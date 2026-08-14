@@ -2173,6 +2173,96 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             "file" : file_metadata(hashes, uid),
         }, ensure_ascii=False)
 
+    # Experimental: streaming chunked upload (rebased + hardened from Leitarkkk #5).
+    @api('/file/chunked_upload', methods=['POST'])
+    def chunked_upload(req):
+        """
+        Stream large files in chunks.
+
+        Request params:
+        - uid, password, filename
+        - chunk_index (0-based), chunk_total
+        - chunk_data (base64)
+        - file_id (required after first chunk)
+        - expected_hash (optional SHA256 of full file)
+        """
+        try:
+            uid = req["uid"]
+            password = req["password"]
+            filename = req["filename"]
+            chunk_index = req["chunk_index"]
+            chunk_total = req["chunk_total"]
+            chunk_data = req["chunk_data"]
+            file_id = req.get("file_id", None)
+            expected_hash = req.get("expected_hash", None)
+
+            if not isinstance(uid, int):
+                return json.dumps({"success": False, "error": "Invalid uid"}, ensure_ascii=False)
+            if not user_cursor.verify_user(uid, password):
+                return json.dumps({"success": False, "error": "Password incorrect"}, ensure_ascii=False)
+            user_row = get_user_row(uid)
+            if user_row is None:
+                return json.dumps({"success": False, "error": "User not found"}, ensure_ascii=False)
+            if user_row[4] == 'banned':
+                return json.dumps({"success": False, "error": "User banned"}, ensure_ascii=False)
+
+            cfg = read_config()
+            normalized_name = normalize_upload_filename(filename)
+            if normalized_name is None:
+                return json.dumps({"success": False, "error": "Invalid filename"}, ensure_ascii=False)
+            allowed_extensions = read_allowed_file_extensions(cfg)
+            if allowed_extensions:
+                _, ext = os.path.splitext(normalized_name.lower())
+                if not ext or ext not in allowed_extensions:
+                    return json.dumps({"success": False, "error": "Extension not allowed"}, ensure_ascii=False)
+
+            result = file.chunked_upload_file(
+                port_api,
+                uid,
+                normalized_name,
+                chunk_index,
+                chunk_total,
+                chunk_data,
+                file_id,
+                file_cursor,
+                expected_hash,
+            )
+
+            # Enforce user storage quota on successful finalization.
+            if result.get("success") and result.get("file_hash"):
+                quota = cfg.get("user_storage_quota", -1)
+                if quota != -1:
+                    hashes = result["file_hash"]
+                    meta = file_metadata(hashes, uid) or {}
+                    new_size = int(meta.get("size") or meta.get("file_size") or 0)
+                    current_usage = file_cursor.get_user_storage_used(uid)
+                    # register_upload already counted this file; approximate by
+                    # checking whether usage already includes it via has_active.
+                    if new_size and current_usage > quota:
+                        file.dereference_file(
+                            port_api, uid, hashes, file_cursor,
+                            cfg.get("file_last_time", 72),
+                        )
+                        return json.dumps(
+                            {"success": False, "error": "Storage quota exceeded"},
+                            ensure_ascii=False,
+                        )
+                return json.dumps({
+                    "success": True,
+                    "file_hash": result["file_hash"],
+                    "verified": result.get("verified", False),
+                    "hash": result["file_hash"],
+                    "download_url": "/file/get_file/{}".format(result["file_hash"]),
+                    "info_url": "/file/get_file_info/{}".format(result["file_hash"]),
+                    "file": file_metadata(result["file_hash"], uid),
+                }, ensure_ascii=False)
+
+            return json.dumps(result, ensure_ascii=False)
+        except KeyError as e:
+            return json.dumps({"success": False, "error": "Missing parameter"}, ensure_ascii=False)
+        except Exception:
+            return json.dumps({"success": False, "error": "Server error"}, ensure_ascii=False)
+
     @api('/file/dereference_file', methods=['POST'])
     def dereference_file(req):
         uid = req["uid"]
