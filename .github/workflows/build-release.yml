@@ -1,10 +1,7 @@
 name: Build & Release TouchFishServer
 
 on:
-  workflow_dispatch:      # 手动触发
-  push:
-    tags:
-      - dev-build         # 推送 dev-build 标签时触发
+  push
 
 concurrency:
   group: touchfishserver-dev-build
@@ -86,6 +83,16 @@ jobs:
         if: runner.os == 'Windows'
         shell: powershell
         run: |
+          # 兜底：若仓库中未随附简体中文语言文件，则下载官方文件到仓库路径
+          $langFile = "packaging\windows\Languages\ChineseSimplified.isl"
+          if (-not (Test-Path $langFile)) {
+            New-Item -ItemType Directory -Force -Path (Split-Path $langFile) | Out-Null
+            curl.exe -L -s -o $langFile "https://raw.githubusercontent.com/jrsoftware/issrc/main/Files/Languages/ChineseSimplified.isl"
+            if (-not (Test-Path $langFile)) {
+              curl.exe -L -s -o $langFile "https://cdn.jsdelivr.net/gh/jrsoftware/issrc@main/Files/Languages/ChineseSimplified.isl"
+            }
+            if (-not (Test-Path $langFile)) { throw "Could not obtain ChineseSimplified.isl" }
+          }
           $iscc = Get-Command "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" -ErrorAction SilentlyContinue
           if (-not $iscc) { $iscc = Get-Command ISCC.exe -ErrorAction SilentlyContinue }
           if (-not $iscc) { throw "ISCC.exe not found after installing Inno Setup" }

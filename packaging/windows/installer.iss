@@ -8,6 +8,10 @@
 ;    pyinstaller main.py --collect-all captcha --collect-all werkzeug --paths . --name TouchFishServer
 ;
 ;  相对路径均相对于本 .iss 文件所在目录 (packaging/windows)
+;  简体中文语言文件 ChineseSimplified.isl 已随仓库提供
+;  （来自 https://github.com/jrsoftware/issrc/tree/main/Files/Languages ，
+;   见 Languages/ChineseSimplified.isl），因此不依赖本机 Inno Setup
+;   安装是否包含该语言文件。
 ; ============================================================
 
 #define MyAppName "TouchFishServer"
@@ -36,7 +40,7 @@ WizardStyle=modern
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
-Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+Name: "chinesesimplified"; MessagesFile: "Languages\ChineseSimplified.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
