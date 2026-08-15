@@ -96,6 +96,30 @@ CREATE TABLE IF NOT EXISTS notifications (
         )
         return ts
 
+    def add_events(self, uid_and_events) -> list:
+        """批量插入多条通知，单事务提交，返回与输入顺序一致的时间戳列表。
+
+        :param uid_and_events: [(uid, event), ...]
+        """
+        if not uid_and_events:
+            return []
+        now = time.time()
+        values = []
+        timestamps = []
+        for index, (uid, event) in enumerate(uid_and_events):
+            ts = now + index * 1e-6
+            values.append((int(uid), ts, self._serialize_event(event)))
+            timestamps.append(ts)
+        with self.lock:
+            def operation():
+                self.cursor.executemany(
+                    "INSERT INTO notifications (uid, time_stamp, info) VALUES (?, ?, ?)",
+                    values,
+                )
+                self.conn.commit()
+            self._execute_with_retry(operation)
+        return timestamps
+
     def redact_recalled_message(self, mid : int):
         """删除消息内容，保留引用预览"""
         with self.lock:

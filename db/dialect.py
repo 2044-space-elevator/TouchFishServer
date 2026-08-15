@@ -184,6 +184,7 @@ class SQLiteDialect(SQLDialect):
         import sqlite3
         conn = sqlite3.connect(dsn, timeout=10)
         conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=5000")
         return conn
 

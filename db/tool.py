@@ -1,4 +1,3 @@
-import sqlite3
 import threading
 import time
 
@@ -6,7 +5,7 @@ from db.dialect import CursorProxy, SQLiteDialect
 
 
 class Db:
-    def __init__(self, path_or_dsn, PORT_API: int, PORT_TCP: int,
+    def __init__(self, path_or_dsn, PORT_API, PORT_TCP,
                  WAL_mode=True, max_retries=3, dialect=None):
         self.path = path_or_dsn
         self.api_pt = PORT_API
@@ -16,9 +15,12 @@ class Db:
         if dialect is None:
             dialect = SQLiteDialect()
         self.dialect = dialect
+        # 写锁：串行化所有写操作。读操作在 WAL 模式下并发，不加这把锁。
         self.lock = threading.Lock()
+        # 每线程一个独立连接，避免单连接 + 单锁把读也串行化。
         self._local = threading.local()
-        self._init_thread()
+        # 初始化主线程连接（触发 WAL 等 PRAGMA）。
+        _ = self.conn
 
     def _init_thread(self):
         conn = self.dialect.connect(self.path)
@@ -53,7 +55,7 @@ class Db:
 
     def _execute_with_retry(self, db_operation, *args, **kwargs):
         error_types = self.dialect.retryable_error_types or (
-            sqlite3.OperationalError,
+            self.dialect.DatabaseError,
         )
         for attempt in range(self.max_retries):
             try:

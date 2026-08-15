@@ -453,6 +453,22 @@ class MessagesDb(Db):
             for row in rows
         }
 
+    def get_room_preference_map(self, uids, room_id: str) -> dict:
+        """批量获取多个用户对同一房间的通知偏好，单次查询。"""
+        uids = [int(uid) for uid in set(uids)]
+        if not uids:
+            return {}
+        placeholders = ",".join("?" * len(uids))
+        rows = self.query(
+            "SELECT uid, is_pinned, notify_level FROM room_preferences "
+            "WHERE uid IN ({}) AND room_id = ?".format(placeholders),
+            tuple(uids) + (room_id,),
+        )
+        return {
+            row[0]: {"is_pinned": bool(row[1]), "notify_level": int(row[2])}
+            for row in rows
+        }
+
     def get_room_preference(self, uid: int, room_id: str) -> dict:
         rows = self.query(
             "SELECT is_pinned, notify_level FROM room_preferences WHERE uid = ? AND room_id = ?",

@@ -42,6 +42,16 @@ def _metadata_with_name(metadata, file_name):
     return result
 
 
+def alert_from_preference(pref, uid, mentioned_uids) -> bool:
+    """根据房间偏好判断是否需要提醒。pref 为 get_room_preference 的 dict，缺省按 0 级处理。"""
+    level = int((pref or {}).get("notify_level", 0))
+    if level == 2:
+        return False
+    if level == 1:
+        return uid in mentioned_uids
+    return True
+
+
 def can_access_room(user_cursor, group_cursor, uid: int, room_id: str) -> bool:
     if not isinstance(room_id, str) or len(room_id) < 2:
         return False
@@ -241,6 +251,34 @@ class InstantConnect():
                 self.loop
             )
         return record
+
+    def notify_users(self, uid_notifications) -> list:
+        """批量写入通知并推送给各自已连接的客户端，单事务提交。
+
+        :param uid_notifications: [(uid, notification), ...]
+        :return: [{time_stamp, info}, ...]
+        """
+        if not uid_notifications:
+            return []
+        prepared = [(int(uid), dict(notification)) for uid, notification in uid_notifications]
+        timestamps = self.notification_cursor.add_events(prepared)
+        with self._clients_lock:
+            client_map = {
+                uid: list(self.connected_clients.get(uid, []))
+                for uid, _ in prepared
+            }
+        records = []
+        for (uid, notification), time_stamp in zip(prepared, timestamps):
+            record = {"time_stamp" : time_stamp, "info" : notification}
+            records.append(record)
+            if self.loop is None:
+                continue
+            for websocket in client_map.get(uid, []):
+                asyncio.run_coroutine_threadsafe(
+                    self._queue_message(websocket, {"type" : "NOTIFICATION.NEW", "notification" : record}),
+                    self.loop
+                )
+        return records
 
     def disconnect_user(self, uid : int):
         if self.loop is None:
@@ -457,20 +495,23 @@ class InstantConnect():
                         notif_dict["quote_preview"] = (
                             self.messages_cursor.get_quote_preview(quote, msg_record) if quote >= 0 else None
                         )
+                        room_id = "G{}".format(gid)
+                        pref_map = self.messages_cursor.get_room_preference_map(members, room_id) if members else {}
+                        sender_uid = self.clients_belonged[websocket]
+                        pending = []
                         for user in members:
                             user_notif = dict(notif_dict)
                             user_notif["mentioned_uids"] = mentioned_uids
                             user_notif["mentions_me"] = user in mentioned_uids
                             user_notif["should_alert"] = (
-                                user != self.clients_belonged[websocket]
-                                and should_alert(
-                                    self.messages_cursor,
-                                    user,
-                                    "G{}".format(gid),
-                                    mentioned_uids,
-                                )
+                                user != sender_uid
+                                and alert_from_preference(pref_map.get(user), user, mentioned_uids)
                             )
-                            await self._notify_user_async(user, user_notif)
+                            pending.append((user, user_notif))
+                        try:
+                            await asyncio.to_thread(self.notify_users, pending)
+                        except Exception as e:
+                            print("[WARN] 批量通知失败(群{}): {}".format(gid, e))
 
                     else:
                         self._queue_ack(websocket, client_mid, status="failed", error="invalid_target")
@@ -649,17 +690,23 @@ class InstantConnect():
                                 ),
                                 metadata["file_name"],
                             )
+                        room_id = "G{}".format(gid)
+                        pref_map = self.messages_cursor.get_room_preference_map(members, room_id) if members else {}
+                        sender_uid = self.clients_belonged[websocket]
+                        pending = []
                         for user in members:
                             user_notif = dict(notif_dict)
                             user_notif["mentioned_uids"] = []
                             user_notif["mentions_me"] = False
                             user_notif["should_alert"] = (
-                                user != self.clients_belonged[websocket]
-                                and should_alert(
-                                    self.messages_cursor, user, "G{}".format(gid), []
-                                )
+                                user != sender_uid
+                                and alert_from_preference(pref_map.get(user), user, [])
                             )
-                            await self._notify_user_async(user, user_notif)
+                            pending.append((user, user_notif))
+                        try:
+                            await asyncio.to_thread(self.notify_users, pending)
+                        except Exception as e:
+                            print("[WARN] 批量通知失败(群{}): {}".format(gid, e))
 
                     else:
                         self._queue_ack(websocket, client_mid, status="failed", error="invalid_target")
