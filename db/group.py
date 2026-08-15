@@ -58,17 +58,13 @@ class GroupDb(Db):
         self._migrate()
 
     def _parse_essence(self, raw) -> list:
-        """安全解析 essence 列，兼容 None / JSON / Python list 字面量。"""
         if not raw:
             return []
         try:
-            return json.loads(raw)
+            result = json.loads(raw)
+            return result if isinstance(result, list) else []
         except (ValueError, TypeError):
-            try:
-                result = eval(raw)
-                return result if isinstance(result, list) else []
-            except Exception:
-                return []
+            return []
 
     def add_essence(self, gid, mid):
         with self.lock:

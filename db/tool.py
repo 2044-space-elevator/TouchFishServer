@@ -1,4 +1,3 @@
-import sqlite3
 import threading
 import time
 
@@ -6,58 +5,22 @@ from db.dialect import CursorProxy, SQLiteDialect
 
 
 class Db:
-    def __init__(self, path_or_dsn, PORT_API: int, PORT_TCP: int,
+    def __init__(self, path_or_dsn, PORT_API, PORT_TCP,
                  WAL_mode=True, max_retries=3, dialect=None):
         self.path = path_or_dsn
         self.api_pt = PORT_API
         self.tcp_pt = PORT_TCP
         self.WAL_mode = WAL_mode
         self.max_retries = max_retries
+        if dialect is None:
+            dialect = SQLiteDialect()
+        self.dialect = dialect
         # 写锁：串行化所有写操作。读操作在 WAL 模式下并发，不加这把锁。
         self.lock = threading.Lock()
         # 每线程一个独立连接，避免单连接 + 单锁把读也串行化。
         self._local = threading.local()
         # 初始化主线程连接（触发 WAL 等 PRAGMA）。
         _ = self.conn
-
-    def _connect(self):
-        conn = sqlite3.connect(self.path, check_same_thread=False)
-        if self.WAL_mode:
-            conn.execute("PRAGMA journal_mode=WAL")
-        # WAL + synchronous=NORMAL：写性能大幅提升，崩溃时最多丢最后一次事务。
-        conn.execute("PRAGMA synchronous=NORMAL")
-        # 写冲突时等待而不是立刻报错。
-        conn.execute("PRAGMA busy_timeout=5000")
-        return conn
-
-    @property
-    def conn(self):
-        conn = getattr(self._local, "conn", None)
-        if conn is None:
-            conn = self._connect()
-            self._local.conn = conn
-            self._local.cursor = conn.cursor()
-        return conn
-
-    @property
-    def cursor(self):
-        _ = self.conn
-        return self._local.cursor
-
-    def _reconnect(self):
-        try:
-            if getattr(self._local, "conn", None) is not None:
-                self._local.conn.close()
-        except Exception:
-            pass
-        self._local.conn = self._connect()
-        self._local.cursor = self._local.conn.cursor()
-        if dialect is None:
-            dialect = SQLiteDialect()
-        self.dialect = dialect
-        self.lock = threading.Lock()
-        self._local = threading.local()
-        self._init_thread()
 
     def _init_thread(self):
         conn = self.dialect.connect(self.path)
@@ -92,7 +55,7 @@ class Db:
 
     def _execute_with_retry(self, db_operation, *args, **kwargs):
         error_types = self.dialect.retryable_error_types or (
-            sqlite3.OperationalError,
+            self.dialect.DatabaseError,
         )
         for attempt in range(self.max_retries):
             try:

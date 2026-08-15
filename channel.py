@@ -508,7 +508,10 @@ class InstantConnect():
                                 and alert_from_preference(pref_map.get(user), user, mentioned_uids)
                             )
                             pending.append((user, user_notif))
-                        await asyncio.to_thread(self.notify_users, pending)
+                        try:
+                            await asyncio.to_thread(self.notify_users, pending)
+                        except Exception as e:
+                            print("[WARN] 批量通知失败(群{}): {}".format(gid, e))
 
                     else:
                         self._queue_ack(websocket, client_mid, status="failed", error="invalid_target")
@@ -700,7 +703,10 @@ class InstantConnect():
                                 and alert_from_preference(pref_map.get(user), user, [])
                             )
                             pending.append((user, user_notif))
-                        await asyncio.to_thread(self.notify_users, pending)
+                        try:
+                            await asyncio.to_thread(self.notify_users, pending)
+                        except Exception as e:
+                            print("[WARN] 批量通知失败(群{}): {}".format(gid, e))
 
                     else:
                         self._queue_ack(websocket, client_mid, status="failed", error="invalid_target")
