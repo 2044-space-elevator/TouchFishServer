@@ -7,6 +7,10 @@
 ;  前置条件: 先用 PyInstaller 生成 dist 目录
 ;    pyinstaller main.py --collect-all captcha --collect-all werkzeug --paths . --name TouchFishServer
 ;
+;  PyInstaller onedir 产物位于 dist\TouchFishServer\（内含
+;  TouchFishServer.exe 与 _internal\）。本脚本直接打包该内层目录内容，
+;  使安装后 {app}\TouchFishServer.exe 位于安装根目录，不再多套一层。
+;
 ;  相对路径均相对于本 .iss 文件所在目录 (packaging/windows)
 ;  简体中文语言文件 ChineseSimplified.isl 已随仓库提供
 ;  （来自 https://github.com/jrsoftware/issrc/tree/main/Files/Languages ，
@@ -19,7 +23,7 @@
 #define MyAppPublisher "TouchFish"
 #define MyAppExeName "TouchFishServer.exe"
 
-#define MyAppSourceDir "..\..\dist"
+#define MyAppSourceDir "..\..\dist\TouchFishServer"
 #define MyAppOutputDir "..\.."
 #define MyAppOutputFilename "TouchFishServer_windows-setup"
 

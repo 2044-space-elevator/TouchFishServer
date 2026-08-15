@@ -59,6 +59,13 @@ jobs:
 
           dst = Path(sys.argv[1])
           src = Path('dist')
+          # PyInstaller onedir: dist 下只有一个以应用名命名的子目录
+          # （内含 <应用名>.exe 与 _internal/）。提取这一层，避免 zip
+          # 里再多套一层目录。
+          dirs = sorted(p for p in src.iterdir() if p.is_dir())
+          files = sorted(p for p in src.iterdir() if p.is_file())
+          if len(dirs) == 1 and not files:
+              src = dirs[0]
           with zipfile.ZipFile(dst, 'w', zipfile.ZIP_DEFLATED) as z:
               for f in sorted(src.rglob('*')):
                   if f.is_file():
