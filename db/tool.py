@@ -2,10 +2,13 @@ import sqlite3
 import threading
 import time
 
+from db.dialect import CursorProxy, SQLiteDialect
+
 
 class Db:
-    def __init__(self, path: str, PORT_API: int, PORT_TCP: int, WAL_mode=True, max_retries=3):
-        self.path = path
+    def __init__(self, path_or_dsn, PORT_API: int, PORT_TCP: int,
+                 WAL_mode=True, max_retries=3, dialect=None):
+        self.path = path_or_dsn
         self.api_pt = PORT_API
         self.tcp_pt = PORT_TCP
         self.WAL_mode = WAL_mode
@@ -49,17 +52,65 @@ class Db:
             pass
         self._local.conn = self._connect()
         self._local.cursor = self._local.conn.cursor()
+        if dialect is None:
+            dialect = SQLiteDialect()
+        self.dialect = dialect
+        self.lock = threading.Lock()
+        self._local = threading.local()
+        self._init_thread()
+
+    def _init_thread(self):
+        conn = self.dialect.connect(self.path)
+        self._local.conn = conn
+        self._local.cursor = CursorProxy(conn.cursor(), self.dialect, conn)
+
+    @property
+    def conn(self):
+        if not hasattr(self._local, 'conn') or self._local.conn is None:
+            self._init_thread()
+        return self._local.conn
+
+    @property
+    def cursor(self):
+        if not hasattr(self._local, 'cursor') or self._local.cursor is None:
+            self._init_thread()
+        return self._local.cursor
+
+    @property
+    def IntegrityError(self):
+        return self.dialect.IntegrityError
+
+    def _reconnect(self):
+        try:
+            if hasattr(self._local, 'conn') and self._local.conn:
+                self._local.conn.close()
+        except Exception:
+            pass
+        self._local.conn = None
+        self._local.cursor = None
+        self._init_thread()
 
     def _execute_with_retry(self, db_operation, *args, **kwargs):
+        error_types = self.dialect.retryable_error_types or (
+            sqlite3.OperationalError,
+        )
         for attempt in range(self.max_retries):
             try:
                 return db_operation(*args, **kwargs)
-            except (sqlite3.OperationalError, sqlite3.ProgrammingError) as e:
+            except error_types:
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
                 if attempt == self.max_retries - 1:
                     raise
                 self._reconnect()
                 time.sleep(0.1)
             except Exception:
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
                 raise
 
     def update(self, command: str, parameters: list):
@@ -70,13 +121,14 @@ class Db:
             self._execute_with_retry(operation)
 
     def query(self, command: str, parameters: tuple = None):
-        # 读操作不加锁：每个线程用自己的连接，WAL 下可并行读取。
         def operation():
             if parameters:
                 self.cursor.execute(command, parameters)
             else:
                 self.cursor.execute(command)
-            return self.cursor.fetchall()
+            result = self.cursor.fetchall()
+            self.conn.commit()  # 关闭读事务，释放 REPEATABLE READ 快照
+            return result
         return self._execute_with_retry(operation)
 
     def execute(self, command: str, parameters: tuple = None):
@@ -96,7 +148,7 @@ class Db:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         try:
-            if getattr(self._local, "conn", None) is not None:
+            if hasattr(self._local, 'conn') and self._local.conn:
                 self._local.conn.close()
         except Exception:
             pass

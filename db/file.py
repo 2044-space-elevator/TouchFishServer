@@ -4,8 +4,8 @@ import time
 import os
 
 class FileDb(Db):
-    def __init__(self, path : str, port_api : int):
-        super().__init__(path, port_api, -1)
+    def __init__(self, path : str, port_api : int, dialect=None):
+        super().__init__(path, port_api, -1, dialect=dialect)
         self.port_api = port_api
 
     def create_file_db(self):

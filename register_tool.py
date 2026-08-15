@@ -14,14 +14,24 @@ from time import time
 
 MAX_DELAY = 300
 
-def login_email(sender_email : str, password : str):
+def login_email(sender_email : str, password : str, smtp_host=None, smtp_port=None, smtp_use_ssl=True):
     """
     password 是登录密码或者授权码，视邮件提供商要求
+    smtp_host/smtp_port/smtp_use_ssl 可手动指定 SMTP 参数；
+    未指定 smtp_host 时按邮箱域名自动猜测 smtp.<domain>
+    smtp_use_ssl: True = SMTP_SSL 直连（默认 465），False = SMTP + STARTTLS（默认 587）
     """
-    server = sender_email.split('@')[1]
-    smtp_server = 'smtp.' + server
-    smtp_port = 465 
-    server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=1e5)
+    if smtp_host:
+        smtp_server = smtp_host
+    else:
+        smtp_server = 'smtp.' + sender_email.split('@')[1]
+    if smtp_port is None:
+        smtp_port = 465 if smtp_use_ssl else 587
+    if smtp_use_ssl:
+        server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=10)
+    else:
+        server = smtplib.SMTP(smtp_server, smtp_port, timeout=10)
+        server.starttls()
     server.login(sender_email, password)
     return server
 
@@ -85,11 +95,15 @@ def verify_captcha(port_api : int, time_stamp : int, verify_text : str, lock):
         return lst.get(str(time_stamp), "").lower() == verify_text.lower()
 
 def email_code(sender_email : str, port_api : int, email : str, password : str, config_lock, activate_lock):
-    session = login_email(sender_email, password)
     folder_path = "res/{}".format(port_api)
     with config_lock:
+        cfg = read_json(folder_path + '/config.json')
         sender = sender_email
-        server_name = read_json(folder_path + '/config.json')["server_name"]
+        server_name = cfg["server_name"]
+        smtp_host = cfg.get("smtp_host", "") or None
+        smtp_port = cfg.get("smtp_port")
+        smtp_use_ssl = cfg.get("smtp_use_ssl", True)
+    session = login_email(sender_email, password, smtp_host, smtp_port, smtp_use_ssl)
     verify_code = randint(100000, 999999)
     with activate_lock:
         update_json(

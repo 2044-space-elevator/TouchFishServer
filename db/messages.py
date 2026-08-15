@@ -3,8 +3,8 @@ import time
 
 
 class MessagesDb(Db):
-    def __init__(self, path: str, port_api: int):
-        super().__init__(path, port_api, -1)
+    def __init__(self, path: str, port_api: int, dialect=None):
+        super().__init__(path, port_api, -1, dialect=dialect)
         self._create_table()
         self._migrate()
         self._create_indexes()
@@ -59,18 +59,16 @@ class MessagesDb(Db):
 
     def _migrate(self):
         """尝试修复db"""
-        from sqlite3 import OperationalError
         for col, typ in [("group_id", "INTEGER"), ("client_mid", "TEXT"),
                          ("deleted_at", "REAL"), ("deleted_by", "INTEGER"),
                            ("file_name", "TEXT"),
                            ("forwarded", "INTEGER NOT NULL DEFAULT -1")]:
             try:
                 self.execute("ALTER TABLE messages ADD COLUMN {} {}".format(col, typ))
-            except OperationalError:
+            except Exception:
                 pass
 
     def _create_indexes(self):
-        from sqlite3 import OperationalError
         try:
             self.execute("DROP INDEX IF EXISTS idx_messages_client_mid")
         except Exception:
@@ -88,7 +86,7 @@ class MessagesDb(Db):
         for idx_sql in indexes:
             try:
                 self.execute(idx_sql)
-            except OperationalError:
+            except Exception:
                 pass
 
     def add_message(self, sender_uid: int, receiver_uid: int, content: str,
@@ -97,7 +95,7 @@ class MessagesDb(Db):
                        client_mid: str = None, file_name: str = None,
                        forwarded: int = -1) -> dict:
         send_time = time.time()
-        from sqlite3 import IntegrityError
+        _IntegrityError = self.dialect.IntegrityError
         with self.lock:
             def operation():
                 try:
@@ -112,7 +110,7 @@ class MessagesDb(Db):
                     mid = self.cursor.lastrowid
                     self.conn.commit()
                     return mid, False
-                except IntegrityError:
+                except _IntegrityError:
                     self.conn.rollback()
                     if client_mid:
                         self.cursor.execute(
@@ -284,7 +282,7 @@ class MessagesDb(Db):
                   WHERE group_id IS NULL
                    AND (sender_uid = ? OR receiver_uid = ?)
                    AND sender_uid != receiver_uid
-               )
+               ) AS ranked
                WHERE rn = 1 AND partner_uid != ?
                ORDER BY mid DESC""",
             (uid, uid, uid, uid, uid)
@@ -521,8 +519,9 @@ class MessagesDb(Db):
                    VALUES (?, ?, ?, ?)""",
                 (message_id, group_id, pinned_by_uid, time.time()),
             )
+            pin_id = self.cursor.lastrowid
             self.conn.commit()
-            return self.cursor.lastrowid
+            return pin_id
 
     def unpin_message(self, pin_id: int, group_id: int) -> bool:
         with self.lock:

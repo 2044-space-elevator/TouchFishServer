@@ -9,8 +9,8 @@ ALLOWED_USER_STATS = {"user", "banned", "admin", "root"}
 _UNSET = object()
 
 class UserDb(Db):
-    def __init__(self, hasher, path : str, port_api : int, port_tcp : int):
-        super().__init__(path, port_api, port_tcp)
+    def __init__(self, hasher, path : str, port_api : int, port_tcp : int, dialect=None):
+        super().__init__(path, port_api, port_tcp, dialect=dialect)
         self.hasher = hasher
     
     def verify_user(self,  uid, password):
@@ -220,7 +220,7 @@ class UserDb(Db):
         email TEXT UNIQUE,
         pwd_hash TEXT NOT NULL,
         stat TEXT DEFAULT 'user',
-        create_time TEXT REAL,
+        create_time REAL,
         sign TEXT,
         introduction TEXT
     )

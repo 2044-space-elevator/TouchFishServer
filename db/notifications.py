@@ -3,8 +3,8 @@ import json
 import time
 
 class NotificationsDb(Db):
-    def __init__(self, path: str, port_api: int):
-        super().__init__(path, port_api, -1)
+    def __init__(self, path: str, port_api: int, dialect=None):
+        super().__init__(path, port_api, -1, dialect=dialect)
         self._ensure_unified_table()
         self._migrate_legacy_tables()
 

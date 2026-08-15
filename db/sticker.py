@@ -3,7 +3,6 @@
 """
 from __future__ import annotations
 
-import sqlite3
 import time
 import uuid
 
@@ -17,8 +16,8 @@ def escape_like(value):
 class StickerDb(Db):
     """表情数据库"""
 
-    def __init__(self, path: str, port_api: int):
-        super().__init__(path, port_api, -1)
+    def __init__(self, path: str, port_api: int, dialect=None):
+        super().__init__(path, port_api, -1, dialect=dialect)
         self._create_tables()
 
     def _create_tables(self):
@@ -176,6 +175,7 @@ class StickerDb(Db):
 
     def create_sticker(self, uid, pack_id, slug, name, file_hash, file_type, render_size, render_mode, max_stickers, exempt):
         now = time.time()
+        _IntegrityError = self.dialect.IntegrityError
         with self.lock:
             def operation():
                 self.cursor.execute("SELECT creator_uid FROM sticker_packs WHERE id = ? AND is_deleted = 0", (pack_id,))
@@ -193,7 +193,7 @@ class StickerDb(Db):
                 sticker_id = uuid.uuid4().hex
                 try:
                     self.cursor.execute("INSERT INTO stickers(id, pack_id, slug, name, file_hash, file_type, position, render_size, render_mode, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", (sticker_id, pack_id, slug, name, file_hash, file_type, position, render_size, render_mode, now))
-                except sqlite3.IntegrityError:
+                except _IntegrityError:
                     self.conn.rollback()
                     return None, "slug_exists"
                 self.cursor.execute("UPDATE sticker_packs SET updated_at = ? WHERE id = ?", (now, pack_id))

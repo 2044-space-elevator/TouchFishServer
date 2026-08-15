@@ -31,8 +31,8 @@ def update_comments(port_api : int, callback):
         return update_json(comments_path(port_api), callback)
 
 class ForumDb(Db):
-    def __init__(self, path : str, port_api : int, port_tcp : int):
-        super().__init__(path, port_api, port_tcp)
+    def __init__(self, path : str, port_api : int, port_tcp : int, dialect=None):
+        super().__init__(path, port_api, port_tcp, dialect=dialect)
     
     def create_forum_table(self):
         cmd = """

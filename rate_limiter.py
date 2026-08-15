@@ -33,6 +33,25 @@ class RateLimiter:
             self._limits: dict = cfg.get("rate_limits", {})
         except Exception:
             self._limits = {}
+        self._start_cleanup()
+
+    def _start_cleanup(self):
+        def _loop():
+            while True:
+                time.sleep(300)
+                self._cleanup()
+        t = threading.Thread(target=_loop, daemon=True, name="tfv5-ratelimit-gc")
+        t.start()
+
+    def _cleanup(self):
+        with self._lock:
+            max_range = max(
+                (v.get("range", 60) for v in self._limits.values()), default=60
+            )
+            cutoff = time.time() - max_range * 2
+            expired = [k for k, v in self._requests.items() if not v or v[-1] < cutoff]
+            for k in expired:
+                del self._requests[k]
 
     def _get_limit_for(self, endpoint: str) -> dict | None:
         """返回适用的限制规则，优先端点规则，其次 default，无则 None。"""

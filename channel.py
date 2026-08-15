@@ -90,6 +90,31 @@ class InstantConnect():
         self._auth_lock = threading.Lock()
         self._auth_timestamps = defaultdict(list)
         self._auth_semaphore = asyncio.Semaphore(2)
+        self._start_cleanup_thread()
+
+    def _start_cleanup_thread(self):
+        def _loop():
+            while True:
+                time.sleep(300)
+                try:
+                    self._cleanup_rate_timestamps()
+                except Exception:
+                    pass
+        t = threading.Thread(target=_loop, daemon=True, name="tfv5-ws-rate-gc")
+        t.start()
+
+    def _cleanup_rate_timestamps(self):
+        now = time.time()
+        cutoff = now - 120
+        with self._ws_lock:
+            for d in (self._ws_timestamps, self._ws_typing_timestamps):
+                expired = [k for k, v in d.items() if not v or v[-1] < cutoff]
+                for k in expired:
+                    del d[k]
+        with self._auth_lock:
+            expired = [k for k, v in self._auth_timestamps.items() if not v or v[-1] < cutoff]
+            for k in expired:
+                del self._auth_timestamps[k]
 
     def _check_ws_auth_rate(self, remote_address, limit: int = 5, window: float = 60.0) -> bool:
         ip = remote_address[0] if isinstance(remote_address, tuple) else str(remote_address)
@@ -117,14 +142,15 @@ class InstantConnect():
             ts_dict[uid].append(now)
             return True
 
-    def _load_config(self):
-        cfg_path = os.path.join("res", str(self.port_api), "config.json")
-        try:
-            with open(cfg_path, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            self.max_message_length = cfg.get("max_message_length", 10000)
-        except Exception:
-            self.max_message_length = 10000
+    def _load_config(self, cfg=None):
+        if cfg is None:
+            cfg_path = os.path.join("res", str(self.port_api), "config.json")
+            try:
+                with open(cfg_path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+            except Exception:
+                cfg = {}
+        self.max_message_length = cfg.get("max_message_length", 10000)
     
     def encrypt_response(self, req : dict, websocket):
         json_req = json.dumps(req)
@@ -331,7 +357,7 @@ class InstantConnect():
                     continue
 
                 if message['type'] in ("message.plain", "message.file"):
-                    info = self.user_cursor.uid_query(sender_uid)
+                    info = await to_thread(self.user_cursor.uid_query, sender_uid)
                     if not info or info[0][4] == 'banned':
                         self._queue_ack(websocket, message.get('client_mid'), status="failed", error="banned")
                         break
@@ -364,10 +390,11 @@ class InstantConnect():
                         # 发送给用户
                         send_to = int(send_to[1:])
                         sender_uid = self.clients_belonged[websocket]
-                        if not self.user_cursor.is_friend(sender_uid, send_to):
+                        if not await to_thread(self.user_cursor.is_friend, sender_uid, send_to):
                             self._queue_ack(websocket, client_mid, status="failed", error="not_friends")
                             continue
-                        msg_record = self.messages_cursor.add_message(
+                        msg_record = await to_thread(
+                            self.messages_cursor.add_message,
                             sender_uid, send_to, plain,
                             content_type='plain', quote=quote,
                             client_mid=client_mid
@@ -418,16 +445,17 @@ class InstantConnect():
 
                     elif send_to[0] == 'G':
                         gid = int(send_to[1:])
-                        group = self.group_cursor.query_gid(gid)
+                        group = await to_thread(self.group_cursor.query_gid, gid)
                         if not group:
                             self._queue_ack(websocket, client_mid, status="failed", error="group_not_found")
                             continue
-                        members = self.group_cursor.get_member_uids(gid)
+                        members = await to_thread(self.group_cursor.get_member_uids, gid)
                         sender_str = "G{}U{}".format(gid, self.clients_belonged[websocket])
                         if not self.clients_belonged[websocket] in members:
                             self._queue_ack(websocket, client_mid, status="failed", error="not_group_member")
                             continue
-                        msg_record = self.messages_cursor.add_message(
+                        msg_record = await to_thread(
+                            self.messages_cursor.add_message,
                             self.clients_belonged[websocket], 0, plain,
                             content_type='plain', quote=quote, group_id=gid,
                             client_mid=client_mid
@@ -519,7 +547,7 @@ class InstantConnect():
                             self._queue_ack(websocket, client_mid, status="failed", error="invalid_target")
                             continue
                         sender_uid = self.clients_belonged[websocket]
-                        if not self.user_cursor.is_friend(sender_uid, send_to):
+                        if not await to_thread(self.user_cursor.is_friend, sender_uid, send_to):
                             self._queue_ack(websocket, client_mid, status="failed", error="not_friends")
                             continue
                         metadata = (self.file_cursor.acquire_reference(sender_uid, file_hashes)
@@ -528,7 +556,8 @@ class InstantConnect():
                             self._queue_ack(websocket, client_mid, status="failed", error="file_not_owned")
                             continue
                         try:
-                            msg_record = self.messages_cursor.add_message(
+                            msg_record = await to_thread(
+                                self.messages_cursor.add_message,
                                 sender_uid, send_to, file_hashes,
                                 content_type='file', file_hash=file_hashes, quote=quote,
                                 client_mid=client_mid, file_name=metadata["file_name"]
@@ -547,7 +576,8 @@ class InstantConnect():
                                 continue
                             self._queue_ack(websocket, client_mid, mid=msg_record["mid"], status="sent")
                             continue
-                        if not self.file_cursor.add_reference(
+                        if not await to_thread(
+                                self.file_cursor.add_reference,
                                 file_hashes, "message", msg_record["mid"], sender_uid):
                             self.messages_cursor.recall_message(msg_record["mid"], sender_uid)
                             self._queue_ack(websocket, client_mid, status="failed", error="file_reference_failed")
@@ -591,11 +621,11 @@ class InstantConnect():
                         except ValueError:
                             self._queue_ack(websocket, client_mid, status="failed", error="invalid_target")
                             continue
-                        group = self.group_cursor.query_gid(gid)
+                        group = await to_thread(self.group_cursor.query_gid, gid)
                         if not group:
                             self._queue_ack(websocket, client_mid, status="failed", error="group_not_found")
                             continue
-                        members = self.group_cursor.get_member_uids(gid)
+                        members = await to_thread(self.group_cursor.get_member_uids, gid)
                         sender_str = "G{}U{}".format(gid, self.clients_belonged[websocket])
                         if not self.clients_belonged[websocket] in members:
                             self._queue_ack(websocket, client_mid, status="failed", error="not_group_member")
@@ -607,7 +637,8 @@ class InstantConnect():
                             self._queue_ack(websocket, client_mid, status="failed", error="file_not_owned")
                             continue
                         try:
-                            msg_record = self.messages_cursor.add_message(
+                            msg_record = await to_thread(
+                                self.messages_cursor.add_message,
                                 sender_uid, 0, file_hashes,
                                 content_type='file', file_hash=file_hashes, quote=quote, group_id=gid,
                                 client_mid=client_mid, file_name=metadata["file_name"]
@@ -626,7 +657,8 @@ class InstantConnect():
                                 continue
                             self._queue_ack(websocket, client_mid, mid=msg_record["mid"], status="sent")
                             continue
-                        if not self.file_cursor.add_reference(
+                        if not await to_thread(
+                                self.file_cursor.add_reference,
                                 file_hashes, "message", msg_record["mid"], sender_uid):
                             self.messages_cursor.recall_message(msg_record["mid"], sender_uid)
                             self._queue_ack(websocket, client_mid, status="failed", error="file_reference_failed")

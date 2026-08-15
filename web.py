@@ -1,4 +1,5 @@
 from flask import Flask, send_file, request as flask_request
+from werkzeug.middleware.proxy_fix import ProxyFix
 import json
 import register_tool
 import base64
@@ -7,7 +8,7 @@ import os
 from db import *
 import avatar
 import file
-from sqlite3 import OperationalError
+
 import announcements
 from crypto import generate_rsa_keys, return_app_route
 from rate_limiter import RateLimiter
@@ -60,24 +61,27 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         'announcement': threading.Lock(),
     }
 
-    _config_cache = {"data": None, "ts": 0.0}
-    _CONFIG_TTL = 2.0
-
-    def invalidate_config_cache():
-        _config_cache["data"] = None
-
+    _config_cache = None
     def read_config():
+        nonlocal _config_cache
+        if _config_cache is not None:
+            return dict(_config_cache)
         with locks['config']:
-            cached = _config_cache
-            now = time.time()
-            if cached["data"] is not None and now - cached["ts"] < _CONFIG_TTL:
-                return cached["data"]
-            data = read_json("res/{}/config.json".format(port_api))
-            cached["data"] = data
-            cached["ts"] = now
-            return data
+            cfg = read_json("res/{}/config.json".format(port_api))
+            _config_cache = dict(cfg)
+            return dict(_config_cache)
 
     group_cursor._config_reader = read_config
+
+    _base_wsgi_app = app.wsgi_app
+    def apply_proxy_fix(cfg):
+        if cfg.get("reverse_proxy_enabled", False):
+            x_for = int(cfg.get("proxy_count", 1))
+            app.wsgi_app = ProxyFix(_base_wsgi_app, x_for=x_for, x_proto=1)
+        else:
+            app.wsgi_app = _base_wsgi_app
+
+    apply_proxy_fix(read_config())
 
     def build_notification(event : str, title : str, content : str, sender=None, meta=None):
         if isinstance(meta, dict):
@@ -148,14 +152,15 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         return ret
 
     def update_config(mutator):
+        nonlocal _config_cache
         with locks['config']:
             state = {}
             def apply(cfg):
                 mutator(cfg)
                 state["cfg"] = dict(cfg)
             update_json("res/{}/config.json".format(port_api), apply)
-            invalidate_config_cache()
-            return state["cfg"]
+            _config_cache = state["cfg"]
+            return dict(_config_cache)
 
     def serialize_server_settings(cfg, include_manage=False):
         ret = {
@@ -193,6 +198,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             ret["rate_limits"] = cfg.get("rate_limits", {})
             if cfg.get("email_activate"):
                 ret["verify_email"] = cfg.get("email_activate")
+            ret["smtp_host"] = cfg.get("smtp_host", "")
+            ret["smtp_port"] = cfg.get("smtp_port", 465)
+            ret["smtp_use_ssl"] = cfg.get("smtp_use_ssl", True)
+            ret["reverse_proxy_enabled"] = cfg.get("reverse_proxy_enabled", False)
+            ret["proxy_count"] = cfg.get("proxy_count", 1)
         return ret
 
     def parse_int_setting(value, minimum=0, allow_unlimited=False):
@@ -607,9 +617,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     @app.route('/auth/captcha')
     def get_captcha():
-        with locks['config']:
-            with open("res/{}/config.json".format(port_api), "r+") as file:
-                captcha = json.load(file)["captcha"]
+        captcha = read_config().get("captcha", False)
         if not captcha:
             return {}
         token = register_tool.generate_captcha(port_api, ImgCaptcha, locks['captcha'])
@@ -631,16 +639,18 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return bool_res()[False]
         
         new_stat = req["change_to"]
-        with locks['config']:
-            def change(cfg):
-                if new_stat == False:
-                    cfg["email_activate"] = ""
-                    cfg["email_password"] = ""
-                else:
-                    cfg["email_activate"] = req["verify_email"]
-                    cfg["email_password"] = req["email_password"]
-            update_json("res/{}/config.json".format(port_api), change)
-            invalidate_config_cache()
+        if new_stat:
+            verify_email = req["verify_email"]
+            email_password = req["email_password"]
+            update_config(lambda cfg: cfg.update({
+                "email_activate": verify_email,
+                "email_password": email_password,
+            }))
+        else:
+            update_config(lambda cfg: cfg.update({
+                "email_activate": "",
+                "email_password": "",
+            }))
         return bool_res()[True]
         
     @app.route("/auth/uid/<uid>")
@@ -688,12 +698,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def register(req):
         username = req["username"]
         password = req["password"]
-        is_captcha = False
-        with locks['config']:
-            with open("res/{}/config.json".format(port_api), "r+") as file:
-                cfg = json.load(file)
-                is_captcha = cfg['captcha']
-                is_email_activate = cfg["email_activate"]
+        cfg = read_config()
+        is_captcha = cfg.get("captcha", False)
+        is_email_activate = cfg.get("email_activate", "")
         if (not isinstance(username, str) or len(username) < int(cfg.get("min_username_length", 4))
                 or not isinstance(password, str) or len(password) < int(cfg.get("min_password_length", 1))):
             return bool_res()[False]
@@ -971,12 +978,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         user_row = get_user_row(uid)
         if user_row is None or user_row[4] != 'root':
             return bool_res()[False]
-        with locks['config']:
-            update_json(
-                "res/{}/config.json".format(port_api),
-                lambda cfg: cfg.__setitem__("captcha", final_stat),
-            )
-            invalidate_config_cache()
+        update_config(lambda cfg: cfg.__setitem__("captcha", final_stat))
         return bool_res()[True]
 
     @api("/auth/change_rate_limits", methods=['POST'])
@@ -1007,14 +1009,12 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         new_limits = req.get("rate_limits")
         if new_limits is not None and not isinstance(new_limits, dict):
             return bool_res()[False]
-        with locks['config']:
-            def change(cfg):
-                if new_limits is None:
-                    cfg.pop("rate_limits", None)
-                else:
-                    cfg["rate_limits"] = new_limits
-            update_json("res/{}/config.json".format(port_api), change)
-            invalidate_config_cache()
+        def change(cfg):
+            if new_limits is None:
+                cfg.pop("rate_limits", None)
+            else:
+                cfg["rate_limits"] = new_limits
+        update_config(change)
         limiter.reload(port_api)
         return bool_res()[True]
 
@@ -1107,6 +1107,27 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             if "max_sticker_size" in req:
                 updates["max_sticker_size"] = parse_int_setting(req["max_sticker_size"], minimum=1, allow_unlimited=True)
 
+            if "smtp_host" in req:
+                if not isinstance(req["smtp_host"], str):
+                    return bool_res()[False]
+                updates["smtp_host"] = req["smtp_host"].strip()
+
+            if "smtp_port" in req:
+                updates["smtp_port"] = parse_int_setting(req["smtp_port"], minimum=1)
+
+            if "smtp_use_ssl" in req:
+                if not isinstance(req["smtp_use_ssl"], bool):
+                    return bool_res()[False]
+                updates["smtp_use_ssl"] = req["smtp_use_ssl"]
+
+            if "reverse_proxy_enabled" in req:
+                if not isinstance(req["reverse_proxy_enabled"], bool):
+                    return bool_res()[False]
+                updates["reverse_proxy_enabled"] = req["reverse_proxy_enabled"]
+
+            if "proxy_count" in req:
+                updates["proxy_count"] = parse_int_setting(req["proxy_count"], minimum=0)
+
             if not updates:
                 return bool_res()[False]
 
@@ -1115,7 +1136,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             cfg = update_config(_apply)
             # 重新加载 ws
             if "max_message_length" in updates:
-                instant_contact._load_config()
+                instant_contact._load_config(cfg)
+            # 反代配置变更时重新包装 wsgi 中间件
+            if "reverse_proxy_enabled" in updates or "proxy_count" in updates:
+                apply_proxy_fix(cfg)
             return json.dumps(serialize_server_settings(cfg, include_manage=True), ensure_ascii=False)
         except Exception:
             return bool_res()[False]
@@ -1507,7 +1531,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     @app.route("/forum/get_forum_list")
     def get_forum_list():
-        return forum_cursor.query_all_forums()
+        return json.dumps(forum_cursor.query_all_forums(), ensure_ascii=False)
 
     @app.route("/forum/search")
     def search_forum():
@@ -1618,14 +1642,14 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             posts = forum_cursor.query_all_post(fid_int)
             try:
                 pinned_pid = forum_cursor.get_pinned_pid(fid_int)
-            except Exception:
+            except forum_cursor.dialect.DatabaseError:
                 pinned_pid = None
             return json.dumps({
                 "posts": posts,
                 "post_rows": serialize_post_rows(posts),
                 "pinned_pid": pinned_pid,
             }, ensure_ascii=False)
-        except OperationalError as e:
+        except forum_cursor.dialect.DatabaseError:
             return {}
 
     @app.route("/forum/get_post/<fid>/<pid>")
@@ -2149,6 +2173,96 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             "file" : file_metadata(hashes, uid),
         }, ensure_ascii=False)
 
+    # Experimental: streaming chunked upload (rebased + hardened from Leitarkkk #5).
+    @api('/file/chunked_upload', methods=['POST'])
+    def chunked_upload(req):
+        """
+        Stream large files in chunks.
+
+        Request params:
+        - uid, password, filename
+        - chunk_index (0-based), chunk_total
+        - chunk_data (base64)
+        - file_id (required after first chunk)
+        - expected_hash (optional SHA256 of full file)
+        """
+        try:
+            uid = req["uid"]
+            password = req["password"]
+            filename = req["filename"]
+            chunk_index = req["chunk_index"]
+            chunk_total = req["chunk_total"]
+            chunk_data = req["chunk_data"]
+            file_id = req.get("file_id", None)
+            expected_hash = req.get("expected_hash", None)
+
+            if not isinstance(uid, int):
+                return json.dumps({"success": False, "error": "Invalid uid"}, ensure_ascii=False)
+            if not user_cursor.verify_user(uid, password):
+                return json.dumps({"success": False, "error": "Password incorrect"}, ensure_ascii=False)
+            user_row = get_user_row(uid)
+            if user_row is None:
+                return json.dumps({"success": False, "error": "User not found"}, ensure_ascii=False)
+            if user_row[4] == 'banned':
+                return json.dumps({"success": False, "error": "User banned"}, ensure_ascii=False)
+
+            cfg = read_config()
+            normalized_name = normalize_upload_filename(filename)
+            if normalized_name is None:
+                return json.dumps({"success": False, "error": "Invalid filename"}, ensure_ascii=False)
+            allowed_extensions = read_allowed_file_extensions(cfg)
+            if allowed_extensions:
+                _, ext = os.path.splitext(normalized_name.lower())
+                if not ext or ext not in allowed_extensions:
+                    return json.dumps({"success": False, "error": "Extension not allowed"}, ensure_ascii=False)
+
+            result = file.chunked_upload_file(
+                port_api,
+                uid,
+                normalized_name,
+                chunk_index,
+                chunk_total,
+                chunk_data,
+                file_id,
+                file_cursor,
+                expected_hash,
+            )
+
+            # Enforce user storage quota on successful finalization.
+            if result.get("success") and result.get("file_hash"):
+                quota = cfg.get("user_storage_quota", -1)
+                if quota != -1:
+                    hashes = result["file_hash"]
+                    meta = file_metadata(hashes, uid) or {}
+                    new_size = int(meta.get("size") or meta.get("file_size") or 0)
+                    current_usage = file_cursor.get_user_storage_used(uid)
+                    # register_upload already counted this file; approximate by
+                    # checking whether usage already includes it via has_active.
+                    if new_size and current_usage > quota:
+                        file.dereference_file(
+                            port_api, uid, hashes, file_cursor,
+                            cfg.get("file_last_time", 72),
+                        )
+                        return json.dumps(
+                            {"success": False, "error": "Storage quota exceeded"},
+                            ensure_ascii=False,
+                        )
+                return json.dumps({
+                    "success": True,
+                    "file_hash": result["file_hash"],
+                    "verified": result.get("verified", False),
+                    "hash": result["file_hash"],
+                    "download_url": "/file/get_file/{}".format(result["file_hash"]),
+                    "info_url": "/file/get_file_info/{}".format(result["file_hash"]),
+                    "file": file_metadata(result["file_hash"], uid),
+                }, ensure_ascii=False)
+
+            return json.dumps(result, ensure_ascii=False)
+        except KeyError as e:
+            return json.dumps({"success": False, "error": "Missing parameter"}, ensure_ascii=False)
+        except Exception:
+            return json.dumps({"success": False, "error": "Server error"}, ensure_ascii=False)
+
     @api('/file/dereference_file', methods=['POST'])
     def dereference_file(req):
         uid = req["uid"]
@@ -2399,11 +2513,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         qry = group_cursor.query_gid(gid)
         if len(qry) < 1:
             return {}
-        return list(qry[0])
-        
+        return json.dumps(list(qry[0]), ensure_ascii=False)
+
     @app.route("/group/groupname_search/<groupname>")
     def groupname_search(groupname : str):
-        return group_cursor.groupname_search(groupname)        
+        return json.dumps(group_cursor.groupname_search(groupname), ensure_ascii=False)
 
     @api("/group/add_admin", methods=['POST'])
     def add_admin(req):

@@ -7,8 +7,8 @@ GROUP_MEMBERS_MIGRATION = "group_members_v1"
 
 
 class GroupDb(Db):
-    def __init__(self, path: str, port_api: int, config_reader=None):
-        super().__init__(path, port_api, -1)
+    def __init__(self, path: str, port_api: int, config_reader=None, dialect=None):
+        super().__init__(path, port_api, -1, dialect=dialect)
         self._config_reader = config_reader or self._default_config_reader
         self.create_group_table()
 
@@ -110,22 +110,21 @@ class GroupDb(Db):
         return self._parse_essence(row[0][0])
 
     def _migrate(self):
-        from sqlite3 import OperationalError
         try:
             self.execute("ALTER TABLE groups ADD COLUMN allow_direct_join INTEGER NOT NULL DEFAULT 0")
-        except OperationalError:
+        except Exception:
             pass
         try:
             self.execute("ALTER TABLE groups ADD COLUMN require_review INTEGER NOT NULL DEFAULT 1")
-        except OperationalError:
+        except Exception:
             pass
         try:
             self.execute("ALTER TABLE groups ADD COLUMN essence TEXT DEFAULT '[]'")
-        except OperationalError:
+        except Exception:
             pass
         try:
             self.execute("ALTER TABLE groups ADD COLUMN essence_enabled INTEGER NOT NULL DEFAULT 1")
-        except OperationalError:
+        except Exception:
             pass
         self.execute("""
             CREATE TABLE IF NOT EXISTS group_members (
