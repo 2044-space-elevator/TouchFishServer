@@ -9,6 +9,15 @@ class MessagesDb(Db):
         self._migrate()
         self._create_indexes()
 
+    @staticmethod
+    def room_key_of(sender_uid: int, receiver_uid: int, group_id=None) -> str:
+        """房间的规范化 key：私聊为排序后的 UminUmax，群聊为 Ggid。"""
+        if group_id is not None:
+            return "G{}".format(group_id)
+        lo, hi = (sender_uid, receiver_uid) if sender_uid < receiver_uid \
+            else (receiver_uid, sender_uid)
+        return "U{}U{}".format(lo, hi)
+
     def _create_table(self):
         self.execute("""
             CREATE TABLE IF NOT EXISTS messages (
@@ -26,7 +35,9 @@ class MessagesDb(Db):
                 deleted_at REAL,
                 deleted_by INTEGER,
                 file_name TEXT,
-                forwarded INTEGER NOT NULL DEFAULT -1
+                forwarded INTEGER NOT NULL DEFAULT -1,
+                room_key TEXT,
+                room_seq INTEGER
             )
         """)
         self.execute("""
@@ -62,11 +73,41 @@ class MessagesDb(Db):
         for col, typ in [("group_id", "INTEGER"), ("client_mid", "TEXT"),
                          ("deleted_at", "REAL"), ("deleted_by", "INTEGER"),
                            ("file_name", "TEXT"),
-                           ("forwarded", "INTEGER NOT NULL DEFAULT -1")]:
+                           ("forwarded", "INTEGER NOT NULL DEFAULT -1"),
+                           ("room_key", "TEXT"), ("room_seq", "INTEGER")]:
             try:
                 self.execute("ALTER TABLE messages ADD COLUMN {} {}".format(col, typ))
             except Exception:
                 pass
+        self._backfill_room_sequences()
+
+    def _backfill_room_sequences(self):
+        """为旧数据回填 room_key / room_seq（按 mid 升序、每房间从 1 递增）。
+
+        幂等：仅处理 room_seq IS NULL 的行，重复执行安全。
+        """
+        with self.lock:
+            def operation():
+                rows = self.cursor.execute(
+                    "SELECT mid, sender_uid, receiver_uid, group_id "
+                    "FROM messages WHERE room_seq IS NULL ORDER BY mid ASC"
+                ).fetchall()
+                if not rows:
+                    self.conn.commit()
+                    return
+                seq_by_room = {}
+                updates = []
+                for mid, sender, receiver, gid in rows:
+                    key = self.room_key_of(sender, receiver, gid)
+                    seq_by_room[key] = seq_by_room.get(key, 0) + 1
+                    updates.append((key, seq_by_room[key], mid))
+                self.cursor.executemany(
+                    "UPDATE messages SET room_key = ?, room_seq = ? WHERE mid = ?",
+                    updates,
+                )
+                self.conn.commit()
+                print("[INFO] DATABASE 回填了 {} 条消息的 room_key/room_seq".format(len(updates)))
+            self._execute_with_retry(operation)
 
     def _create_indexes(self):
         try:
@@ -82,6 +123,8 @@ class MessagesDb(Db):
                ON messages(group_id, send_time DESC)""",
             """CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_sender_client_mid
                ON messages(sender_uid, client_mid) WHERE client_mid IS NOT NULL""",
+            """CREATE INDEX IF NOT EXISTS idx_messages_room_seq
+               ON messages(room_key, room_seq)""",
         ]
         for idx_sql in indexes:
             try:
@@ -93,23 +136,29 @@ class MessagesDb(Db):
                      content_type: str = 'plain', file_hash: str = None,
                       quote: int = -1, group_id: int = None,
                        client_mid: str = None, file_name: str = None,
-                       forwarded: int = -1) -> dict:
+                        forwarded: int = -1) -> dict:
         send_time = time.time()
         _IntegrityError = self.dialect.IntegrityError
         with self.lock:
             def operation():
+                room_key = self.room_key_of(sender_uid, receiver_uid, group_id)
                 try:
+                    row = self.cursor.execute(
+                        "SELECT MAX(room_seq) FROM messages WHERE room_key = ?",
+                        (room_key,),
+                    ).fetchone()
+                    room_seq = (row[0] + 1) if row and row[0] is not None else 1
                     self.cursor.execute(
                         """INSERT INTO messages
                            (client_mid, sender_uid, receiver_uid, group_id, content, content_type,
-                             file_hash, send_time, quote, file_name, forwarded)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                             file_hash, send_time, quote, file_name, forwarded, room_key, room_seq)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (client_mid, sender_uid, receiver_uid, group_id, content, content_type,
-                          file_hash, send_time, quote, file_name, forwarded),
+                          file_hash, send_time, quote, file_name, forwarded, room_key, room_seq),
                     )
                     mid = self.cursor.lastrowid
                     self.conn.commit()
-                    return mid, False
+                    return mid, room_seq, False
                 except _IntegrityError:
                     self.conn.rollback()
                     if client_mid:
@@ -119,10 +168,10 @@ class MessagesDb(Db):
                         )
                         existing = self.cursor.fetchone()
                         if existing:
-                            return existing[0], True
+                            return existing[0], None, True
                     raise
 
-            mid, duplicate = self._execute_with_retry(operation)
+            mid, room_seq, duplicate = self._execute_with_retry(operation)
 
         if duplicate:
             return {"mid": mid, "duplicate": True}
@@ -142,6 +191,8 @@ class MessagesDb(Db):
             "deleted_by": None,
             "file_name": file_name,
             "forwarded": forwarded,
+            "room_key": self.room_key_of(sender_uid, receiver_uid, group_id),
+            "room_seq": room_seq,
         }
 
     def query_history(self, uid: int, target_uid: int,
@@ -163,14 +214,85 @@ class MessagesDb(Db):
 
         sql = """SELECT mid, client_mid, sender_uid, receiver_uid, group_id,
                          content, content_type, file_hash, send_time, quote, deleted,
-                          deleted_at, deleted_by, file_name, forwarded
+                          deleted_at, deleted_by, file_name, forwarded, room_key, room_seq
                   FROM messages WHERE {} ORDER BY mid DESC LIMIT ?""".format(where)
         params.append(limit)
         return self.query(sql, tuple(params))
 
+    def query_sync(self, room_key: str, after_seq: int = 0,
+                   after_mid: int = 0, limit: int = 100) -> list:
+        """按房间增量同步：优先按 room_seq，其次按 mid，升序返回。
+
+        返回 serialized rows（含 room_seq），配合 current_seq 使用。
+        """
+        if after_seq < 0:
+            after_seq = 0
+        if after_mid < 0:
+            after_mid = 0
+        if after_seq > 0:
+            rows = self.query(
+                "{} WHERE room_key = ? AND room_seq > ? "
+                "ORDER BY room_seq ASC LIMIT ?".format(self._SELECT_ALL),
+                (room_key, after_seq, limit),
+            )
+        elif after_mid > 0:
+            rows = self.query(
+                "{} WHERE room_key = ? AND mid > ? "
+                "ORDER BY mid ASC LIMIT ?".format(self._SELECT_ALL),
+                (room_key, after_mid, limit),
+            )
+        else:
+            rows = self.query(
+                "{} WHERE room_key = ? "
+                "ORDER BY room_seq ASC LIMIT ?".format(self._SELECT_ALL),
+                (room_key, limit),
+            )
+        return self.serialize_rows(rows)
+
+    def sync_cursor_for_mid(self, room_key: str, mid: int):
+        """返回房间内 mid 的 (room_seq, deleted)，跨房间或不存在时返回 None。"""
+        rows = self.query(
+            "SELECT room_seq, deleted FROM messages WHERE room_key = ? AND mid = ?",
+            (room_key, mid),
+        )
+        return (rows[0][0], bool(rows[0][1])) if rows else None
+
+    def sync_after_seq_for_mid(self, room_key: str, mid: int):
+        """将旧客户端的 mid 游标转换为房间序号，不存在或跨房间时返回 None。"""
+        cursor = self.sync_cursor_for_mid(room_key, mid)
+        if cursor is None or cursor[0] is None:
+            return None
+        # recall_message moves the old mid to a new sequence; include that tombstone.
+        return max(cursor[0] - 1, 0) if cursor[1] else cursor[0]
+
+    def query_missing_sequences(self, room_key: str, sequences: list) -> list:
+        """按具体房间序号（缺失缺口）取消息，升序返回 serialized rows。"""
+        sequences = sorted({int(s) for s in sequences if s is not None})
+        if not sequences:
+            return []
+        placeholders = ",".join("?" * len(sequences))
+        rows = self.query(
+            "{} WHERE room_key = ? AND room_seq IN ({}) "
+            "ORDER BY room_seq ASC".format(self._SELECT_ALL, placeholders),
+            tuple([room_key] + sequences),
+        )
+        return self.serialize_rows(rows)
+
+    def current_room_seq(self, room_key: str) -> int:
+        rows = self.query(
+            "SELECT MAX(room_seq) FROM messages WHERE room_key = ?", (room_key,)
+        )
+        return rows[0][0] if rows and rows[0][0] is not None else 0
+
     _COLUMNS = ["mid", "client_mid", "sender_uid", "receiver_uid", "group_id",
                   "content", "content_type", "file_hash", "send_time", "quote", "deleted",
-                  "deleted_at", "deleted_by", "file_name", "forwarded"]
+                  "deleted_at", "deleted_by", "file_name", "forwarded",
+                  "room_key", "room_seq"]
+
+    _SELECT_ALL = ("SELECT mid, client_mid, sender_uid, receiver_uid, group_id,"
+                   " content, content_type, file_hash, send_time, quote, deleted,"
+                   " deleted_at, deleted_by, file_name, forwarded, room_key, room_seq"
+                   " FROM messages")
 
     @staticmethod
     def _redact_recalled(record: dict) -> dict:
@@ -227,7 +349,7 @@ class MessagesDb(Db):
             quote_rows = self.query(
                 """SELECT mid, client_mid, sender_uid, receiver_uid, group_id,
                           content, content_type, file_hash, send_time, quote, deleted,
-                           deleted_at, deleted_by, file_name, forwarded
+                           deleted_at, deleted_by, file_name, forwarded, room_key, room_seq
                    FROM messages WHERE mid IN ({})""".format(placeholders),
                 tuple(quote_mids),
             )
@@ -252,7 +374,8 @@ class MessagesDb(Db):
         rows = self.query(
             """SELECT mid, client_mid, sender_uid, receiver_uid, group_id,
                       content, content_type, file_hash, send_time, quote, deleted,
-                        deleted_at, deleted_by, file_name, forwarded FROM messages WHERE mid = ?""",
+                        deleted_at, deleted_by, file_name, forwarded, room_key, room_seq
+                      FROM messages WHERE mid = ?""",
             (mid,),
         )
         if not rows:
@@ -375,7 +498,8 @@ class MessagesDb(Db):
         rows = self.query(
             """SELECT mid, client_mid, sender_uid, receiver_uid, group_id,
                        content, content_type, file_hash, send_time, quote, deleted,
-                        deleted_at, deleted_by, file_name, forwarded FROM messages WHERE mid = ?""",
+                        deleted_at, deleted_by, file_name, forwarded, room_key, room_seq
+                      FROM messages WHERE mid = ?""",
             (mid,),
         )
         if not rows:
@@ -411,21 +535,38 @@ class MessagesDb(Db):
         )
         return self.get_message(rows[0][0]) if rows else None
 
-    def recall_message(self, mid: int, deleted_by: int) -> bool:
+    def recall_message(self, mid: int, deleted_by: int) -> int:
+        """撤回消息：置 deleted 并递增该房间 room_seq（离线端经 sync 收墓碑）。
+
+        返回新的 room_seq（>0 表示成功），失败返回 0。
+        """
         with self.lock:
             def operation():
+                row = self.cursor.execute(
+                    "SELECT room_key FROM messages WHERE mid = ? AND deleted = 0",
+                    (mid,),
+                ).fetchone()
+                if not row:
+                    self.conn.commit()
+                    return 0
+                room_key = row[0]
+                max_row = self.cursor.execute(
+                    "SELECT MAX(room_seq) FROM messages WHERE room_key = ?",
+                    (room_key,),
+                ).fetchone()
+                room_seq = (max_row[0] + 1) if max_row and max_row[0] is not None else 1
                 self.cursor.execute(
-                    """UPDATE messages SET deleted = 1, deleted_at = ?, deleted_by = ?
-                       WHERE mid = ? AND deleted = 0""",
-                    (time.time(), deleted_by, mid),
+                    """UPDATE messages SET deleted = 1, deleted_at = ?, deleted_by = ?,
+                       room_seq = ? WHERE mid = ? AND deleted = 0""",
+                    (time.time(), deleted_by, room_seq, mid),
                 )
                 changed = self.cursor.rowcount > 0
                 self.conn.commit()
-                return changed
+                return room_seq if changed else 0
             return self._execute_with_retry(operation)
 
     def delete_message(self, mid: int) -> bool:
-        return self.recall_message(mid, 0)
+        return self.recall_message(mid, 0) > 0
 
     def count_file_references(self, file_hash: str) -> int:
         rows = self.query(

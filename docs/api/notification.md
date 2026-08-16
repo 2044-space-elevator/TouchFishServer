@@ -4,10 +4,21 @@
 
 TFV5 的通知系统由两部分组成：
 
-1. Secret API：查询和清理持久化通知。
+1. Secret API：查询、清理持久化通知，以及服务端已读状态管理。
 2. TCP WebSocket：推送实时通知。
 
 需要注意的是，WebSocket 只负责推送新通知，不会在登录后自动补发历史通知。客户端应先通过查询 API 拉取历史通知，再保持 TCP 连接接收后续推送。
+
+## 消息与通知分离
+
+注意：TouchFish 已重构通知系统！旧版将不保证兼容性！
+
+新协议中聊天消息不再写入通知系统：
+
+- 消息实时推送将使用 `MESSAGE.NEW`（见[消息文档](message.md)），历史/断线补拉 `/message/sync`；
+- 通知表（notifications）将只保存系统事件（好友、群聊、论坛、公告等），并新增服务端已读状态（`read_at`）与事件类别（`kind`，消息事件=1，系统事件=0）；
+- 旧版本写入通知表的消息事件记录会保留在库中（不删除数据），但所有查询 API 均不再返回。
+
 
 ## 通知数据结构
 
@@ -15,7 +26,9 @@ TFV5 的通知系统由两部分组成：
 
 ```json
 {
+    "id" : <id>,
     "time_stamp" : <time_stamp>,
+    "read_at" : <read_at_or_null>,
     "info" : {
         "event" : <event>,
         "title" : <title>,
@@ -28,7 +41,9 @@ TFV5 的通知系统由两部分组成：
 
 其中：
 
+- `<id>` 是通知唯一 ID，用于单条已读。
 - `<time_stamp>` 是通知生成时间，为时间戳。
+- `<read_at>` 是服务端已读时间，未读时为 `null`。
 - `<event>` 是事件类型。
 - `<title>` 是通知标题。
 - `<content>` 是通知正文。
@@ -60,9 +75,8 @@ TFV5 的通知系统由两部分组成：
 - `group.invited`
 - `group.invited.pending`
 - `group.join.approved`
-- `message.plain`
-- `message.file`
-- `message.recalled`
+
+消息事件（`message.plain` / `message.file` / `message.recalled`）已不再出现在通知系统中。
 
 ## Secret API
 
@@ -135,6 +149,92 @@ TFV5 的通知系统由两部分组成：
 
 返回体：删除成功返回时间戳加 `True`，否则返回时间戳加 `False`。
 
+- `^ POST /notification/unread_count` 查询未读通知数（仅系统事件）。
+
+请求体：
+
+```json
+{
+
+}
+```
+
+返回体：
+
+```json
+{
+    "count" : <未读数>
+}
+```
+
+- `^ POST /notification/mark_read` 将通知标记为已读（服务端写入 `read_at`）。
+
+请求体（二选一）：
+
+```json
+{
+    "time_stamp" : <时间戳>
+}
+```
+
+将 `<time_stamp>` 及之前的系统通知全部标为已读；或：
+
+```json
+{
+    "ids" : [<通知 id>, ...]
+}
+```
+
+按 id 单条标记。返回体：
+
+```json
+{
+    "success" : true,
+    "changed" : <影响行数>
+}
+```
+
+- `^ POST /notification/mark_all_read` 将全部系统通知标记为已读。
+
+请求体：
+
+```json
+{
+
+}
+```
+
+返回体同 `mark_read`。
+
+- `^ POST /notification/list` 分页查询系统通知（按时间倒序）。
+
+请求体：
+
+```json
+{
+    "offset" : <偏移>,
+    "take" : <每页条数，默认 50，最大 100>
+}
+```
+
+返回体：
+
+```json
+{
+    "items" : [<通知结构>, ...],
+    "total" : <总条数>,
+    "has_more" : <是否还有下一页>
+}
+```
+
+## 数据迁移说明
+
+升级到 v2 时，服务端自动完成以下无损迁移：
+
+- `messages` 表新增 `room_key`（房间规范化 key）与 `room_seq`（房间内单调递增序号），旧数据按 `mid` 升序回填，不删除任何消息；
+- `notifications` 表新增 `read_at`（已读时间）与 `kind`（0=系统事件，1=消息事件）列；旧记录按事件类型回填，旧消息事件**保留在库中但不再展示**；
+- 旧通知一律视为已读（`read_at = time_stamp`），升级后未读数从 0 开始。
+
 ## TCP WebSocket 实时推送
 
 通知实时推送使用服务器的 `port_tcp` 端口，端口值可通过 `GET /info` 获取。
@@ -198,101 +298,60 @@ ws://<server_host>:<port_tcp>
 
 客户端收到 `NOTIFICATION.NEW` 后，可以直接展示，也可以用其中的 `time_stamp` 配合 `query_after` 或 `delete_before` 做本地同步与清理。
 
-#### 接收文本消息
+### 聊天消息的实时推送（v2）
 
-**在 `info` 中**，有：
-```json
-{
-    "event" : "message.plain",
-    "title" : "<send_time>",
-    "content" : <content>,
-    "sender" : "<sender_id>",
-    "meta" : <quote_mid>,
-    "mid" : <mid>,
-    "client_mid" : <client_mid>,
-    "room_id" : "<room_id>",
-    "group_id" : <group_id>,
-    "quote_preview" : <quote_preview_or_null>,
-    "forwarded" : <forwarded_mid>,
-    "forward_preview" : <forward_preview_or_null>,
-    "mentioned_uids" : [<uid>, ...],
-    "mentions_me" : <true_or_false>,
-    "should_alert" : <true_or_false>
-}
-```
-
-新增字段说明：
-- `<mid>`：服务端分配的消息唯一 ID。
-- `<client_mid>`：客户端发送时携带的去重标识（若发送时未携带则为 `null`）。
-- `<room_id>`：聊天室标识。私聊时，接收方看到的 `room_id` 为发送者 uid（`"U<sender_uid>"`），发送方（自己也会收到推送）看到的为 `"U<target_uid>"`。群聊时为 `"G<gid>"`。
-- `<group_id>`：仅群聊消息存在，为群 gid；私聊消息不包含该字段。
-- `<forwarded>`：转发来源消息的 `mid`；非转发消息为 `-1`。
-- `<forward_preview>`：转发来源消息摘要，结构与 `quote_preview` 相同；非转发消息为 `null`。
-- `<mentioned_uids>`：消息中完整的、经服务端解析出的 @提及用户 uid 列表；发送方收到的副本也保留此列表。
-- `<mentions_me>`：当前接收用户是否在被提及列表中。发送方收到的推送中固定为 `false`。
-- `<should_alert>`：客户端是否应触发通知提醒。由用户的聊天室偏好（`notify_level`）和被提及状态共同决定。发送方收到的推送中固定为 `false`。
-
-`<sender_id>` 的格式：
-- 私聊：`"U<uid>"`，如 `"U0"`。
-- 群聊：`"G<gid>U<uid>"`，如 `"G0U0"`。
-
-其余字段含义见[消息文档](message.md)。
-
-#### 接收文件消息
-
-**在 `info` 中**，有：
-```json
-{
-    "event" : "message.file",
-    "title" : "<send_time>",
-    "content" : <hashes>,
-    "sender" : "<sender_id>",
-    "meta" : <quote_mid>,
-    "mid" : <mid>,
-    "file_hash" : <hashes>,
-    "client_mid" : <client_mid>,
-    "room_id" : "<room_id>",
-    "group_id" : <group_id>,
-    "quote_preview" : <quote_preview_or_null>,
-    "forwarded" : <forwarded_mid>,
-    "forward_preview" : <forward_preview_or_null>,
-    "file" : <file_metadata>,
-    "mentioned_uids" : [],
-    "mentions_me" : false,
-    "should_alert" : <true_or_false>
-}
-```
-
-格式说明同文本消息。`<hashes>` 是文件的取件码。`quote_preview` 是回复目标摘要，`forward_preview` 是转发来源摘要，`file` 是文件名、大小、MIME 类型、扩展名和下载地址等元数据。文件消息不支持 @提及，`mentioned_uids` 固定为空数组，`mentions_me` 固定为 `false`。
-
-#### 消息撤回通知
-
-撤回成功后，相关在线用户会收到：
+自 v2 起，聊天消息不再通过 `NOTIFICATION.NEW` 推送，改为独立的 `MESSAGE.NEW` 事件：
 
 ```json
 {
-    "type" : "NOTIFICATION.NEW",
-    "notification" : {
-        "time_stamp" : <time_stamp>,
-        "info" : {
-            "event" : "message.recalled",
-            "title" : "<deleted_at>",
-            "content" : null,
-            "sender" : <operator_uid>,
-            "mid" : <mid>,
-            "deleted" : true,
-            "deleted_at" : <deleted_at>,
-            "deleted_by" : <operator_uid>,
-            "room_id" : <room_id>,
-            "group_id" : <group_id_or_null>
-        }
+    "type" : "MESSAGE.NEW",
+    "message" : {
+        "event" : "message.plain",
+        "title" : "<send_time>",
+        "content" : <content>,
+        "sender" : "<sender_id>",
+        "mid" : <mid>,
+        "client_mid" : <client_mid>,
+        "room_id" : "<room_id>",
+        "group_id" : <group_id>,
+        "room_seq" : <房间序号>,
+        "quote_preview" : <quote_preview_or_null>,
+        "forwarded" : <forwarded_mid>,
+        "forward_preview" : <forward_preview_or_null>,
+        "mentioned_uids" : [<uid>, ...],
+        "mentions_me" : <true_or_false>,
+        "should_alert" : <true_or_false>
     }
 }
 ```
 
-通知不会包含被撤回的原始内容。撤回接口和权限规则见[消息文档](message.md#撤回消息)。
+`room_seq` 是该房间内单调递增的消息序号，客户端据此检测缺口并通过 `/message/sync` 补拉（详见[消息文档](message.md#增量同步)）。文件消息为 `"event": "message.file"`，字段与旧协议一致。
 
-### 客户端发送消息
+#### 消息撤回推送（MESSAGE.RECALLED）
+
+撤回成功后会推送：
+
+```json
+{
+    "type" : "MESSAGE.RECALLED",
+    "message" : {
+        "event" : "message.recalled",
+        "content" : null,
+        "sender" : <operator_uid>,
+        "mid" : <mid>,
+        "deleted" : true,
+        "deleted_at" : <deleted_at>,
+        "deleted_by" : <operator_uid>,
+        "room_id" : <room_id>,
+        "group_id" : <group_id_or_null>,
+        "room_seq" : <递增后的房间序号>
+    }
+}
+```
+
+撤回还会使 `messages` 表中该消息所在房间的 `room_seq` 递增，离线客户端重连后通过 `/message/sync` 获取记录（不再残留原文）。
+
+### 发送消息与确认
 
 TFV5 在 WebSocket 中支持发送文本和文件消息，可带引用。
 

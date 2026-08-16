@@ -2,10 +2,13 @@ from db.tool import Db
 import json
 import time
 
+_MESSAGE_EVENTS = {"message.plain", "message.file", "message.recalled"}
+
 class NotificationsDb(Db):
     def __init__(self, path: str, port_api: int, dialect=None):
         super().__init__(path, port_api, -1, dialect=dialect)
         self._ensure_unified_table()
+        self._migrate_new_columns()
         self._migrate_legacy_tables()
 
     def _ensure_unified_table(self):
@@ -15,13 +18,72 @@ CREATE TABLE IF NOT EXISTS notifications (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     uid        INTEGER NOT NULL,
     time_stamp REAL    NOT NULL,
-    info       TEXT    NOT NULL
+    info       TEXT    NOT NULL,
+    read_at    REAL,
+    kind       INTEGER NOT NULL DEFAULT 0
+)
+""")
+        self.execute("""
+CREATE TABLE IF NOT EXISTS notification_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
 )
 """)
         self.execute(
             "CREATE INDEX IF NOT EXISTS idx_notifications_uid_ts "
             "ON notifications (uid, time_stamp)"
         )
+
+    def _migrate_new_columns(self):
+        """为旧 db补 read_at / kind 列，并回填历史数据（仅首次，幂等）。
+
+        - kind: 消息事件=1，系统事件=0（旧消息事件保留在库中，仅不再展示）
+        - read_at: 旧通知一律视为已读（read_at = time_stamp），未读数从 0 起步
+        """
+        for col, typ in [("read_at", "REAL"), ("kind", "INTEGER")]:
+            try:
+                self.execute("ALTER TABLE notifications ADD COLUMN {} {}".format(col, typ))
+            except Exception:
+                pass
+        try:
+            self.execute(
+                "CREATE INDEX IF NOT EXISTS idx_notifications_uid_kind "
+                "ON notifications (uid, kind, time_stamp)"
+            )
+        except Exception:
+            pass
+        self._backfill_kind_and_read()
+
+    def _backfill_kind_and_read(self):
+        with self.lock:
+            def operation():
+                marker = self.cursor.execute(
+                    "SELECT value FROM notification_meta WHERE key = 'v2_migrated'"
+                ).fetchone()
+                if marker:
+                    self.conn.commit()
+                    return
+                rows = self.cursor.execute(
+                    "SELECT id, info FROM notifications WHERE kind IS NULL"
+                ).fetchall()
+                if rows:
+                    updates = []
+                    for nid, raw_info in rows:
+                        event = self._deserialize_event(raw_info).get("event", "")
+                        updates.append((1 if event in _MESSAGE_EVENTS else 0, nid))
+                    self.cursor.executemany(
+                        "UPDATE notifications SET kind = ? WHERE id = ?", updates
+                    )
+                self.cursor.execute(
+                    "UPDATE notifications SET read_at = time_stamp WHERE read_at IS NULL"
+                )
+                self.cursor.execute(
+                    "INSERT OR REPLACE INTO notification_meta(key, value) "
+                    "VALUES ('v2_migrated', '1')"
+                )
+                self.conn.commit()
+                print("[INFO] DATABASE 完成通知 v2 迁移（kind/read_at 回填）")
+            self._execute_with_retry(operation)
 
     def _migrate_legacy_tables(self):
         """将 U{uid} 格式的每用户表迁移到统一表"""
@@ -48,14 +110,17 @@ CREATE TABLE IF NOT EXISTS notifications (
                         "SELECT time_stamp FROM notifications WHERE uid = ?", (uid,)
                     )
                 }
-                to_insert = [
-                    (uid, ts, info)
-                    for ts, info in old_rows
-                    if ts not in existing_ts
-                ]
+                to_insert = []
+                for ts, info in old_rows:
+                    if ts in existing_ts:
+                        continue
+                    event = self._deserialize_event(info)
+                    to_insert.append(
+                        (uid, ts, self._serialize_event(event), self._event_kind(event))
+                    )
                 if to_insert:
                     self.update(
-                        "INSERT INTO notifications (uid, time_stamp, info) VALUES (?, ?, ?)",
+                        "INSERT INTO notifications (uid, time_stamp, info, kind) VALUES (?, ?, ?, ?)",
                         to_insert,
                     )
 
@@ -87,41 +152,70 @@ CREATE TABLE IF NOT EXISTS notifications (
         """删除用户的所有通知"""
         uid = int(uid)
         self.execute("DELETE FROM notifications WHERE uid = ?", (uid,))
-    def add_event(self, uid: int, event) -> float:
+
+    @staticmethod
+    def _event_kind(event: dict) -> int:
+        return 1 if event.get("event") in _MESSAGE_EVENTS else 0
+
+    def add_event(self, uid: int, event) -> dict:
+        """写入一条通知，返回 {"id": nid, "time_stamp": ts}。"""
         uid = int(uid)
         ts = time.time()
-        self.execute(
-            "INSERT INTO notifications (uid, time_stamp, info) VALUES (?, ?, ?)",
-            (uid, ts, self._serialize_event(event)),
+        nid = self.execute(
+            "INSERT INTO notifications (uid, time_stamp, info, kind) VALUES (?, ?, ?, ?)",
+            (uid, ts, self._serialize_event(event), self._event_kind(self._as_dict(event))),
         )
-        return ts
+        return {"id": nid, "time_stamp": ts}
 
     def add_events(self, uid_and_events) -> list:
-        """批量插入多条通知，单事务提交，返回与输入顺序一致的时间戳列表。
+        """批量插入多条通知，单事务提交，返回与输入顺序一致的记录列表。
 
         :param uid_and_events: [(uid, event), ...]
+        :return: [{"id": nid, "time_stamp": ts}, ...]
         """
         if not uid_and_events:
             return []
         now = time.time()
         values = []
-        timestamps = []
         for index, (uid, event) in enumerate(uid_and_events):
             ts = now + index * 1e-6
-            values.append((int(uid), ts, self._serialize_event(event)))
-            timestamps.append(ts)
+            values.append((int(uid), ts, self._serialize_event(event), self._event_kind(self._as_dict(event))))
         with self.lock:
             def operation():
                 self.cursor.executemany(
-                    "INSERT INTO notifications (uid, time_stamp, info) VALUES (?, ?, ?)",
+                    "INSERT INTO notifications (uid, time_stamp, info, kind) VALUES (?, ?, ?, ?)",
                     values,
                 )
                 self.conn.commit()
             self._execute_with_retry(operation)
-        return timestamps
+        # 按 (uid, time_stamp) 回查 id（取最大 id，兼容低时间戳精度），保证与输入同序
+        records = []
+        for uid, ts, _, _ in values:
+            rows = self.query(
+                "SELECT id FROM notifications WHERE uid = ? AND time_stamp = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (uid, ts),
+            )
+            nid = rows[0][0] if rows else None
+            records.append({"id": nid, "time_stamp": ts})
+        return records
+
+    @staticmethod
+    def _as_dict(event) -> dict:
+        if isinstance(event, dict):
+            return event
+        try:
+            parsed = json.loads(event) if isinstance(event, str) else None
+            return parsed if isinstance(parsed, dict) else {}
+        except (json.JSONDecodeError, TypeError):
+            return {}
 
     def redact_recalled_message(self, mid : int):
-        """删除消息内容，保留引用预览"""
+        """[DEPRECATED] 删除消息内容，保留引用预览。
+
+        自 v2 起消息事件不再写入 notifications 表，此方法仅为兼容旧数据保留，
+        新代码不应再调用。
+        """
         with self.lock:
             def operation():
                 self.cursor.execute(
@@ -157,23 +251,103 @@ CREATE TABLE IF NOT EXISTS notifications (
 
             return self._execute_with_retry(operation)
 
-    def query_events_after(self, uid: int, time_stamp):
+    def query_events_after(self, uid: int, time_stamp, limit: int = None):
         uid = int(uid)
-        return self.query(
-            "SELECT time_stamp, info FROM notifications "
-            "WHERE uid = ? AND time_stamp > ? "
-            "ORDER BY time_stamp ASC",
-            (uid, time_stamp),
-        )
+        sql = ("SELECT id, time_stamp, read_at, info FROM notifications "
+               "WHERE uid = ? AND (kind IS NULL OR kind = 0) AND time_stamp > ? "
+               "ORDER BY time_stamp ASC")
+        params = (uid, time_stamp)
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = params + (limit,)
+        return self.query(sql, params)
 
     def query_all_events(self, uid: int):
         return self.query_events_after(uid, 0)
 
+    def list_events_page(self, uid: int, offset: int = 0, take: int = 50) -> tuple:
+        """分页查询系统通知（kind=0），按时间倒序。返回 (rows, total)。"""
+        uid = int(uid)
+        total_rows = self.query(
+            "SELECT COUNT(*) FROM notifications WHERE uid = ? AND (kind IS NULL OR kind = 0)",
+            (uid,),
+        )
+        total = total_rows[0][0] if total_rows and total_rows[0][0] is not None else 0
+        rows = self.query(
+            "SELECT id, time_stamp, read_at, info FROM notifications "
+            "WHERE uid = ? AND (kind IS NULL OR kind = 0) "
+            "ORDER BY time_stamp DESC, id DESC LIMIT ? OFFSET ?",
+            (uid, take, offset),
+        )
+        return rows, total
+
+    def unread_count(self, uid: int) -> int:
+        uid = int(uid)
+        rows = self.query(
+            "SELECT COUNT(*) FROM notifications "
+            "WHERE uid = ? AND (kind IS NULL OR kind = 0) AND read_at IS NULL",
+            (uid,),
+        )
+        return rows[0][0] if rows and rows[0][0] is not None else 0
+
+    def mark_read_until(self, uid: int, time_stamp) -> int:
+        """把指定时间戳及之前的系统通知全部标为已读，返回影响数。"""
+        uid = int(uid)
+        with self.lock:
+            def operation():
+                self.cursor.execute(
+                    "UPDATE notifications SET read_at = ? "
+                    "WHERE uid = ? AND (kind IS NULL OR kind = 0) "
+                    "AND time_stamp <= ? AND read_at IS NULL",
+                    (time.time(), uid, time_stamp),
+                )
+                changed = self.cursor.rowcount
+                self.conn.commit()
+                return changed
+            return self._execute_with_retry(operation)
+
+    def mark_read_ids(self, uid: int, ids) -> int:
+        """把指定 id 的系统通知标为已读，返回影响数。"""
+        ids = [int(i) for i in ids if str(i).lstrip('-').isdigit()]
+        if not ids:
+            return 0
+        uid = int(uid)
+        placeholders = ",".join("?" * len(ids))
+        with self.lock:
+            def operation():
+                self.cursor.execute(
+                    "UPDATE notifications SET read_at = ? "
+                    "WHERE uid = ? AND (kind IS NULL OR kind = 0) "
+                    "AND id IN ({}) AND read_at IS NULL".format(placeholders),
+                    tuple([time.time(), uid] + ids),
+                )
+                changed = self.cursor.rowcount
+                self.conn.commit()
+                return changed
+            return self._execute_with_retry(operation)
+
+    def mark_all_read(self, uid: int) -> int:
+        uid = int(uid)
+        with self.lock:
+            def operation():
+                self.cursor.execute(
+                    "UPDATE notifications SET read_at = ? "
+                    "WHERE uid = ? AND (kind IS NULL OR kind = 0) AND read_at IS NULL",
+                    (time.time(), uid),
+                )
+                changed = self.cursor.rowcount
+                self.conn.commit()
+                return changed
+            return self._execute_with_retry(operation)
+
     def list_events_after(self, uid: int, time_stamp):
         events = []
-        for item_ts, raw_event in self.query_events_after(uid, time_stamp):
+        for row in self.query_events_after(uid, time_stamp):
+            nid, item_ts, read_at, raw_event = row[0], row[1], row[2], row[3]
             event = self._deserialize_event(raw_event)
             event["time_stamp"] = item_ts
+            event["id"] = nid
+            event["read_at"] = read_at
             events.append(event)
         return events
 
@@ -182,9 +356,15 @@ CREATE TABLE IF NOT EXISTS notifications (
 
     def serialize_rows(self, rows):
         serialized = []
-        for ts, raw_event in rows:
+        for row in rows:
+            nid, ts, read_at, raw_event = row[0], row[1], row[2], row[3]
             event = self._deserialize_event(raw_event)
-            serialized.append({"time_stamp": ts, "info": event})
+            serialized.append({
+                "id": nid,
+                "time_stamp": ts,
+                "read_at": read_at,
+                "info": event,
+            })
         return serialized
 
     def delete_events_before(self, uid: int, time_stamp) -> bool:

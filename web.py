@@ -19,6 +19,7 @@ from json_store import read_json, update_json
 from datetime import datetime
 from file_types import detect_file_type, is_sticker_type
 import oss_store
+from sync_limits import SYNC_MAX_LIMIT, parse_sync_missing_sequences
 
 def bool_res() -> tuple: 
     return (str(time.time()) + "False", str(time.time()) + "True")
@@ -1205,6 +1206,61 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if not user_cursor.verify_user(uid, password):
             return bool_res()[False]
         return bool_res()[notification_cursor.delete_all_events(uid)]
+
+    @api("/notification/unread_count", methods=['POST'])
+    def notification_unread_count(req):
+        uid = req["uid"]
+        password = req["password"]
+        if not user_cursor.verify_user(uid, password):
+            return bool_res()[False]
+        return json.dumps({"count": notification_cursor.unread_count(uid)}, ensure_ascii=False)
+
+    @api("/notification/mark_read", methods=['POST'])
+    def notification_mark_read(req):
+        uid = req["uid"]
+        password = req["password"]
+        if not user_cursor.verify_user(uid, password):
+            return bool_res()[False]
+        try:
+            time_stamp = req.get("time_stamp")
+            ids = req.get("ids")
+            if time_stamp is not None:
+                time_stamp = float(time_stamp)
+                changed = notification_cursor.mark_read_until(uid, time_stamp)
+            elif ids is not None:
+                changed = notification_cursor.mark_read_ids(uid, ids)
+            else:
+                return bool_res()[False]
+        except (TypeError, ValueError):
+            return bool_res()[False]
+        return json.dumps({"success": True, "changed": changed}, ensure_ascii=False)
+
+    @api("/notification/mark_all_read", methods=['POST'])
+    def notification_mark_all_read(req):
+        uid = req["uid"]
+        password = req["password"]
+        if not user_cursor.verify_user(uid, password):
+            return bool_res()[False]
+        changed = notification_cursor.mark_all_read(uid)
+        return json.dumps({"success": True, "changed": changed}, ensure_ascii=False)
+
+    @api("/notification/list", methods=['POST'])
+    def notification_list(req):
+        uid = req["uid"]
+        password = req["password"]
+        if not user_cursor.verify_user(uid, password):
+            return bool_res()[False]
+        try:
+            offset = max(int(req.get("offset", 0)), 0)
+            take = min(max(int(req.get("take", 50)), 1), 100)
+        except (TypeError, ValueError):
+            return bool_res()[False]
+        rows, total = notification_cursor.list_events_page(uid, offset, take)
+        return json.dumps({
+            "items": notification_cursor.serialize_rows(rows),
+            "total": total,
+            "has_more": offset + len(rows) < total,
+        }, ensure_ascii=False)
 
     @api("/auth/mention_candidates", methods=['POST'])
     def mention_candidates(req):
@@ -3481,24 +3537,27 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 room_id = "G{}".format(group_id)
                 for user in group_cursor.get_member_uids(group_id):
                     user_notif = dict(notif)
+                    user_notif["room_seq"] = msg_record.get("room_seq")
                     user_notif["mentions_me"] = user in mentioned_uids
                     user_notif["should_alert"] = user != uid and should_alert(
                         messages_cursor, user, room_id, mentioned_uids
                     )
-                    instant_contact.notify_user(user, user_notif)
+                    instant_contact.push_message(user, user_notif)
             else:
                 recv_notif = dict(notif)
                 recv_notif["room_id"] = "U{}".format(uid)
+                recv_notif["room_seq"] = msg_record.get("room_seq")
                 recv_notif["mentions_me"] = target_uid in mentioned_uids
                 recv_notif["should_alert"] = should_alert(
                     messages_cursor, target_uid, recv_notif["room_id"], mentioned_uids
                 )
                 sender_notif = dict(notif)
                 sender_notif["room_id"] = "U{}".format(target_uid)
+                sender_notif["room_seq"] = msg_record.get("room_seq")
                 sender_notif["mentions_me"] = False
                 sender_notif["should_alert"] = False
-                instant_contact.notify_user(target_uid, recv_notif)
-                instant_contact.notify_user(uid, sender_notif)
+                instant_contact.push_message(target_uid, recv_notif)
+                instant_contact.push_message(uid, sender_notif)
 
             response_message = dict(msg_record)
             response_message["mentioned_uids"] = mentioned_uids
@@ -3710,7 +3769,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             file_cursor.remove_reference(message["file_hash"], "message", mid)
 
         recalled = messages_cursor.get_message(mid)
-        notification_cursor.redact_recalled_message(mid)
         event = {
             "event": "message.recalled",
             "title": str(recalled["deleted_at"]),
@@ -3721,6 +3779,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             "deleted_at": recalled["deleted_at"],
             "deleted_by": uid,
             "group_id": recalled["group_id"],
+            "room_seq": recalled.get("room_seq"),
             "room_id": (
                 "G{}".format(recalled["group_id"])
                 if recalled["group_id"] is not None
@@ -3737,10 +3796,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                              else recalled["sender_uid"])
                 direct_event = dict(event)
                 direct_event["room_id"] = "U{}".format(other_uid)
-                instant_contact.notify_user(recipient, direct_event)
+                instant_contact.push_recall(recipient, direct_event)
             recipients = []
         for recipient in recipients:
-            instant_contact.notify_user(recipient, event)
+            instant_contact.push_recall(recipient, event)
         return json.dumps({
             "success": True,
             "message": recalled,
@@ -3808,6 +3867,89 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             before_mid=before_mid, limit=limit, group_id=group_id)
         records = messages_cursor.serialize_rows(rows)
         return json.dumps(enrich_message_files(records), ensure_ascii=False)
+
+    @api("/message/sync", methods=['POST'])
+    def message_sync(req):
+        """增量同步某房间消息（含缺口补拉）。
+
+        请求体：
+            room_id: "U<uid>" 或 "G<gid>"
+            last_seq: 上次同步到的房间序号（可选，与 last_mid 二选一）
+            last_mid: 上次同步到的 mid（旧客户端迁移用，可选）
+            missing_sequences: [seq, ...]（可选，精确缺口）
+            missing_sequence_ranges: [{"start_seq": s, "end_seq": e}, ...]（可选）
+            limit: 每批上限（默认 100，最大 200）
+
+        返回：
+            {"messages": [...], "current_seq": int, "has_more": bool}
+        """
+        try:
+            uid = int(req["uid"])
+            password = req["password"]
+            room_id = str(req["room_id"])
+            last_seq = int(req.get("last_seq", 0))
+            last_mid = int(req.get("last_mid", 0))
+            limit = max(1, min(int(req.get("limit", 100)), SYNC_MAX_LIMIT))
+        except (KeyError, TypeError, ValueError):
+            return bool_res()[False]
+        if not user_cursor.verify_user(uid, password):
+            return bool_res()[False]
+        user_row = get_user_row(uid)
+        if user_row is None or user_row[4] == 'banned':
+            return bool_res()[False]
+
+        if room_id.startswith('G'):
+            gid = int(room_id[1:])
+            if not group_cursor.is_member(gid, uid):
+                return bool_res()[False]
+            room_key = messages_cursor.room_key_of(uid, 0, group_id=gid)
+        elif room_id.startswith('U'):
+            target_uid = int(room_id[1:])
+            if not user_cursor.is_friend(uid, target_uid):
+                return bool_res()[False]
+            room_key = messages_cursor.room_key_of(uid, target_uid)
+        else:
+            return bool_res()[False]
+
+        try:
+            missing_sequences = parse_sync_missing_sequences(req)
+            if missing_sequences is None:
+                return bool_res()[False]
+
+            after_seq = last_seq
+            if after_seq < 0 or last_mid < 0:
+                return bool_res()[False]
+            if after_seq <= 0 and last_mid > 0:
+                after_seq = messages_cursor.sync_after_seq_for_mid(room_key, last_mid)
+                if after_seq is None:
+                    return bool_res()[False]
+
+            incremental_records = messages_cursor.query_sync(
+                room_key,
+                after_seq=after_seq,
+                limit=limit + 1,
+            )
+            has_more = len(incremental_records) > limit
+            records = incremental_records[:limit]
+            if missing_sequences:
+                missing_records = messages_cursor.query_missing_sequences(
+                    room_key, missing_sequences)
+                by_mid = {r["mid"]: r for r in records}
+                for r in missing_records:
+                    if r["mid"] not in by_mid:
+                        records.append(r)
+                        by_mid[r["mid"]] = r
+                records.sort(key=lambda r: (r.get("room_seq") or 0, r.get("mid") or 0))
+
+            current_seq = messages_cursor.current_room_seq(room_key)
+            return json.dumps({
+                "messages": enrich_message_files(records),
+                "current_seq": current_seq,
+                "has_more": has_more,
+            }, ensure_ascii=False)
+        except Exception as e:
+            print("[WARN] message_sync failed: {}".format(e))
+            return bool_res()[False]
 
     @api("/friend/add_friend", methods=['POST'])
     def add_friend(req):

@@ -196,9 +196,6 @@ class InstantConnect():
         if queue is not None:
             await queue.put(message)
 
-    async def _notify_user_async(self, uid : int, notification : dict):
-        return await asyncio.to_thread(self.notify_user, uid, notification)
-
     def _queue_ack(self, websocket, client_mid=None, status="sent", mid=None, error=None):
         if client_mid is None or websocket not in self.send_queue or self.loop is None:
             return
@@ -221,24 +218,16 @@ class InstantConnect():
                 self._cleanup_client(websocket)
 
     def notify_user(self, uid : int, notification : dict):
+        """推送系统事件通知（写入 notifications 表，再推 NOTIFICATION.NEW）
+
+        消息事件不再走此通道，请使用 push_message / push_messages。
+        """
         notification = dict(notification)
-        if notification.get("event") in {"message.plain", "message.file"}:
-            mid = notification.get("mid")
-            message = self.messages_cursor.get_message(mid) if mid is not None else None
-            if message and message.get("deleted"):
-                notification["content"] = None
-                notification.pop("file_hash", None)
-                notification.pop("file", None)
-                notification["deleted"] = True
-                notification["deleted_at"] = message.get("deleted_at")
-                notification["deleted_by"] = message.get("deleted_by")
-        preview = notification.get("quote_preview")
-        if isinstance(preview, dict) and preview.get("mid") is not None:
-            latest_preview = self.messages_cursor.get_quote_preview(preview["mid"])
-            if latest_preview is not None:
-                notification["quote_preview"] = latest_preview
+        stored = self.notification_cursor.add_event(uid, notification)
         record = {
-            "time_stamp" : self.notification_cursor.add_event(uid, notification),
+            "id" : stored["id"],
+            "time_stamp" : stored["time_stamp"],
+            "read_at" : None,
             "info" : notification
         }
         if self.loop is None:
@@ -253,23 +242,28 @@ class InstantConnect():
         return record
 
     def notify_users(self, uid_notifications) -> list:
-        """批量写入通知并推送给各自已连接的客户端，单事务提交。
+        """批量写入系统事件通知并推送给各自已连接的客户端，单事务提交。
 
         :param uid_notifications: [(uid, notification), ...]
-        :return: [{time_stamp, info}, ...]
+        :return: [{id, time_stamp, read_at, info}, ...]
         """
         if not uid_notifications:
             return []
         prepared = [(int(uid), dict(notification)) for uid, notification in uid_notifications]
-        timestamps = self.notification_cursor.add_events(prepared)
+        stored = self.notification_cursor.add_events(prepared)
         with self._clients_lock:
             client_map = {
                 uid: list(self.connected_clients.get(uid, []))
                 for uid, _ in prepared
             }
         records = []
-        for (uid, notification), time_stamp in zip(prepared, timestamps):
-            record = {"time_stamp" : time_stamp, "info" : notification}
+        for (uid, notification), meta in zip(prepared, stored):
+            record = {
+                "id" : meta["id"],
+                "time_stamp" : meta["time_stamp"],
+                "read_at" : None,
+                "info" : notification
+            }
             records.append(record)
             if self.loop is None:
                 continue
@@ -279,6 +273,58 @@ class InstantConnect():
                     self.loop
                 )
         return records
+
+    def push_message(self, uid : int, message : dict):
+        """实时推送消息事件（MESSAGE.NEW），不写入 notifications
+
+        消息只持久化在 messages 表中，离线端通过 /message/sync 增量补拉。
+        """
+        if self.loop is None:
+            return message
+        with self._clients_lock:
+            clients = list(self.connected_clients.get(uid, []))
+        for websocket in clients:
+            asyncio.run_coroutine_threadsafe(
+                self._queue_message(websocket, {"type" : "MESSAGE.NEW", "message" : message}),
+                self.loop
+            )
+        return message
+
+    def push_recall(self, uid : int, message : dict):
+        """实时推送消息撤回事件（MESSAGE.RECALLED），不写入 notifications"""
+        if self.loop is None:
+            return message
+        with self._clients_lock:
+            clients = list(self.connected_clients.get(uid, []))
+        for websocket in clients:
+            asyncio.run_coroutine_threadsafe(
+                self._queue_message(websocket, {"type" : "MESSAGE.RECALLED", "message" : message}),
+                self.loop
+            )
+        return message
+
+    def push_messages(self, uid_messages) -> list:
+        """批量实时推送消息事件（MESSAGE.NEW），不写入 notifications
+
+        :param uid_messages: [(uid, message), ...]
+        """
+        if not uid_messages:
+            return []
+        prepared = [(int(uid), dict(message)) for uid, message in uid_messages]
+        if self.loop is None:
+            return [message for _, message in prepared]
+        with self._clients_lock:
+            client_map = {
+                uid: list(self.connected_clients.get(uid, []))
+                for uid, _ in prepared
+            }
+        for uid, message in prepared:
+            for websocket in client_map.get(uid, []):
+                asyncio.run_coroutine_threadsafe(
+                    self._queue_message(websocket, {"type" : "MESSAGE.NEW", "message" : message}),
+                    self.loop
+                )
+        return [message for _, message in prepared]
 
     def disconnect_user(self, uid : int):
         if self.loop is None:
@@ -426,7 +472,8 @@ class InstantConnect():
                             "meta" : quote,
                             "mid" : msg_record["mid"],
                             "client_mid" : client_mid,
-                            "room_id" : sender_str
+                            "room_id" : sender_str,
+                            "room_seq" : msg_record.get("room_seq")
                         }
                         recv_notif["quote_preview"] = (
                             self.messages_cursor.get_quote_preview(quote, msg_record) if quote >= 0 else None
@@ -440,8 +487,8 @@ class InstantConnect():
                         sender_notif["room_id"] = "U{}".format(send_to)
                         sender_notif["mentions_me"] = False
                         sender_notif["should_alert"] = False
-                        await self._notify_user_async(send_to, recv_notif)
-                        await self._notify_user_async(sender_uid, sender_notif)
+                        await asyncio.to_thread(self.push_message, send_to, recv_notif)
+                        await asyncio.to_thread(self.push_message, sender_uid, sender_notif)
 
                     elif send_to[0] == 'G':
                         gid = int(send_to[1:])
@@ -490,7 +537,8 @@ class InstantConnect():
                             "mid" : msg_record["mid"],
                             "client_mid" : client_mid,
                             "room_id" : "G{}".format(gid),
-                            "group_id" : gid
+                            "group_id" : gid,
+                            "room_seq" : msg_record.get("room_seq")
                         }
                         notif_dict["quote_preview"] = (
                             self.messages_cursor.get_quote_preview(quote, msg_record) if quote >= 0 else None
@@ -509,9 +557,9 @@ class InstantConnect():
                             )
                             pending.append((user, user_notif))
                         try:
-                            await asyncio.to_thread(self.notify_users, pending)
+                            await asyncio.to_thread(self.push_messages, pending)
                         except Exception as e:
-                            print("[WARN] 批量通知失败(群{}): {}".format(gid, e))
+                            print("[WARN] 批量推送失败(群{}): {}".format(gid, e))
 
                     else:
                         self._queue_ack(websocket, client_mid, status="failed", error="invalid_target")
@@ -597,7 +645,8 @@ class InstantConnect():
                             "mid" : msg_record["mid"],
                             "file_hash" : file_hashes,
                             "client_mid" : client_mid,
-                            "room_id" : sender_str
+                            "room_id" : sender_str,
+                            "room_seq" : msg_record.get("room_seq")
                         }
                         recv_notif["quote_preview"] = (
                             self.messages_cursor.get_quote_preview(quote, msg_record) if quote >= 0 else None
@@ -615,8 +664,8 @@ class InstantConnect():
                         sender_notif = dict(recv_notif)
                         sender_notif["room_id"] = "U{}".format(send_to)
                         sender_notif["should_alert"] = False
-                        await self._notify_user_async(send_to, recv_notif)
-                        await self._notify_user_async(sender_uid, sender_notif)
+                        await asyncio.to_thread(self.push_message, send_to, recv_notif)
+                        await asyncio.to_thread(self.push_message, sender_uid, sender_notif)
 
                     elif send_to[0] == 'G':
                         try:
@@ -678,7 +727,8 @@ class InstantConnect():
                             "file_hash" : file_hashes,
                             "client_mid" : client_mid,
                             "room_id" : "G{}".format(gid),
-                            "group_id" : gid
+                            "group_id" : gid,
+                            "room_seq" : msg_record.get("room_seq")
                         }
                         notif_dict["quote_preview"] = (
                             self.messages_cursor.get_quote_preview(quote, msg_record) if quote >= 0 else None
@@ -704,9 +754,9 @@ class InstantConnect():
                             )
                             pending.append((user, user_notif))
                         try:
-                            await asyncio.to_thread(self.notify_users, pending)
+                            await asyncio.to_thread(self.push_messages, pending)
                         except Exception as e:
-                            print("[WARN] 批量通知失败(群{}): {}".format(gid, e))
+                            print("[WARN] 批量推送失败(群{}): {}".format(gid, e))
 
                     else:
                         self._queue_ack(websocket, client_mid, status="failed", error="invalid_target")

@@ -35,7 +35,9 @@ TFV5 的消息系统由两部分组成：
     "quote_preview" : <quote_preview_or_null>,
     "forward_preview" : <forward_preview_or_null>,
     "file" : <file_metadata_or_null>,
-    "mentioned_uids" : [<uid>, ...]
+    "mentioned_uids" : [<uid>, ...],
+    "room_key" : <room_key>,
+    "room_seq" : <room_seq>
 }
 ```
 
@@ -53,6 +55,8 @@ TFV5 的消息系统由两部分组成：
 - 当 `deleted = 1` 时，普通接口仍返回该消息作为撤回占位，但 `content` 和 `file_hash` 固定为 `null`。服务端不会从数据库中移除原始内容。
 - `<mentioned_uids>`：消息正文中通过 `@用户名` 提及的用户 uid 列表。仅在 `content_type` 为 `"plain"` 时有值。
 - `<room_id>`：聊天室标识，格式为 `"U<uid>"` 或 `"G<gid>"`。
+- `<room_key>`：房间规范化 key（私聊为排序后的 `U<min>U<max>`，群聊为 `G<gid>`），用于增量同步。
+- `<room_seq>`：房间内单调递增的消息序号（撤回也会递增），用于缺口检测与 `/message/sync` 增量同步。
 
 ### 聊天室对象
 
@@ -297,6 +301,47 @@ TFV5 的消息系统由两部分组成：
 
 ---
 
+### 增量同步（v2）
+
+- `^ POST /message/sync` 按房间序号增量拉取消息（含缺口补拉）。
+
+*推荐在有 WebSocket 连接时优先使用实时推送（`MESSAGE.NEW`），本接口用于断线重连后的补齐与序号缺口恢复。*
+
+请求体：
+
+```json
+{
+    "room_id" : "<room_id>",
+    "last_seq" : <last_seq>,
+    "last_mid" : <last_mid>,
+    "missing_sequences" : [<seq>, ...],
+    "missing_sequence_ranges" : [{"start_seq": <s>, "end_seq": <e>}, ...],
+    "limit" : <limit>
+}
+```
+
+其中：
+
+- `<room_id>`（必填）聊天室标识：私聊 `"U<uid>"`，群聊 `"G<gid>"`。
+- `<last_seq>`（可选）上次同步到的房间序号；与 `last_mid` 同时提供时优先按 `last_seq`。
+- `<last_mid>`（可选）旧客户端迁移期使用：服务端先校验该 `mid` 属于目标房间，再转换为房间序号；已撤回的旧消息会按其新的墓碑序号返回。不存在或跨房间的 `mid` 会拒绝请求。
+- `<missing_sequences>` / `<missing_sequence_ranges>`（可选）精确缺口：客户端检测到序号跳跃后按缺失序号/区间补拉。序号列表最多 200 项，区间最多 50 段，每段最多 200 个序号，展开后的去重总数最多 200；超限或格式无效时请求失败。
+- `<limit>`（可选，默认 `100`，上限 `200`）每批条数。
+
+返回体：
+
+```json
+{
+    "messages" : [<消息对象，含 room_seq>],
+    "current_seq" : <当前房间最大序号>,
+    "has_more" : <是否还有更多>
+}
+```
+
+消息按 `room_seq` 升序排列。`has_more` 只表示增量查询（不含额外缺口补拉）是否还有下一页；为 `true` 时客户端应以增量结果的最大序号作为 `last_seq` 继续翻页，直到 `has_more` 为 `false`。已撤回消息（墓碑）也会返回，客户端按 `mid` 覆盖本地记录即可。
+
+---
+
 ### 撤回消息
 
 - `^ POST /message/recall` 撤回一条消息。
@@ -512,31 +557,33 @@ TFV5 的消息系统由两部分组成：
 
 ### 接收消息推送
 
-消息发送成功后，服务端会向接收方（及发送方本人，私聊时）推送消息通知。推送格式封装在 `NOTIFICATION.NEW` 中（参见[通知文档](notification.md)），`info` 中携带额外字段：
-
-**文本消息**：
+消息发送成功后，服务端会向接收方（及发送方本人，私聊时）推送独立的 `MESSAGE.NEW` 事件（v2 起不再走 `NOTIFICATION.NEW`）：
 
 ```json
 {
-    "event" : "message.plain",
-    "title" : "<send_time>",
-    "content" : <plain>,
-    "sender" : "<sender_id>",
-    "meta" : <quote_mid>,
-    "mid" : <mid>,
-    "client_mid" : <client_mid>,
-    "room_id" : "<room_id>",
-    "group_id" : <group_id>,
-    "quote_preview" : <quote_preview_or_null>,
-    "forwarded" : <forwarded_mid>,
-    "forward_preview" : <forward_preview_or_null>,
-    "mentioned_uids" : [<uid>, ...],
-    "mentions_me" : <true_or_false>,
-    "should_alert" : <true_or_false>
+    "type" : "MESSAGE.NEW",
+    "message" : {
+        "event" : "message.plain",
+        "title" : "<send_time>",
+        "content" : <plain>,
+        "sender" : "<sender_id>",
+        "meta" : <quote_mid>,
+        "mid" : <mid>,
+        "client_mid" : <client_mid>,
+        "room_id" : "<room_id>",
+        "group_id" : <group_id>,
+        "room_seq" : <room_seq>,
+        "quote_preview" : <quote_preview_or_null>,
+        "forwarded" : <forwarded_mid>,
+        "forward_preview" : <forward_preview_or_null>,
+        "mentioned_uids" : [<uid>, ...],
+        "mentions_me" : <true_or_false>,
+        "should_alert" : <true_or_false>
+    }
 }
 ```
 
-**文件消息**：
+**文件消息** `message` 中为：
 
 ```json
 {
@@ -550,6 +597,7 @@ TFV5 的消息系统由两部分组成：
     "client_mid" : <client_mid>,
     "room_id" : "<room_id>",
     "group_id" : <group_id>,
+    "room_seq" : <room_seq>,
     "quote_preview" : <quote_preview_or_null>,
     "forwarded" : <forwarded_mid>,
     "forward_preview" : <forward_preview_or_null>,
@@ -567,6 +615,7 @@ TFV5 的消息系统由两部分组成：
 - `<group_id>`：群聊时存在，为群 gid。私聊时无此字段。
 - `<sender_id>`：私聊为 `"U<uid>"`，群聊为 `"G<gid>U<uid>"`。
 - `<meta>`：引用的消息 `mid`。
+- `<room_seq>`：房间内单调递增序号。客户端应记录每房间最大序号，检测到序号跳跃时通过 `/message/sync` 的 `missing_sequences`/`missing_sequence_ranges` 补拉。
 - `<quote_preview>`：回复目标摘要，结构与 REST 消息对象一致。
 - `<forwarded>`、`<forward_preview>`：转发来源消息 ID 与摘要；非转发消息分别为 `-1` 和 `null`。
 - `<file>`：文件消息的元数据。
@@ -576,24 +625,27 @@ TFV5 的消息系统由两部分组成：
 
 ### 消息撤回推送
 
-消息撤回后，会向会话内在线用户发送 `NOTIFICATION.NEW`，其 `notification.info` 为：
+消息撤回后，会向会话内在线用户发送 `MESSAGE.RECALLED`：
 
 ```json
 {
-    "event" : "message.recalled",
-    "title" : "<deleted_at>",
-    "content" : null,
-    "sender" : <operator_uid>,
-    "mid" : <mid>,
-    "deleted" : true,
-    "deleted_at" : <deleted_at>,
+    "type" : "MESSAGE.RECALLED",
+    "message" : {
+        "event" : "message.recalled",
+        "title" : "<deleted_at>",
+        "content" : null,
+        "sender" : <operator_uid>,
+        "mid" : <mid>,
+        "deleted" : true,
+        "deleted_at" : <deleted_at>,
     "deleted_by" : <operator_uid>,
     "room_id" : <room_id>,
-    "group_id" : <group_id_or_null>
+    "group_id" : <group_id_or_null>,
+    "room_seq" : <递增后的房间序号>
 }
 ```
 
-该事件不包含被撤回消息的原始正文或文件哈希。客户端应将对应本地消息改为撤回占位，并清除引用该消息的缓存摘要。
+该事件不包含被撤回消息的原始正文或文件哈希。客户端应将对应本地消息改为撤回占位，并清除引用该消息的缓存摘要。撤回同时递增房间 `room_seq`，离线客户端重连后通过 `/message/sync` 收到墓碑记录。
 
 ### 消息置顶推送
 
