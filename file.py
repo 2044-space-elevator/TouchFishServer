@@ -7,6 +7,7 @@ import hashlib
 from file_types import detect_file_type
 import threading
 import random
+import oss_store
 
 _upload_lock = threading.Lock()
 
@@ -36,6 +37,25 @@ def sticker_path(port_api : int, hashes : str):
     """贴图文件独立存放目录，由 sticker.db 全职管理，不参与 file.db 自动回收"""
     return "res/{}/sticker/{}.file".format(port_api, hashes)
 
+
+def ensure_local_blob(port_api: int, kind: str, hashes: str) -> str:
+    """
+    确保本地存在指定 blob 的临时副本。
+    - 本地已存在：直接返回
+    - 本地不存在且启用 OSS2：从 OSS2 拉取到本地
+    - 本地不存在且未启用 OSS2：返回空路径
+    调用方负责在不需要时删除本地副本（仅 OSS2 模式下才会拉回本地）。
+    """
+    target_path = file_path(port_api, hashes) if kind == "file" else sticker_path(port_api, hashes)
+    if os.path.isfile(target_path):
+        return target_path
+    if oss_store.is_oss_enabled(port_api):
+        temp_path = oss_store.temp_download_path(port_api, kind, hashes)
+        if oss_store.download_from_oss(port_api, kind, hashes, temp_path):
+            return temp_path
+    return ""
+
+
 def upload_file(port_api : int, uid : int, file_b64 : str, file_name : str, file_cursor : FileDb, file_last_time : float = 72.0):
     content = base64.b64decode(file_b64)
     file_size = len(content)
@@ -57,6 +77,14 @@ def upload_file(port_api : int, uid : int, file_b64 : str, file_name : str, file
                 uid, hashes, file_name, time.time(), file_size,
                 mime_type=file_type, extension=extension,
             )
+
+            if oss_store.is_oss_enabled(port_api):
+                if oss_store.upload_file_to_oss(port_api, disk_path, "file", hashes):
+                    try:
+                        if os.path.isfile(disk_path):
+                            os.remove(disk_path)
+                    except OSError:
+                        pass
         except Exception:
             if wrote_blob:
                 try:
@@ -100,6 +128,14 @@ def upload_sticker(port_api : int, uid : int, file_b64 : str, file_name : str, s
                 uid, hashes, file_name, time.time(), file_size,
                 mime_type=file_type,
             )
+
+            if oss_store.is_oss_enabled(port_api):
+                if oss_store.upload_file_to_oss(port_api, disk_path, "sticker", hashes):
+                    try:
+                        if os.path.isfile(disk_path):
+                            os.remove(disk_path)
+                    except OSError:
+                        pass
         except Exception:
             if wrote_blob:
                 try:
@@ -115,8 +151,10 @@ def upload_sticker(port_api : int, uid : int, file_b64 : str, file_name : str, s
 
     return hashes
 
+
 def dereference_file(port_api : int, uid : int, hashes : str, file_cursor : FileDb, file_last_time : float = 72.0):
     return delete_user_file(port_api, uid, hashes, file_cursor)
+
 
 def delete_user_file(port_api : int, uid : int, hashes : str, file_cursor : FileDb):
     succeeded, deleted = file_cursor.delete_owned_user_file(uid, hashes)
@@ -125,15 +163,20 @@ def delete_user_file(port_api : int, uid : int, hashes : str, file_cursor : File
     # 存储空间回收
     if deleted:
         file_cursor.delete_blob_relations(hashes)
+        if oss_store.is_oss_enabled(port_api):
+            oss_store.delete_from_oss(port_api, "file", hashes)
         target_path = file_path(port_api, hashes)
         if os.path.isfile(target_path):
             os.remove(target_path)
     return True
 
+
 def clean_user_files(port_api : int, uid : int, file_cursor : FileDb):
     rows = file_cursor.clean_sender_files(uid) or []
     for row in rows:
         file_cursor.delete_blob_relations(row[0])
+        if oss_store.is_oss_enabled(port_api):
+            oss_store.delete_from_oss(port_api, "file", row[0])
         target_path = file_path(port_api, row[0])
         if os.path.isfile(target_path):
             os.remove(target_path)
@@ -156,6 +199,8 @@ def collect_expired(port_api: int, sticker_cursor,  file_cursor: FileDb, file_la
         if sticker_cursor.sticker_file_exists(hashes):
             continue
         file_cursor.delete_blob_relations(hashes)
+        if oss_store.is_oss_enabled(port_api):
+            oss_store.delete_from_oss(port_api, "file", hashes)
         target_path = file_path(port_api, hashes)
         if os.path.isfile(target_path):
             try:
@@ -165,8 +210,11 @@ def collect_expired(port_api: int, sticker_cursor,  file_cursor: FileDb, file_la
         deleted.append(hashes)
     return deleted
 
+
 def force_delete_file(port_api : int, hashes : str, file_cursor : FileDb):
     file_cursor.force_delete_file(hashes)
+    if oss_store.is_oss_enabled(port_api):
+        oss_store.delete_from_oss(port_api, "file", hashes)
     target_path = file_path(port_api, hashes)
     if os.path.isfile(target_path):
         os.remove(target_path)
@@ -337,6 +385,14 @@ def chunked_upload_file(port_api : int, uid : int, file_name : str, chunk_index 
                             uid, file_hash, file_name, time.time(), total_size,
                             mime_type=file_type, extension=extension,
                         )
+
+                    if oss_store.is_oss_enabled(port_api):
+                        if oss_store.upload_file_to_oss(port_api, final_path, "file", file_hash):
+                            try:
+                                if os.path.isfile(final_path):
+                                    os.remove(final_path)
+                            except OSError:
+                                pass
                 except Exception:
                     if wrote_blob and os.path.isfile(final_path):
                         try:
@@ -368,4 +424,3 @@ def chunked_upload_file(port_api : int, uid : int, file_name : str, chunk_index 
             return {"success": False, "error": "Finalization failed"}
 
     return {"success": True, "file_id": file_id}
-

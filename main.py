@@ -216,13 +216,45 @@ def _ask_int(prompt, default):
 
 def advanced_setup(cfg):
     """
-    初始化完成后的高级配置：邮箱验证服务（SMTP）、反向代理、数据库后端
+    初始化完成后的高级配置：邮箱验证服务（SMTP）、反向代理、数据库后端、OSS2 文件存储
     """
     prt("服务器初始化完成！", "green")
     if not _ask_bool("是否进行高级配置？", False):
         prt("未进行高级配置，可稍后在服务器设置中修改。", "yellow")
         return
     changed = False
+
+    # 文件存储后端：本地存储 或 阿里云 OSS2
+    current_backend = cfg.get("storage_backend", "local")
+    if _ask_bool("是否配置 OSS2（阿里云对象存储）文件存储？当前：{}".format(
+            "OSS2" if current_backend == "oss2" else "本地存储"), current_backend == "oss2"):
+        prt("注意：启用 OSS2 后，失效（过期）的文件 tfs 会尝试删除，但不一定有权限。建议设置生命周期。数据库中的文件信息会被清理！", "yellow")
+        prt("请提供阿里云 OSS2 凭据：", "yellow")
+        cfg["storage_backend"] = "oss2"
+        cfg["oss2_authid"] = input("AccessKey ID（authid）：").strip()
+        cfg["oss2_authkey"] = input("AccessKey Secret（authkey）：").strip()
+        cfg["oss2_endpoint"] = input("Endpoint（如 oss-cn-hangzhou.aliyuncs.com）：").strip()
+        cfg["oss2_bucket"] = input("Bucket 名称（bucket_name）：").strip()
+        if not all([cfg.get("oss2_authid"), cfg.get("oss2_authkey"),
+                    cfg.get("oss2_endpoint"), cfg.get("oss2_bucket")]):
+            prt("OSS2 配置不完整，已回退到本地存储。", "yellow")
+            cfg["storage_backend"] = "local"
+            cfg.pop("oss2_authid", None)
+            cfg.pop("oss2_authkey", None)
+            cfg.pop("oss2_endpoint", None)
+            cfg.pop("oss2_bucket", None)
+        else:
+            # 默认 3 天（72 小时）后自动删除失效文件
+            cfg["file_last_time"] = 72
+            changed = True
+    else:
+        if current_backend == "oss2":
+            cfg["storage_backend"] = "local"
+            cfg.pop("oss2_authid", None)
+            cfg.pop("oss2_authkey", None)
+            cfg.pop("oss2_endpoint", None)
+            cfg.pop("oss2_bucket", None)
+            changed = True
 
     if _ask_bool("是否配置邮箱验证服务？", False):
         cfg["smtp_host"] = input("SMTP 服务器地址（留空按邮箱域名自动检测，如 smtp.gmail.com）：").strip()
@@ -444,6 +476,7 @@ def main(args=None):
         last_config_read = 0.0
         expiry = 72
         config_ttl = 300
+        last_oss_cleanup = 0.0
         while True:
             try:
                 now = time.time()
@@ -452,6 +485,12 @@ def main(args=None):
                         expiry = json.load(handle).get("file_last_time", 72)
                     last_config_read = now
                 collect_expired(PORT_API, STICKER_CURSOR, FILE_CURSOR, expiry)
+                # 清理 OSS2 模式下载遗留的 .oss_ 临时文件（每 10 分钟一次）
+                if now - last_oss_cleanup > 600:
+                    import oss_store
+                    oss_store.cleanup_temp_files(PORT_API, "file")
+                    oss_store.cleanup_temp_files(PORT_API, "sticker")
+                    last_oss_cleanup = now
             except Exception as error:
                 print("[WARN] 文件回收失败: {}".format(error))
             time.sleep(60)

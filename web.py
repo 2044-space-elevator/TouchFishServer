@@ -18,6 +18,7 @@ import threading
 from json_store import read_json, update_json
 from datetime import datetime
 from file_types import detect_file_type, is_sticker_type
+import oss_store
 
 def bool_res() -> tuple: 
     return (str(time.time()) + "False", str(time.time()) + "True")
@@ -563,6 +564,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 sticker_hash = row[0]
                 if sticker_cursor.delete_user_sticker(target_uid, sticker_hash):
                     sticker_cursor.delete_sticker_blob_relations(sticker_hash)
+                    if oss_store.is_oss_enabled(port_api):
+                        oss_store.delete_from_oss(port_api, "sticker", sticker_hash)
                     sticker_disk_path = file.sticker_path(port_api, sticker_hash)
                     if os.path.isfile(sticker_disk_path):
                         try:
@@ -1244,6 +1247,20 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     def _hash_file_type(file_hash, sticker_managed=False):
         target = file.sticker_path(port_api, file_hash) if sticker_managed else file.file_path(port_api, file_hash)
+        # OSS2 模式下本地可能没有该文件，用唯一临时文件拉取检查后立即删除
+        if not os.path.isfile(target) and oss_store.is_oss_enabled(port_api):
+            kind = "sticker" if sticker_managed else "file"
+            temp_path = oss_store.temp_download_path(port_api, kind, file_hash)
+            if not oss_store.download_from_oss(port_api, kind, file_hash, temp_path):
+                return "unknown"
+            try:
+                with open(temp_path, "rb") as handle:
+                    result = detect_file_type(handle.read(), "")
+                return result
+            except OSError:
+                return "unknown"
+            finally:
+                oss_store.safe_remove(temp_path)
         try:
             with open(target, "rb") as handle:
                 return detect_file_type(handle.read(), "")
@@ -1330,10 +1347,22 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             file_type = _hash_file_type(file_hash, sticker_managed=sticker_managed)
         except OSError:
             return json.dumps({"success": False, "error": "file_unavailable"})
-        try:
-            sticker_path = file.sticker_path(port_api, file_hash) if sticker_managed else file.file_path(port_api, file_hash)
-            sticker_bytes = open(sticker_path, "rb").read() if os.path.isfile(sticker_path) else b""
-        except OSError:
+        sticker_path = file.sticker_path(port_api, file_hash) if sticker_managed else file.file_path(port_api, file_hash)
+        if os.path.isfile(sticker_path):
+            sticker_bytes = open(sticker_path, "rb").read()
+        elif oss_store.is_oss_enabled(port_api):
+            # OSS2 模式：用唯一临时文件拉取检查类型与大小，用后立即删除
+            kind = "sticker" if sticker_managed else "file"
+            temp_path = oss_store.temp_download_path(port_api, kind, file_hash)
+            if not oss_store.download_from_oss(port_api, kind, file_hash, temp_path):
+                return json.dumps({"success": False, "error": "file_unavailable"})
+            try:
+                sticker_bytes = open(temp_path, "rb").read()
+            except OSError:
+                return json.dumps({"success": False, "error": "file_unavailable"})
+            finally:
+                oss_store.safe_remove(temp_path)
+        else:
             return json.dumps({"success": False, "error": "file_unavailable"})
         if not is_sticker_type(sticker_bytes):
             return json.dumps({"success": False, "error": "unsupported_sticker_type"})
@@ -2448,6 +2477,26 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             ".pdf": "application/pdf", ".zip": "application/zip",
             ".tgs": "application/octet-stream",
         }
+        # OSS2 模式：先从 OSS 拉取到唯一临时文件，发送完成后立即删除
+        if oss_store.is_oss_enabled(port_api):
+            temp_path = oss_store.temp_download_path(port_api, "file", hashes)
+            try:
+                if not oss_store.download_from_oss(port_api, "file", hashes, temp_path):
+                    return ("", 404)
+                resp = send_file(
+                    temp_path,
+                    download_name=download_name,
+                    as_attachment=True,
+                    mimetype=mimetype_map.get(ext),
+                )
+                # 发送完成后立即删除本地临时文件（带重试，避免 WinError 32）
+                @resp.call_on_close
+                def _cleanup_temp():
+                    oss_store.safe_remove(temp_path)
+                return resp
+            except Exception:
+                oss_store.safe_remove(temp_path)
+                raise
         return send_file(
             "res/{}/file/{}.file".format(port_api, hashes),
             download_name=download_name,
@@ -2521,8 +2570,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if info is None:
             return ("", 404)
         target_path = file.sticker_path(port_api, hashes)
-        if not os.path.isfile(target_path):
-            return ("", 404)
         download_name = info.get("file_name") or (hashes + ".png")
         ext = os.path.splitext(download_name)[1].lower()
         mimetype_map = {
@@ -2530,6 +2577,27 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             ".gif": "image/gif", ".bmp": "image/bmp", ".svg": "image/svg+xml",
             ".tgs": "application/octet-stream",
         }
+        # OSS2 mode: download to unique temp file, delete immediately after sending
+        if oss_store.is_oss_enabled(port_api):
+            temp_path = oss_store.temp_download_path(port_api, "sticker", hashes)
+            try:
+                if not oss_store.download_from_oss(port_api, "sticker", hashes, temp_path):
+                    return ("", 404)
+                resp = send_file(
+                    temp_path,
+                    download_name=download_name,
+                    as_attachment=True,
+                    mimetype=mimetype_map.get(ext),
+                )
+                @resp.call_on_close
+                def _cleanup_sticker_temp():
+                    oss_store.safe_remove(temp_path)
+                return resp
+            except Exception:
+                oss_store.safe_remove(temp_path)
+                raise
+        if not os.path.isfile(target_path):
+            return ("", 404)
         return send_file(
             target_path,
             download_name=download_name,
