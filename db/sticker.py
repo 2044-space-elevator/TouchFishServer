@@ -51,9 +51,121 @@ class StickerDb(Db):
                 local_day TEXT NOT NULL, created_at REAL NOT NULL
             )
         """)
+        # 贴图文件独立管理表：记录谁上传了贴图文件、大小与类型。
+        # 贴图文件存放于 res/<port_api>/sticker/ 目录，由 sticker.db 全职管理，
+        # 不参与 file.db 的自动回收（不遵守 file_last_time 自动删除规则）。
+        self.execute("""
+            CREATE TABLE IF NOT EXISTS sticker_files (
+                uid INTEGER NOT NULL,
+                hash TEXT NOT NULL,
+                file_name TEXT,
+                upload_time REAL,
+                size INTEGER DEFAULT 0,
+                mime_type TEXT,
+                PRIMARY KEY (uid, hash)
+            )
+        """)
         self.execute("CREATE INDEX IF NOT EXISTS idx_sticker_packs_creator ON sticker_packs(creator_uid, is_deleted)")
         self.execute("CREATE INDEX IF NOT EXISTS idx_stickers_pack ON stickers(pack_id, position)")
         self.execute("CREATE INDEX IF NOT EXISTS idx_sticker_creation_day ON sticker_pack_creation_log(uid, local_day)")
+        self.execute("CREATE INDEX IF NOT EXISTS idx_sticker_files_hash ON sticker_files(hash)")
+        self.execute("CREATE INDEX IF NOT EXISTS idx_sticker_files_uid ON sticker_files(uid)")
+
+    def register_upload(self, uid: int, hashes: str, file_name: str,
+                        upload_time: float, size: int = 0,
+                        mime_type: str = None):
+        """注册一个贴图文件的归属（uid, hash 维度）。"""
+        with self.lock:
+            def operation():
+                self.cursor.execute(
+                    """INSERT INTO sticker_files
+                       (uid, hash, file_name, upload_time, size, mime_type)
+                       VALUES (?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(uid, hash) DO UPDATE SET
+                           file_name = excluded.file_name,
+                           upload_time = excluded.upload_time,
+                           size = excluded.size,
+                           mime_type = excluded.mime_type""",
+                    (uid, hashes, file_name, upload_time, size, mime_type),
+                )
+                self.conn.commit()
+                return True
+            return self._execute_with_retry(operation)
+
+    def sticker_file_exists(self, hashes: str) -> bool:
+        """贴图文件是否存在（任何用户上传过）。"""
+        rows = self.query(
+            "SELECT 1 FROM sticker_files WHERE hash = ? LIMIT 1", (hashes,))
+        return bool(rows)
+
+    def has_active_user_sticker(self, uid: int, hashes: str) -> bool:
+        """用户是否拥有该贴图文件。"""
+        rows = self.query(
+            "SELECT 1 FROM sticker_files WHERE uid = ? AND hash = ?",
+            (uid, hashes),
+        )
+        return bool(rows)
+
+    def get_user_sticker_used(self, uid: int) -> int:
+        """该用户已验证贴图文件的总大小（瞬时，单位字节）。"""
+        rows = self.query(
+            "SELECT hash, size FROM sticker_files WHERE uid = ?", (uid,))
+        total = 0
+        for hashes, size in rows:
+            total += int(size or 0)
+        return total
+
+    def get_user_stickers(self, uid: int):
+        """该用户上传过的贴图文件列表。"""
+        return self.query(
+            "SELECT hash, file_name, upload_time, size, mime_type "
+            "FROM sticker_files WHERE uid = ? ORDER BY upload_time DESC",
+            (uid,),
+        )
+
+    def get_sticker_file_info(self, hashes: str):
+        """按 hash 查询贴图文件元信息（任意上传者）。"""
+        rows = self.query(
+            "SELECT hash, file_name, upload_time, size, mime_type, uid "
+            "FROM sticker_files WHERE hash = ? ORDER BY upload_time LIMIT 1",
+            (hashes,),
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        return {
+            "hash": row[0],
+            "file_name": row[1],
+            "upload_time": row[2],
+            "size": row[3],
+            "mime_type": row[4],
+            "owner_uid": row[5],
+        }
+
+    def delete_user_sticker(self, uid: int, hashes: str):
+        """删除用户的一个贴图文件归属。返回 True 表示可以物理删除 blob。"""
+        with self.lock:
+            def operation():
+                self.cursor.execute(
+                    "DELETE FROM sticker_files WHERE uid = ? AND hash = ?",
+                    (uid, hashes),
+                )
+                self.cursor.execute(
+                    "SELECT COUNT(*) FROM sticker_files WHERE hash = ?",
+                    (hashes,),
+                )
+                orphaned = self.cursor.fetchone()[0] == 0
+                self.conn.commit()
+                return orphaned
+            return self._execute_with_retry(operation)
+
+    def delete_sticker_blob_relations(self, hashes: str):
+        """物理删除贴图文件的所有归属记录。"""
+        with self.lock:
+            def operation():
+                self.cursor.execute("DELETE FROM sticker_files WHERE hash = ?", (hashes,))
+                self.conn.commit()
+            return self._execute_with_retry(operation)
 
     def create_pack(self, uid, name, description, prefix, local_day, max_packs, daily_limit, exempt):
         now = time.time()

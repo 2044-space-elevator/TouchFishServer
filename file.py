@@ -22,12 +22,19 @@ def sha256(data : str | bytes) -> str:
 def init(port_api : int):
     if not os.path.exists("res/{}/file".format(port_api)):
         os.makedirs("res/{}/file".format(port_api))
+    if not os.path.exists("res/{}/sticker".format(port_api)):
+        os.makedirs("res/{}/sticker".format(port_api))
     file_cursor = FileDb("res/{}/file/file.db".format(port_api), port_api)
     file_cursor.create_file_db()
 
 
 def file_path(port_api : int, hashes : str):
     return "res/{}/file/{}.file".format(port_api, hashes)
+
+
+def sticker_path(port_api : int, hashes : str):
+    """贴图文件独立存放目录，由 sticker.db 全职管理，不参与 file.db 自动回收"""
+    return "res/{}/sticker/{}.file".format(port_api, hashes)
 
 def upload_file(port_api : int, uid : int, file_b64 : str, file_name : str, file_cursor : FileDb, file_last_time : float = 72.0):
     content = base64.b64decode(file_b64)
@@ -54,6 +61,49 @@ def upload_file(port_api : int, uid : int, file_b64 : str, file_name : str, file
             if wrote_blob:
                 try:
                     registered = file_cursor.file_exists(hashes)
+                except Exception:
+                    registered = True
+                if not registered and os.path.isfile(disk_path):
+                    try:
+                        os.remove(disk_path)
+                    except OSError:
+                        pass
+            raise
+
+    return hashes
+
+
+def upload_sticker(port_api : int, uid : int, file_b64 : str, file_name : str, sticker_cursor):
+    """
+    上传贴图文件（独立于 file 体系）。
+
+    贴图文件存放在 res/<port_api>/sticker/ 目录，
+    由 sticker.db 的 sticker_files 表全职管理，
+    不遵守 file_last_time 自动删除规则。
+    """
+    content = base64.b64decode(file_b64)
+    file_size = len(content)
+    hashes = sha256(content)
+    file_type = detect_file_type(content, file_name)
+
+    disk_path = sticker_path(port_api, hashes)
+    with _upload_lock:
+        wrote_blob = False
+        try:
+            registered = sticker_cursor.sticker_file_exists(hashes)
+            if not registered or not os.path.isfile(disk_path):
+                with open(disk_path, "wb") as file:
+                    wrote_blob = True
+                    file.write(content)
+
+            sticker_cursor.register_upload(
+                uid, hashes, file_name, time.time(), file_size,
+                mime_type=file_type,
+            )
+        except Exception:
+            if wrote_blob:
+                try:
+                    registered = sticker_cursor.sticker_file_exists(hashes)
                 except Exception:
                     registered = True
                 if not registered and os.path.isfile(disk_path):
@@ -98,10 +148,12 @@ def release_references(port_api : int, hashes, file_cursor : FileDb,
 
 
 def collect_expired(port_api: int, sticker_cursor,  file_cursor: FileDb, file_last_time: float = 0.0):
-    """回收过期文件"""
+    """回收过期文件（贴图由 sticker.db 全职管理，不参与自动删除）"""
     deleted = []
     for hashes in file_cursor.collect_expired_hashes(file_last_time):
         if sticker_cursor.query_hash_exist(hashes):
+            continue
+        if sticker_cursor.sticker_file_exists(hashes):
             continue
         file_cursor.delete_blob_relations(hashes)
         target_path = file_path(port_api, hashes)

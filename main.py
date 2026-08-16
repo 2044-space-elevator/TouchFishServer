@@ -133,6 +133,9 @@ def create_new_server():
     if not os.path.exists("res/{}/forum".format(PORT_API)):
         os.makedirs("res/{}/forum".format(PORT_API))
 
+    if not os.path.exists("res/{}/sticker".format(PORT_API)):
+        os.makedirs("res/{}/sticker".format(PORT_API))
+
     cfg = {
         "server_name" : "TouchFish",
         "port_api" : PORT_API,
@@ -152,7 +155,9 @@ def create_new_server():
             "default" : {"requests": 60, "range": 60}
         },
         "max_file_size" : -1,
-        "user_storage_quota" : -1
+        "user_storage_quota" : -1,
+        "max_user_storage_quota" : 73400320,
+        "max_sticker_storage_quota" : 31457280
     }
     write_json("res/{}/config.json".format(PORT_API), cfg)
     write_json("res/{}/captcha/captcha.json".format(PORT_API), {})

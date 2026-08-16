@@ -174,6 +174,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             "max_file_size" : cfg.get("max_file_size", -1),
             "max_avatar_size" : cfg.get("max_avatar_size", cfg.get("max_file_size", -1)),
             "user_storage_quota" : cfg.get("user_storage_quota", -1),
+            "max_user_storage_quota" : cfg.get("max_user_storage_quota", 73400320),
+            "max_sticker_storage_quota" : cfg.get("max_sticker_storage_quota", 31457280),
             "max_message_length" : cfg.get("max_message_length", 10000),
             "min_group_name_length" : cfg.get("min_group_name_length", 1),
             "max_group_name_length" : cfg.get("max_group_name_length", 50),
@@ -556,6 +558,17 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
         retain_cross_db_file_references(target_uid)
         file.clean_user_files(port_api, target_uid, file_cursor)
+        if sticker_cursor is not None:
+            for row in sticker_cursor.get_user_stickers(target_uid):
+                sticker_hash = row[0]
+                if sticker_cursor.delete_user_sticker(target_uid, sticker_hash):
+                    sticker_cursor.delete_sticker_blob_relations(sticker_hash)
+                    sticker_disk_path = file.sticker_path(port_api, sticker_hash)
+                    if os.path.isfile(sticker_disk_path):
+                        try:
+                            os.remove(sticker_disk_path)
+                        except OSError:
+                            pass
         group_cursor.remove_user_membership(target_uid)
         deleted_references = forum_cursor.get_file_reference_rows(
             cleanup_uid=target_uid
@@ -1071,6 +1084,12 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             if "user_storage_quota" in req:
                 updates["user_storage_quota"] = parse_int_setting(req["user_storage_quota"], minimum=0, allow_unlimited=True)
 
+            if "max_user_storage_quota" in req:
+                updates["max_user_storage_quota"] = parse_int_setting(req["max_user_storage_quota"], minimum=0, allow_unlimited=True)
+
+            if "max_sticker_storage_quota" in req:
+                updates["max_sticker_storage_quota"] = parse_int_setting(req["max_sticker_storage_quota"], minimum=0, allow_unlimited=True)
+
             if "max_message_length" in req:
                 updates["max_message_length"] = parse_int_setting(req["max_message_length"], minimum=1)
 
@@ -1206,6 +1225,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             "id": row[0], "pack_id": row[1], "slug": row[2], "name": row[3],
             "file_hash": row[4], "file_type": row[5], "order": row[6],
             "size": row[7], "mode": row[8], "created_at": row[9],
+            "download_url" : "/sticker/get/{}".format(row[4]),
         }
 
     def _sticker_pack_dict(row, include_stickers=True):
@@ -1222,8 +1242,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         rows = user_cursor.uid_query(uid)
         return bool(rows and rows[0][4] in manager_auths)
 
-    def _hash_file_type(file_hash):
-        target = file.file_path(port_api, file_hash)
+    def _hash_file_type(file_hash, sticker_managed=False):
+        target = file.sticker_path(port_api, file_hash) if sticker_managed else file.file_path(port_api, file_hash)
         try:
             with open(target, "rb") as handle:
                 return detect_file_type(handle.read(), "")
@@ -1302,14 +1322,16 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         pack_id, slug, file_hash = req.get("pack_id"), req.get("slug"), req.get("file_hash")
         if sticker_cursor is None or not user_cursor.verify_user(uid, password) or not all(isinstance(value, str) and value for value in (pack_id, slug, file_hash)):
             return json.dumps({"success": False, "error": "invalid_request"})
-        if not file_cursor.has_active_user_file(uid, file_hash):
+        # 贴图文件现由 sticker.db 独立管理；兼容旧的 file 上传渠道
+        sticker_managed = sticker_cursor.has_active_user_sticker(uid, file_hash)
+        if not sticker_managed and not file_cursor.has_active_user_file(uid, file_hash):
             return json.dumps({"success": False, "error": "file_not_owned"})
         try:
-            file_type = _hash_file_type(file_hash)
+            file_type = _hash_file_type(file_hash, sticker_managed=sticker_managed)
         except OSError:
             return json.dumps({"success": False, "error": "file_unavailable"})
         try:
-            sticker_path = file.file_path(port_api, file_hash)
+            sticker_path = file.sticker_path(port_api, file_hash) if sticker_managed else file.file_path(port_api, file_hash)
             sticker_bytes = open(sticker_path, "rb").read() if os.path.isfile(sticker_path) else b""
         except OSError:
             return json.dumps({"success": False, "error": "file_unavailable"})
@@ -1323,7 +1345,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if error:
             return json.dumps({"success": False, "error": error})
         item = sticker_cursor.query("SELECT id, pack_id, slug, name, file_hash, file_type, position, render_size, render_mode, created_at FROM stickers WHERE id = ?", (sticker_id,))[0]
-        file_cursor.add_reference(file_hash, "sticker", sticker_id, uid)
+        if file_cursor.file_exists(file_hash):
+            file_cursor.add_reference(file_hash, "sticker", sticker_id, uid)
         return json.dumps({"success": True, "sticker": _sticker_item_dict(item)}, ensure_ascii=False)
 
     @api("/sticker/pack/update", methods=["POST"])
@@ -1349,7 +1372,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return json.dumps({"success": False, "error": "forbidden"})
         hashes = sticker_cursor.delete_pack(pack_id)
         for sticker_id, file_hash in hashes:
-            file_cursor.remove_reference(file_hash, "sticker", sticker_id)
+            try:
+                if file_cursor.file_exists(file_hash):
+                    file_cursor.remove_reference(file_hash, "sticker", sticker_id)
+            except Exception:
+                pass
         return json.dumps({"success": True})
 
     @api("/sticker/item/delete", methods=["POST"])
@@ -1360,7 +1387,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         file_hash = sticker_cursor.delete_sticker(pack_id, sticker_id)
         if file_hash is None:
             return json.dumps({"success": False, "error": "not_found"})
-        file_cursor.remove_reference(file_hash, "sticker", sticker_id)
+        try:
+            if file_cursor.file_exists(file_hash):
+                file_cursor.remove_reference(file_hash, "sticker", sticker_id)
+        except Exception:
+            pass
         return json.dumps({"success": True})
 
     @api("/sticker/item/reorder", methods=["POST"])
@@ -2152,12 +2183,21 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if normalized_name is None:
             return bool_res()[False]
         quota = cfg.get("user_storage_quota", -1)
+        max_quota = cfg.get("max_user_storage_quota", 73400320)  # 默认 70MB
         if quota != -1 and payload is not None:
             new_size = len(payload)
             new_hashes = file.sha256(payload)
             current_usage = file_cursor.get_user_storage_used(uid)
             if not file_cursor.has_active_user_file(uid, new_hashes):
                 if current_usage + new_size > quota:
+                    return bool_res()[False]
+        # 瞬时单用户文件总大小不得超过 max_user_storage_quota（默认 70MB）
+        if payload is not None and max_quota != -1:
+            new_size = len(payload)
+            new_hashes = file.sha256(payload)
+            current_usage = file_cursor.get_user_storage_used(uid)
+            if not file_cursor.has_active_user_file(uid, new_hashes):
+                if current_usage + new_size > max_quota:
                     return bool_res()[False]
         try:
             hashes = file.upload_file(port_api, uid, file_b64, normalized_name, file_cursor,
@@ -2410,6 +2450,88 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         }
         return send_file(
             "res/{}/file/{}.file".format(port_api, hashes),
+            download_name=download_name,
+            as_attachment=True,
+            mimetype=mimetype_map.get(ext),
+        )
+
+    @api('/sticker/upload', methods=['POST'])
+    def upload_sticker(req):
+        """
+        上传贴图文件（独立于 file 体系）。
+        贴图文件存放于 res/<port_api>/sticker/，由 sticker.db 全职管理。
+        不遵守 file_last_time 自动删除规则。
+        """
+        uid = req["uid"]
+        password = req["password"]
+        filename = req["filename"]
+        file_b64 = req["file_b64"]
+        if sticker_cursor is None:
+            return json.dumps({"success": False, "error": "unavailable"}, ensure_ascii=False)
+        if not user_cursor.verify_user(uid, password):
+            return json.dumps({"success": False, "error": "auth_failed"}, ensure_ascii=False)
+        user_row = get_user_row(uid)
+        if user_row is None:
+            return json.dumps({"success": False, "error": "user_not_found"}, ensure_ascii=False)
+        if user_row[4] == 'banned':
+            return json.dumps({"success": False, "error": "user_banned"}, ensure_ascii=False)
+        normalized_name = normalize_upload_filename(filename)
+        if normalized_name is None:
+            return json.dumps({"success": False, "error": "invalid_filename"}, ensure_ascii=False)
+        payload = decode_base64_payload(file_b64)
+        if payload is None:
+            return json.dumps({"success": False, "error": "invalid_base64"}, ensure_ascii=False)
+        if not is_sticker_type(payload, normalized_name):
+            return json.dumps({"success": False, "error": "unsupported_sticker_type"}, ensure_ascii=False)
+        cfg = read_config()
+        max_sticker_size = cfg.get("max_sticker_size", 1048576)
+        if max_sticker_size != -1 and len(payload) > max_sticker_size:
+            return json.dumps({"success": False, "error": "sticker_too_large"}, ensure_ascii=False)
+        # 瞬时贴图总大小不得超过 max_sticker_storage_quota（默认 30MB）
+        max_sticker_quota = cfg.get("max_sticker_storage_quota", 31457280)
+        if max_sticker_quota != -1:
+            new_hashes = file.sha256(payload)
+            current_sticker_usage = sticker_cursor.get_user_sticker_used(uid)
+            if not sticker_cursor.has_active_user_sticker(uid, new_hashes):
+                if current_sticker_usage + len(payload) > max_sticker_quota:
+                    return json.dumps({"success": False, "error": "sticker_storage_quota_exceeded"}, ensure_ascii=False)
+        try:
+            hashes = file.upload_sticker(port_api, uid, file_b64, normalized_name, sticker_cursor)
+        except Exception:
+            return json.dumps({"success": False, "error": "upload_failed"}, ensure_ascii=False)
+        info = sticker_cursor.get_sticker_file_info(hashes)
+        return json.dumps({
+            "success" : True,
+            "hash" : hashes,
+            "download_url" : "/sticker/get/{}".format(hashes),
+            "sticker" : {
+                "hash" : hashes,
+                "file_name" : normalized_name,
+                "file_type" : (info or {}).get("mime_type") or "unknown",
+                "size" : (info or {}).get("size") or len(payload),
+                "download_url" : "/sticker/get/{}".format(hashes),
+            },
+        }, ensure_ascii=False)
+
+    @app.route("/sticker/get/<hashes>")
+    def get_sticker(hashes : str):
+        if sticker_cursor is None:
+            return ("", 404)
+        info = sticker_cursor.get_sticker_file_info(hashes)
+        if info is None:
+            return ("", 404)
+        target_path = file.sticker_path(port_api, hashes)
+        if not os.path.isfile(target_path):
+            return ("", 404)
+        download_name = info.get("file_name") or (hashes + ".png")
+        ext = os.path.splitext(download_name)[1].lower()
+        mimetype_map = {
+            ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+            ".gif": "image/gif", ".bmp": "image/bmp", ".svg": "image/svg+xml",
+            ".tgs": "application/octet-stream",
+        }
+        return send_file(
+            target_path,
             download_name=download_name,
             as_attachment=True,
             mimetype=mimetype_map.get(ext),
