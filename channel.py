@@ -487,8 +487,8 @@ class InstantConnect():
                         sender_notif["room_id"] = "U{}".format(send_to)
                         sender_notif["mentions_me"] = False
                         sender_notif["should_alert"] = False
-                        await asyncio.to_thread(self.push_message, send_to, recv_notif)
-                        await asyncio.to_thread(self.push_message, sender_uid, sender_notif)
+                        await to_thread(self.push_message, send_to, recv_notif)
+                        await to_thread(self.push_message, sender_uid, sender_notif)
 
                     elif send_to[0] == 'G':
                         gid = int(send_to[1:])
@@ -557,7 +557,7 @@ class InstantConnect():
                             )
                             pending.append((user, user_notif))
                         try:
-                            await asyncio.to_thread(self.push_messages, pending)
+                            await to_thread(self.push_messages, pending)
                         except Exception as e:
                             print("[WARN] 批量推送失败(群{}): {}".format(gid, e))
 
@@ -664,8 +664,8 @@ class InstantConnect():
                         sender_notif = dict(recv_notif)
                         sender_notif["room_id"] = "U{}".format(send_to)
                         sender_notif["should_alert"] = False
-                        await asyncio.to_thread(self.push_message, send_to, recv_notif)
-                        await asyncio.to_thread(self.push_message, sender_uid, sender_notif)
+                        await to_thread(self.push_message, send_to, recv_notif)
+                        await to_thread(self.push_message, sender_uid, sender_notif)
 
                     elif send_to[0] == 'G':
                         try:
@@ -754,7 +754,7 @@ class InstantConnect():
                             )
                             pending.append((user, user_notif))
                         try:
-                            await asyncio.to_thread(self.push_messages, pending)
+                            await to_thread(self.push_messages, pending)
                         except Exception as e:
                             print("[WARN] 批量推送失败(群{}): {}".format(gid, e))
 
