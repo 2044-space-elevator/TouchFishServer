@@ -129,6 +129,23 @@ def download_from_oss(port_api: int, kind: str, hashes: str, local_path: str, cf
             return False
 
 
+def get_size_from_oss(port_api: int, kind: str, hashes: str, cfg: dict = None) -> int:
+    """获取 OSS2 对象大小（in Byte) ~~字节跳动~~
+    未启用 OSS2、对象不存在或 head 失败时返回 0。
+    """
+    if not is_oss_enabled(port_api, cfg):
+        return 0
+    if cfg is None:
+        cfg = _read_config(port_api)
+    bucket = _get_bucket(port_api, cfg)
+    key = object_key(kind, hashes)
+    try:
+        return int(bucket.head_object(key).content_length or 0)
+    except Exception as e:
+        print("[WARN] OSS2 head 失败 ({}): {}".format(key, e))
+        return 0
+
+
 def delete_from_oss(port_api: int, kind: str, hashes: str, cfg: dict = None) -> bool:
     """从 OSS2 删除对象。"""
     if not is_oss_enabled(port_api, cfg):

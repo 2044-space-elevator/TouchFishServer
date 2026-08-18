@@ -21,8 +21,22 @@ from file_types import detect_file_type, is_sticker_type
 import oss_store
 from sync_limits import SYNC_MAX_LIMIT, parse_sync_missing_sequences
 
-def bool_res() -> tuple: 
+def bool_res() -> tuple:
     return (str(time.time()) + "False", str(time.time()) + "True")
+
+FILE_MIMETYPES = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".bmp": "image/bmp", ".svg": "image/svg+xml",
+    ".mp4": "video/mp4", ".webm": "video/webm", ".mkv": "video/x-matroska",
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg",
+    ".pdf": "application/pdf", ".zip": "application/zip",
+    ".tgs": "application/octet-stream",
+}
+
+def mime_from_name(name):
+    return FILE_MIMETYPES.get(
+        os.path.splitext(name or "")[1].lower(), "application/octet-stream"
+    )
 
 
 def can_recall_message(operator_uid : int, operator_auth : str, message : dict,
@@ -435,8 +449,20 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             updates["introduction"] = req["introduction"]
         return updates
 
+    def resolve_file_size(hashes):
+        size = file_cursor.get_file_size(hashes)
+        if not size and oss_store.is_oss_enabled(port_api):
+            size = oss_store.get_size_from_oss(port_api, "file", hashes)
+        return size
+
     def file_metadata(file_hash, owner_uid=None):
-        return file_cursor.get_metadata(file_hash, owner_uid=owner_uid) if file_hash else None
+        meta = (
+            file_cursor.get_metadata(file_hash, owner_uid=owner_uid)
+            if file_hash else None
+        )
+        if meta and not meta.get("size") and oss_store.is_oss_enabled(port_api):
+            meta["size"] = oss_store.get_size_from_oss(port_api, "file", file_hash)
+        return meta
 
     def with_display_file_name(metadata, display_name):
         if not metadata or not display_name:
@@ -2410,14 +2436,15 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         for row in rows:
             hashes = row[0]
             meta = file_cursor.get_metadata(hashes) or {}
+            file_name = row[1] or ""
             result.append({
                 "hash" : hashes,
-                "file_name" : row[1],
+                "file_name" : file_name,
                 "upload_time" : row[2],
-                "size" : meta.get("size", 0),
+                "size" : meta.get("size", 0) or resolve_file_size(hashes),
                 "ref_count" : 0,
                 "upload_user_count" : 0,
-                "mime_type" : "application/octet-stream",
+                "mime_type" : mime_from_name(file_name or row[7] or ""),
                 "file_type" : meta.get("file_type", "unknown"),
                 "extension" : row[7] or "",
                 "download_url" : "/file/get_file/{}".format(hashes),
@@ -2480,11 +2507,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 "hash" : hashes,
                 "file_name" : row[2],
                 "upload_time" : row[3],
-                "size" : meta.get("size", 0),
+                "size" : meta.get("size", 0) or resolve_file_size(hashes),
                 "ref_count" : 0,
                 "upload_user_count" : 0,
                 "sender" : "",
-                "mime_type" : "application/octet-stream",
+                "mime_type" : mime_from_name(row[2] or row[9] or ""),
                 "file_type" : meta.get("file_type", "unknown"),
                 "extension" : row[9] or "",
                 "download_url" : "/file/get_file/{}".format(hashes),
@@ -2524,15 +2551,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return ("", 404)
         metadata = file_metadata(hashes) or {}
         download_name = metadata.get("file_name") or hashes
-        ext = os.path.splitext(download_name)[1].lower()
-        mimetype_map = {
-            ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-            ".gif": "image/gif", ".bmp": "image/bmp", ".svg": "image/svg+xml",
-            ".mp4": "video/mp4", ".webm": "video/webm", ".mkv": "video/x-matroska",
-            ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg",
-            ".pdf": "application/pdf", ".zip": "application/zip",
-            ".tgs": "application/octet-stream",
-        }
         # OSS2 模式：先从 OSS 拉取到唯一临时文件，发送完成后立即删除
         if oss_store.is_oss_enabled(port_api):
             temp_path = oss_store.temp_download_path(port_api, "file", hashes)
@@ -2543,7 +2561,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                     temp_path,
                     download_name=download_name,
                     as_attachment=True,
-                    mimetype=mimetype_map.get(ext),
+                    mimetype=mime_from_name(download_name),
                 )
                 # 发送完成后立即删除本地临时文件（带重试，避免 WinError 32）
                 @resp.call_on_close
@@ -2557,7 +2575,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             "res/{}/file/{}.file".format(port_api, hashes),
             download_name=download_name,
             as_attachment=True,
-            mimetype=mimetype_map.get(ext),
+            mimetype=mime_from_name(download_name),
         )
 
     @api('/sticker/upload', methods=['POST'])
