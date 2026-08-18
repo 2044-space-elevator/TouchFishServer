@@ -154,8 +154,8 @@ def create_new_server():
         "rate_limits" : {
             "default" : {"requests": 60, "range": 60}
         },
-        "max_file_size" : -1,
-        "user_storage_quota" : -1,
+        "max_file_size" : 73400320,
+        "user_storage_quota" : 73400320,
         "max_user_storage_quota" : 73400320,
         "max_sticker_storage_quota" : 31457280
     }
@@ -472,6 +472,14 @@ def main(args=None):
         MESSAGES_CURSOR.get_file_reference_rows() +
         FORUM_CURSOR.get_file_reference_rows()
     )
+    # 回填旧数据中 size 为 0/NULL 的文件大小
+    # （OSS2 模式下本地无文件，从 OSS head_object 获取；本地模式下从磁盘获取）
+    try:
+        backfilled = FILE_CURSOR.backfill_missing_sizes()
+        if backfilled > 0:
+            prt("已回填 {} 条旧文件的存储大小记录。".format(backfilled), "yellow")
+    except Exception as e:
+        prt("[WARN] 文件大小回填失败: {}".format(e), "yellow")
     def file_auto_collecter():
         last_config_read = 0.0
         expiry = 72

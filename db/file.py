@@ -51,7 +51,7 @@ class FileDb(Db):
     )
     """
         self.execute(cmd)
-        for col, typ in [("mime_type", "TEXT"), ("extension", "TEXT")]:
+        for col, typ in [("mime_type", "TEXT"), ("extension", "TEXT"), ("size", "INTEGER DEFAULT 0")]:
             try:
                 self.execute("ALTER TABLE user_file ADD COLUMN {} {}".format(col, typ))
             except Exception:
@@ -77,15 +77,16 @@ class FileDb(Db):
 
                 self.cursor.execute(
                     """INSERT INTO user_file
-                       (uid, hash, file_name, upload_time, active, mime_type, extension)
-                       VALUES (?, ?, ?, ?, TRUE, ?, ?)
+                       (uid, hash, file_name, upload_time, active, mime_type, extension, size)
+                       VALUES (?, ?, ?, ?, TRUE, ?, ?, ?)
                        ON CONFLICT(uid, hash) DO UPDATE SET
                            file_name = excluded.file_name,
                            upload_time = excluded.upload_time,
                            active = TRUE,
                            mime_type = excluded.mime_type,
-                           extension = excluded.extension""",
-                    (uid, hashes, file_name, upload_time, mime_type, extension),
+                           extension = excluded.extension,
+                           size = excluded.size""",
+                    (uid, hashes, file_name, upload_time, mime_type, extension, size),
                 )
                 self.cursor.execute(
                     "INSERT OR IGNORE INTO file_uploaders(hash, uid, created_at) VALUES (?, ?, ?)",
@@ -267,13 +268,53 @@ class FileDb(Db):
             (uid,))
 
     def get_user_storage_used(self, uid : int):
-        rows = self.query("SELECT hash FROM user_file WHERE uid = ? AND active = TRUE", (uid,))
+        rows = self.query("SELECT hash, COALESCE(size, 0) FROM user_file WHERE uid = ? AND active = TRUE", (uid,))
         total = 0
-        for (hashes,) in rows:
-            path = "res/{}/file/{}.file".format(self.port_api, hashes)
-            if os.path.isfile(path):
-                total += os.path.getsize(path)
+        for hashes, stored_size in rows:
+            if stored_size and stored_size > 0:
+                # 优先使用数据库中记录的大小（OSS2 模式下本地文件会被删除）
+                total += stored_size
+            else:
+                # 回退到本地文件大小（兼容旧数据）
+                path = "res/{}/file/{}.file".format(self.port_api, hashes)
+                if os.path.isfile(path):
+                    total += os.path.getsize(path)
         return total
+
+    def backfill_missing_sizes(self):
+        """
+        回填 user_file 中 size 为 0/NULL 的旧记录。
+        - 优先从 OSS2 的 head_object 获取大小（OSS2 模式下本地无文件）
+        - 否则从本地磁盘文件获取大小（兼容本地存储模式迁移/旧数据）
+        返回回填的记录数。
+        """
+        import oss_store
+        rows = self.query(
+            "SELECT hash FROM user_file WHERE active = TRUE AND (size IS NULL OR size = 0)"
+        )
+        if not rows:
+            return 0
+        backfilled = 0
+        for (hashes,) in rows:
+            size = 0
+            # 尝试 OSS2（仅启用 OSS2 时有效）
+            if oss_store.is_oss_enabled(self.port_api):
+                size = oss_store.get_size_from_oss(self.port_api, "file", hashes)
+            # OSS 未启用或失败时尝试本地
+            if size <= 0:
+                path = "res/{}/file/{}.file".format(self.port_api, hashes)
+                if os.path.isfile(path):
+                    try:
+                        size = os.path.getsize(path)
+                    except OSError:
+                        size = 0
+            if size > 0:
+                self.execute(
+                    "UPDATE user_file SET size = ? WHERE hash = ?",
+                    (size, hashes),
+                )
+                backfilled += 1
+        return backfilled
 
     def has_active_user_file(self, uid : int, hashes : str):
         result = self.query(
