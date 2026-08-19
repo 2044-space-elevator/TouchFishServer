@@ -286,6 +286,35 @@ class UserDb(Db):
         self.execute("INSERT INTO friendship (user1, user2, adder, relationship, blocked_by_user1, blocked_by_user2) VALUES (?, ?, ?, 'pending', ?, ?)", (uida, uidb, adder, False, False))
         return True
 
+    def ensure_friend(self, uida, uidb):
+        """Create an accepted friendship, or leave an existing relation intact."""
+        if uida == uidb:
+            return False
+        if uida > uidb:
+            uida, uidb = uidb, uida
+        with self.lock:
+            def operation():
+                self.cursor.execute(
+                    "SELECT relationship FROM friendship WHERE user1 = ? AND user2 = ?",
+                    (uida, uidb),
+                )
+                current = self.cursor.fetchone()
+                if current and current[0] == "blocked":
+                    return False
+                if current:
+                    self.cursor.execute(
+                        "UPDATE friendship SET relationship = 'friend' WHERE user1 = ? AND user2 = ?",
+                        (uida, uidb),
+                    )
+                else:
+                    self.cursor.execute(
+                        "INSERT INTO friendship (user1, user2, adder, relationship, blocked_by_user1, blocked_by_user2) VALUES (?, ?, ?, 'friend', ?, ?)",
+                        (uida, uidb, uida, False, False),
+                    )
+                self.conn.commit()
+                return True
+            return self._execute_with_retry(operation)
+
     def delete_relationship(self, uida, uidb):
         if uida > uidb:
             uida, uidb = uidb, uida

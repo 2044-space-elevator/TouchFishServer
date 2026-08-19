@@ -15,6 +15,7 @@ from rate_limiter import RateLimiter
 from mention_utils import resolve_mentioned_uids, should_alert
 import time
 import threading
+from config_utils import normalize_default_join_targets
 from json_store import read_json, update_json
 from datetime import datetime
 from file_types import detect_file_type, is_sticker_type
@@ -32,6 +33,7 @@ FILE_MIMETYPES = {
     ".pdf": "application/pdf", ".zip": "application/zip",
     ".tgs": "application/octet-stream",
 }
+
 
 def mime_from_name(name):
     return FILE_MIMETYPES.get(
@@ -192,6 +194,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             "user_storage_quota" : cfg.get("user_storage_quota", -1),
             "max_user_storage_quota" : cfg.get("max_user_storage_quota", 73400320),
             "max_sticker_storage_quota" : cfg.get("max_sticker_storage_quota", 31457280),
+            "default_join_targets" : normalize_default_join_targets(cfg.get("default_join_targets", [])),
             "max_message_length" : cfg.get("max_message_length", 10000),
             "min_group_name_length" : cfg.get("min_group_name_length", 1),
             "max_group_name_length" : cfg.get("max_group_name_length", 50),
@@ -222,6 +225,32 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             ret["reverse_proxy_enabled"] = cfg.get("reverse_proxy_enabled", False)
             ret["proxy_count"] = cfg.get("proxy_count", 1)
         return ret
+
+    def validate_default_join_targets(targets):
+        for target in targets:
+            target_id = int(target[1:])
+            if target.startswith("U"):
+                if not user_cursor.uid_query(target_id):
+                    raise ValueError("default friend does not exist")
+            elif not group_cursor.query_gid(target_id):
+                raise ValueError("default group does not exist")
+
+    def apply_default_join_targets(uid, cfg=None):
+        cfg = cfg or read_config()
+        try:
+            targets = normalize_default_join_targets(cfg.get("default_join_targets", []))
+        except ValueError:
+            return
+        for target in targets:
+            target_id = int(target[1:])
+            try:
+                if target.startswith("U"):
+                    if target_id != uid and user_cursor.uid_query(target_id):
+                        user_cursor.ensure_friend(uid, target_id)
+                elif group_cursor.query_gid(target_id):
+                    group_cursor.add_member(target_id, uid)
+            except Exception as e:
+                print("[WARN] default join {} 失败: {}".format(target, e))
 
     def parse_int_setting(value, minimum=0, allow_unlimited=False):
         if isinstance(value, bool):
@@ -775,6 +804,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if not ensure_notification_table(target_uid):
             user_cursor.delete_user(target_uid)
             return bool_res()[False]
+        apply_default_join_targets(target_uid, cfg)
         return bool_res()[True]
 
     @api("/auth/activate", methods=["POST"])
@@ -847,6 +877,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             if not ensure_notification_table(target_uid):
                 user_cursor.delete_user(target_uid)
                 return bool_res()[False]
+            apply_default_join_targets(target_uid, cfg)
             return bool_res()[True]
         except Exception:
             return bool_res()[False]
@@ -1104,6 +1135,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
             if "single_group_max_people" in req:
                 updates["single_group_max_people"] = parse_int_setting(req["single_group_max_people"], minimum=1, allow_unlimited=True)
+
+            if "default_join_targets" in req:
+                targets = normalize_default_join_targets(req["default_join_targets"])
+                validate_default_join_targets(targets)
+                updates["default_join_targets"] = targets
 
             if "max_file_size" in req:
                 updates["max_file_size"] = parse_int_setting(req["max_file_size"], minimum=0, allow_unlimited=True)
