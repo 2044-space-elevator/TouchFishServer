@@ -62,7 +62,7 @@ HASHER = None
 ENABLE_DEBUG = False
 ENABLE_WERKZEUG_LOG = False
 USE_DEV_SERVER = False
-WAITRESS_THREADS = 16
+WAITRESS_THREADS = 4
 WAITRESS_CONNECTION_LIMIT = 1000
 
 # Sql 游标
@@ -100,8 +100,8 @@ def create_new_server():
     global USER_CURSOR
 
     HASHER = PasswordHasher(
-        time_cost=2,
-        memory_cost=65536,
+        time_cost=1,
+        memory_cost=4096,
         parallelism=2,
         hash_len=24,
         salt_len=16
@@ -342,8 +342,8 @@ def main(args=None):
     normalize_working_directory()
     IMGCAPTCHA = ImageCaptcha()
     HASHER = PasswordHasher(
-        time_cost=2,
-        memory_cost=65536,
+        time_cost=1,
+        memory_cost=4096,
         parallelism=2,
         hash_len=24,
         salt_len=16

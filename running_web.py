@@ -10,8 +10,8 @@ from argon2 import PasswordHasher
 PORT_API = 7001
 PORT_TCP = 21474
 HASHER = PasswordHasher(
-        time_cost=2,
-        memory_cost=65536,
+        time_cost=1,
+        memory_cost=4096,
         parallelism=2,
         hash_len=24,
         salt_len=16
