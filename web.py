@@ -1,4 +1,4 @@
-from flask import Flask, send_file, request as flask_request
+from flask import Flask, send_file, request as flask_request, g as flask_g
 from werkzeug.middleware.proxy_fix import ProxyFix
 import json
 import register_tool
@@ -10,6 +10,7 @@ import avatar
 import file
 
 import announcements
+import jwt_tool
 from crypto import generate_rsa_keys, return_app_route
 from rate_limiter import RateLimiter
 from mention_utils import resolve_mentioned_uids, should_alert
@@ -49,14 +50,75 @@ def can_recall_message(operator_uid : int, operator_auth : str, message : dict,
         return operator_auth in {"admin", "root"} or group_role >= 1
     return operator_auth in {"admin", "root"}
 
-def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, forum_cursor, file_cursor, notification_cursor, messages_cursor, group_cursor, instant_contact, sticker_cursor=None):
+def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, forum_cursor, file_cursor, notification_cursor, messages_cursor, group_cursor, instant_contact, sticker_cursor=None, jwt_secret=None):
     """
     pri 是 cryptography 库的私钥对象
     pub_pem 是二进制 pem 文件路径
     ImgCaptcha 是 captcha.ImageCaptcha 对象
     ~_cursor 表示 db.tool.Db 对象
+    jwt_secret 是 JWT 签名密钥（不传时自动加载/生成）
     """
     app = Flask(__name__)
+    jwt_secret = jwt_tool.load_secret(port_api) if jwt_secret is None else jwt_secret
+
+    def resolve_auth(content):
+        """
+        加密请求解密后的身份解析（JWT 优先，其次旧版 uid+password）。
+        返回 (ok, result)：
+          ok=True: result = (identity dict 或 None, legacy bool)
+          ok=False: result = 错误响应 dict
+        身份解析成功后设置 flask.g.auth_identity。
+        """
+        token = content.get("token")
+        if token:
+            payload = jwt_tool.verify_token(jwt_secret, token)
+            if payload is None:
+                return False, {"error": "token_expired"}
+            try:
+                uid = int(payload.get("sub"))
+            except (TypeError, ValueError):
+                return False, {"error": "token_expired"}
+            jti = payload.get("jti")
+            if not user_cursor.token_exists(jti):
+                # token 登记已被移除（设备被用靴子踢屁股了）
+                return False, {"error": "token_expired"}
+            row = user_cursor.uid_query(uid)
+            if not row:
+                return False, {"error": "token_expired"}
+            auth_version = user_cursor.get_auth_version(uid)
+            if int(payload.get("av", -1)) != auth_version:
+                return False, {"error": "token_expired"}
+            identity = {"uid": uid, "stat": row[0][4], "auth_version": auth_version, "jti": jti}
+            flask_g.auth_identity = identity
+            return True, (identity, False)
+
+        uid = content.get("uid")
+        pwd = content.get("password")
+        if uid is None or pwd is None:
+            return True, (None, False)
+        if content.get("jwt"):
+            # JWT login！login！
+            return True, (None, False)
+        if not read_config().get("legacy_auth_enabled", True):
+            return False, {"error": "auth_failed"}
+        if not user_cursor.verify_user(uid, pwd):
+            return False, {"error": "auth_failed"}
+        row = user_cursor.uid_query(uid)
+        if not row:
+            return False, {"error": "auth_failed"}
+        identity = {"uid": int(uid), "stat": row[0][4]}
+        flask_g.auth_identity = identity
+        return True, (identity, True)
+
+    def verify_user(uid, pwd):
+        """
+        请求已通过身份解析（JWT 或旧版）时返回返回返回
+        for 兼容性 we still need uidpwd
+        """
+        identity = flask_g.get("auth_identity")
+        if identity is not None and int(identity.get("uid", -1)) == int(uid):
+            return True
+        return user_cursor.verify_user(uid, pwd)
 
     @app.after_request
     def allow_cross_origin_requests(response):
@@ -67,7 +129,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         )
         return response
 
-    api = return_app_route(app, pri)
+    api = return_app_route(app, pri, resolve_auth)
     limiter = RateLimiter(port_api)
     manager_auths = {"admin", "root"}
     managed_auths = {"user", "banned", "admin", "root"}
@@ -208,6 +270,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             "daily_sticker_pack_creation_limit" : cfg.get("daily_sticker_pack_creation_limit", -1),
             "max_sticker_size" : cfg.get("max_sticker_size", 1048576),
             "email_activate" : bool(cfg.get("email_activate")),
+            "legacy_auth_enabled" : bool(cfg.get("legacy_auth_enabled", True)),
+            "jwt_expires_seconds" : int(cfg.get("jwt_expires_seconds", 604800)),
+            "jwt_max_per_user" : int(cfg.get("jwt_max_per_user", 5)),
             "default_asset_urls" : {
                 "logo" : "/avatar/get_logo",
                 "forum" : "/avatar/get_default/forum",
@@ -419,7 +484,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         return str(uid)
 
     def verify_manager(uid, pwd):
-        if not user_cursor.verify_user(uid, pwd):
+        if not verify_user(uid, pwd):
             return None
         operator = get_user_row(uid)
         if operator is None:
@@ -650,6 +715,14 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if not user_cursor.update_user_with_root_guard(target_uid, stat=new_auth):
             return False
 
+        # 吊销全部 JWT；封禁时把人家的 WebSocket 全部使用尖头靴子踢掉
+        user_cursor.bump_auth_version(target_uid)
+        if new_auth == "banned":
+            run_side_effect(
+                "disconnect_banned_user",
+                lambda: instant_contact.disconnect_user(target_uid)
+            )
+
         notify_user(target_uid, "auth.stat.changed", "账号状态已变更", "你的账号状态已更新为 {}。".format(new_auth), sender=uid, meta={"new_auth" : new_auth})
         return True
     
@@ -669,10 +742,138 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         try:
             uid = req["uid"]
             pwd = req["password"]
-            return bool_res()[user_cursor.verify_user(uid, pwd)]
+            if req.get("jwt"):
+                return login_with_jwt(uid, pwd)
+            cfg = read_config()
+            if not cfg.get("legacy_auth_enabled", True):
+                return bool_res()[False]
+            return bool_res()[verify_user(uid, pwd)]
         except Exception:
             return bool_res()[False]
-    
+
+    def login_with_jwt(uid, pwd):
+        """
+        JWT 登录：校验凭据后签发 JWT 并登记 registry.tfpmjs.c0m
+        超限（jwt_max_per_user）时不签 visa
+        """
+        if not verify_user(uid, pwd):
+            return {"error": "auth_failed"}
+        cfg = read_config()
+        max_tokens = int(cfg.get("jwt_max_per_user", 5))
+        expires = int(cfg.get("jwt_expires_seconds", 604800))
+        auth_version = user_cursor.get_auth_version(uid)
+        user_cursor.prune_expired_tokens()
+        if max_tokens > 0 and user_cursor.count_active_tokens(uid) >= max_tokens:
+            return {"error": "token_limit_reached"}
+        client_ip = flask_request.remote_addr or ""
+        user_agent = flask_request.user_agent.string or ""
+        if len(user_agent) > 256:
+            user_agent = user_agent[:256]
+        token, payload = jwt_tool.issue_token(jwt_secret, uid, auth_version, expires, port_api)
+        if not user_cursor.issue_token(payload["jti"], uid, payload["iat"], payload["exp"], ip=client_ip, ua=user_agent):
+            return {"error": "auth_failed"}
+        return {"token": token, "expires_in": int(expires), "expires_at": payload["exp"]}
+
+    @api("/auth/tokens/list", methods=["POST"])
+    def list_auth_tokens(req):
+        """
+        列出活跃 token
+        """
+        identity = flask_g.get("auth_identity")
+        if identity is None:
+            return {"error": "not_authenticated"}
+        uid = identity["uid"]
+        current_jti = identity.get("jti")
+        target_uid = req.get("target_uid")
+        if target_uid is not None:
+            if not isinstance(target_uid, int):
+                return {"error": "invalid_request"}
+            operator = verify_manager(uid, identity.get("password"))
+            if operator is None:
+                return {"error": "forbidden"}
+            if resolve_managed_target(operator[4], target_uid) is None:
+                return {"error": "forbidden"}
+            uid = target_uid
+            current_jti = None
+        now = time.time()
+        tokens = []
+        for jti, issued_at, expires_at, ip, ua in user_cursor.list_tokens(uid):
+            if expires_at <= now:
+                continue
+            tokens.append({
+                "jti": jti,
+                "issued_at": int(issued_at),
+                "expires_at": int(expires_at),
+                "ip": ip or "",
+                "ua": ua or "",
+                "is_current": jti == current_jti,
+            })
+        return {
+            "tokens": tokens,
+            "max_per_user": int(read_config().get("jwt_max_per_user", 5)),
+        }
+
+    @api("/auth/tokens/revoke", methods=["POST"])
+    def revoke_auth_token(req):
+        """
+        移除指定 jti 的 token(/kick @e)
+        """
+        identity = flask_g.get("auth_identity")
+        if identity is None:
+            return {"error": "not_authenticated"}
+        uid = identity["uid"]
+        jti = req.get("jti")
+        if not isinstance(jti, str) or not jti:
+            return {"error": "invalid_request"}
+        target_uid = req.get("target_uid")
+        if target_uid is not None:
+            if not isinstance(target_uid, int):
+                return {"error": "invalid_request"}
+            operator = verify_manager(uid, identity.get("password"))
+            if operator is None:
+                return {"error": "forbidden"}
+            if resolve_managed_target(operator[4], target_uid) is None:
+                return {"error": "forbidden"}
+            uid = target_uid
+        elif jti == identity.get("jti"):
+            return {"error": "current_token"}
+        if not user_cursor.delete_token(jti, uid):
+            return {"error": "not_found"}
+        run_side_effect(
+            "disconnect_token_owner",
+            lambda: instant_contact.disconnect_jti(jti)
+        )
+        return {"success": True}
+
+    @api("/auth/logout", methods=["POST"])
+    def logout_current_token(req):
+        """
+        登出：吊销当前请求所使用的 token（若有），并断开该设备的 WebSocket。
+        """
+        identity = flask_g.get("auth_identity")
+        if identity is None:
+            return {"success": True}
+        jti = identity.get("jti")
+        if jti:
+            user_cursor.delete_token(jti, identity["uid"])
+            run_side_effect(
+                "disconnect_token_owner",
+                lambda: instant_contact.disconnect_jti(jti)
+            )
+        return {"success": True}
+
+    @api("/auth/validate", methods=["POST"])
+    def validate_token(req):
+        """
+        仅 JWT 路径的会话探活：验证 token 有效性并返回身份
+        """
+        identity = flask_g.get("auth_identity")
+        if identity is None or "auth_version" not in identity:
+            return {"error": "not_authenticated"}
+        row = get_user_row(identity["uid"])
+        if row is None:
+            return {"error": "token_expired"}
+        return {"valid": True, "uid": identity["uid"], "stat": row[4]}
 
     @api("/auth/change_pwd", methods=["POST"])
     def change_pwd(req):
@@ -680,9 +881,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             uid = req["uid"]
             pwd = req["password"]
             new_pwd = req["new_pwd"]
-            if not user_cursor.verify_user(uid, pwd):
+            if not verify_user(uid, pwd):
                 return bool_res()[False]
             user_cursor.change_pwd(uid, new_pwd)
+            user_cursor.bump_auth_version(uid)
             return bool_res()[True]
         except Exception:
             return bool_res()[False]
@@ -704,7 +906,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         pwd = req["password"]
 
-        if not user_cursor.verify_user(uid, pwd):
+        if not verify_user(uid, pwd):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None or user_row[4] != 'root':
@@ -761,7 +963,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def change_email(req):
         uid = req["uid"]
         pwd = req["password"]
-        if not user_cursor.verify_user(uid, pwd):
+        if not verify_user(uid, pwd):
             return bool_res()[False]
         new_email = req["new_email"]
         return bool_res()[user_cursor.change_email(uid, new_email)]
@@ -914,6 +1116,14 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             if not user_cursor.update_user_with_root_guard(target_uid, **updates):
                 return bool_res()[False]
 
+            if "password" in updates or next_auth is not None:
+                user_cursor.bump_auth_version(target_uid)
+            if next_auth == "banned":
+                run_side_effect(
+                    "disconnect_banned_user",
+                    lambda: instant_contact.disconnect_user(target_uid)
+                )
+
             if next_auth is not None:
                 notify_user(target_uid, "auth.stat.changed", "账号状态已变更", "你的账号状态已更新为 {}。".format(next_auth), sender=uid, meta={"new_auth" : next_auth})
             return bool_res()[True]
@@ -950,6 +1160,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
             if not user_cursor.delete_user_with_root_guard(target_uid):
                 return bool_res()[False]
+
+            user_cursor.delete_tokens(target_uid)
 
             run_side_effect(
                 "disconnect_deleted_user",
@@ -1019,7 +1231,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def change_sign(req):
         uid = req["uid"]
         password = req["password"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         new_sign = req["new_sign"]
         max_sign = read_config().get("max_sign_length", 100)
@@ -1032,7 +1244,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def change_introduction(req):
         uid = req["uid"]
         password = req["password"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         new_intro = req["new_introduction"]
         # #16: 校验简介长度
@@ -1047,7 +1259,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         pwd = req["password"]
         final_stat = req["change_to"]
-        if not user_cursor.verify_user(uid, pwd):
+        if not verify_user(uid, pwd):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None or user_row[4] != 'root':
@@ -1075,7 +1287,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         """
         uid = req["uid"]
         pwd = req["password"]
-        if not user_cursor.verify_user(uid, pwd):
+        if not verify_user(uid, pwd):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None or user_row[4] != 'root':
@@ -1213,6 +1425,17 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             if "proxy_count" in req:
                 updates["proxy_count"] = parse_int_setting(req["proxy_count"], minimum=0)
 
+            if "legacy_auth_enabled" in req:
+                if not isinstance(req["legacy_auth_enabled"], bool):
+                    return bool_res()[False]
+                updates["legacy_auth_enabled"] = req["legacy_auth_enabled"]
+
+            if "jwt_expires_seconds" in req:
+                updates["jwt_expires_seconds"] = parse_int_setting(req["jwt_expires_seconds"], minimum=60)
+
+            if "jwt_max_per_user" in req:
+                updates["jwt_max_per_user"] = parse_int_setting(req["jwt_max_per_user"], minimum=0, allow_unlimited=True)
+
             if not updates:
                 return bool_res()[False]
 
@@ -1233,7 +1456,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def query_all_notifications(req):
         uid = req["uid"]
         password = req["password"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         return serialize_notifications(notification_cursor.query_all_events(uid))
 
@@ -1241,7 +1464,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def query_notifications_after(req):
         uid = req["uid"]
         password = req["password"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         try:
             time_stamp = float(req.get("time_stamp", 0))
@@ -1253,7 +1476,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def delete_notifications_before(req):
         uid = req["uid"]
         password = req["password"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         try:
             time_stamp = float(req["time_stamp"])
@@ -1265,7 +1488,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def delete_all_notifications(req):
         uid = req["uid"]
         password = req["password"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         return bool_res()[notification_cursor.delete_all_events(uid)]
 
@@ -1273,7 +1496,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def notification_unread_count(req):
         uid = req["uid"]
         password = req["password"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         return json.dumps({"count": notification_cursor.unread_count(uid)}, ensure_ascii=False)
 
@@ -1281,7 +1504,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def notification_mark_read(req):
         uid = req["uid"]
         password = req["password"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         try:
             time_stamp = req.get("time_stamp")
@@ -1301,7 +1524,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def notification_mark_all_read(req):
         uid = req["uid"]
         password = req["password"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         changed = notification_cursor.mark_all_read(uid)
         return json.dumps({"success": True, "changed": changed}, ensure_ascii=False)
@@ -1310,7 +1533,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def notification_list(req):
         uid = req["uid"]
         password = req["password"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         try:
             offset = max(int(req.get("offset", 0)), 0)
@@ -1328,7 +1551,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def mention_candidates(req):
         uid = req["uid"]
         password = req["password"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         rows = user_cursor.query(
             "SELECT uid, username FROM users WHERE stat != 'banned' ORDER BY username"
@@ -1422,7 +1645,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     @api("/sticker/mine", methods=["POST"])
     def sticker_mine(req):
         uid, password = req.get("uid"), req.get("password")
-        if sticker_cursor is None or not user_cursor.verify_user(uid, password):
+        if sticker_cursor is None or not verify_user(uid, password):
             return json.dumps({"error": "auth_failed"})
         owned = []
         for row in sticker_cursor.list_owned(uid):
@@ -1433,7 +1656,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     @api("/sticker/created", methods=["POST"])
     def sticker_created(req):
         uid, password = req.get("uid"), req.get("password")
-        if sticker_cursor is None or not user_cursor.verify_user(uid, password):
+        if sticker_cursor is None or not verify_user(uid, password):
             return json.dumps({"error": "auth_failed"})
         rows, total = sticker_cursor.list_packs(0, 100, creator_uid=uid)
         return json.dumps({"items": [_sticker_pack_dict(row) for row in rows], "total": total}, ensure_ascii=False)
@@ -1442,7 +1665,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def create_sticker_pack(req):
         uid, password = req.get("uid"), req.get("password")
         name, prefix = req.get("name"), req.get("prefix")
-        if sticker_cursor is None or not user_cursor.verify_user(uid, password) or not isinstance(name, str) or not name.strip() or not isinstance(prefix, str) or not prefix.strip():
+        if sticker_cursor is None or not verify_user(uid, password) or not isinstance(name, str) or not name.strip() or not isinstance(prefix, str) or not prefix.strip():
             return json.dumps({"success": False, "error": "invalid_request"})
         cfg = read_config()
         local_day = datetime.now().date().isoformat()
@@ -1455,7 +1678,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def create_sticker_item(req):
         uid, password = req.get("uid"), req.get("password")
         pack_id, slug, file_hash = req.get("pack_id"), req.get("slug"), req.get("file_hash")
-        if sticker_cursor is None or not user_cursor.verify_user(uid, password) or not all(isinstance(value, str) and value for value in (pack_id, slug, file_hash)):
+        if sticker_cursor is None or not verify_user(uid, password) or not all(isinstance(value, str) and value for value in (pack_id, slug, file_hash)):
             return json.dumps({"success": False, "error": "invalid_request"})
         # 贴图文件现由 sticker.db 独立管理；兼容旧的 file 上传渠道
         sticker_managed = sticker_cursor.has_active_user_sticker(uid, file_hash)
@@ -1499,7 +1722,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     @api("/sticker/pack/update", methods=["POST"])
     def update_sticker_pack(req):
         uid, password, pack_id = req.get("uid"), req.get("password"), req.get("pack_id")
-        if sticker_cursor is None or not user_cursor.verify_user(uid, password) or not isinstance(pack_id, str) or not sticker_cursor.can_manage_pack(uid, pack_id, _sticker_exempt(uid)):
+        if sticker_cursor is None or not verify_user(uid, password) or not isinstance(pack_id, str) or not sticker_cursor.can_manage_pack(uid, pack_id, _sticker_exempt(uid)):
             return json.dumps({"success": False, "error": "forbidden"})
         name = req.get("name"); prefix = req.get("prefix"); description = req.get("description")
         if name is not None and (not isinstance(name, str) or not name.strip()):
@@ -1515,7 +1738,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     @api("/sticker/pack/delete", methods=["POST"])
     def delete_sticker_pack(req):
         uid, password, pack_id = req.get("uid"), req.get("password"), req.get("pack_id")
-        if sticker_cursor is None or not user_cursor.verify_user(uid, password) or not isinstance(pack_id, str) or not sticker_cursor.can_manage_pack(uid, pack_id, _sticker_exempt(uid)):
+        if sticker_cursor is None or not verify_user(uid, password) or not isinstance(pack_id, str) or not sticker_cursor.can_manage_pack(uid, pack_id, _sticker_exempt(uid)):
             return json.dumps({"success": False, "error": "forbidden"})
         hashes = sticker_cursor.delete_pack(pack_id)
         for sticker_id, file_hash in hashes:
@@ -1529,7 +1752,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     @api("/sticker/item/delete", methods=["POST"])
     def delete_sticker_item(req):
         uid, password, pack_id, sticker_id = req.get("uid"), req.get("password"), req.get("pack_id"), req.get("sticker_id")
-        if sticker_cursor is None or not user_cursor.verify_user(uid, password) or not all(isinstance(value, str) for value in (pack_id, sticker_id)) or not sticker_cursor.can_manage_pack(uid, pack_id, _sticker_exempt(uid)):
+        if sticker_cursor is None or not verify_user(uid, password) or not all(isinstance(value, str) for value in (pack_id, sticker_id)) or not sticker_cursor.can_manage_pack(uid, pack_id, _sticker_exempt(uid)):
             return json.dumps({"success": False, "error": "forbidden"})
         file_hash = sticker_cursor.delete_sticker(pack_id, sticker_id)
         if file_hash is None:
@@ -1544,14 +1767,14 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     @api("/sticker/item/reorder", methods=["POST"])
     def reorder_sticker_items(req):
         uid, password, pack_id, ids = req.get("uid"), req.get("password"), req.get("pack_id"), req.get("sticker_ids")
-        if sticker_cursor is None or not user_cursor.verify_user(uid, password) or not isinstance(pack_id, str) or not isinstance(ids, list) or not all(isinstance(value, str) for value in ids) or not sticker_cursor.can_manage_pack(uid, pack_id, _sticker_exempt(uid)):
+        if sticker_cursor is None or not verify_user(uid, password) or not isinstance(pack_id, str) or not isinstance(ids, list) or not all(isinstance(value, str) for value in ids) or not sticker_cursor.can_manage_pack(uid, pack_id, _sticker_exempt(uid)):
             return json.dumps({"success": False, "error": "forbidden"})
         return json.dumps({"success": sticker_cursor.reorder_stickers(pack_id, ids)})
 
     @api("/sticker/ownership/reorder", methods=["POST"])
     def reorder_sticker_ownership(req):
         uid, password, ids = req.get("uid"), req.get("password"), req.get("pack_ids")
-        if (sticker_cursor is None or not user_cursor.verify_user(uid, password)
+        if (sticker_cursor is None or not verify_user(uid, password)
                 or not isinstance(ids, list)
                 or not all(isinstance(value, str) for value in ids)):
             return json.dumps({"success": False, "error": "invalid_request"})
@@ -1560,7 +1783,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     @api("/sticker/ownership", methods=["POST"])
     def sticker_ownership(req):
         uid, password, pack_id = req.get("uid"), req.get("password"), req.get("pack_id")
-        if sticker_cursor is None or not user_cursor.verify_user(uid, password) or not isinstance(pack_id, str):
+        if sticker_cursor is None or not verify_user(uid, password) or not isinstance(pack_id, str):
             return json.dumps({"success": False, "error": "invalid_request"})
         owned = bool(req.get("owned", True))
         return json.dumps({"success": sticker_cursor.set_owned(uid, pack_id, owned)})
@@ -1572,7 +1795,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         forum_name = req["forum_name"]
         introduction = req["introduction"]
         request_id = req.get("request_id")
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -1619,7 +1842,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def get_approving_forum_list(req):
         uid = req["uid"]
         password = req["password"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -1635,7 +1858,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         qid = req["qid"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -1684,7 +1907,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if not isinstance(reason, str):
             reason = ""
         reason = reason.strip()
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -1760,7 +1983,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                     or hashes in attachment_hashes):
                 return bool_res()[False]
             attachment_hashes.append(hashes)
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -1844,7 +2067,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         fid = req["fid"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         forum_info = query_forum(fid)
         if not forum_info:
@@ -1872,7 +2095,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         fid = req["fid"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         forum_info = query_forum(fid)
         if not forum_info:
@@ -1917,7 +2140,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         password = req["password"]
         fid = req["fid"]
         pid = req["pid"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         forum_info = query_forum(fid)
         post_info = query_post(fid, pid)
@@ -1951,7 +2174,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         password = req["password"]
         fid = req["fid"]
         pid = req["pid"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         forum_info = query_forum(fid)
         if not forum_info:
@@ -1970,7 +2193,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         fid = req["fid"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         forum_info = query_forum(fid)
         if not forum_info:
@@ -1989,7 +2212,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         fid = req["fid"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         forum_info = query_forum(fid)
         if not forum_info:
@@ -2007,7 +2230,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         fid = req["fid"]
         target_uid = req["target_uid"]
         role = req.get("role", 0)
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         operator_role = forum_cursor.get_member_role(fid, uid)
         if operator_role is None or operator_role < 50:
@@ -2025,7 +2248,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         password = req["password"]
         fid = req["fid"]
         target_uid = req["target_uid"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         operator_role = forum_cursor.get_member_role(fid, uid)
         if operator_role is None or operator_role < 50:
@@ -2042,7 +2265,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         fid = req["fid"]
         target_uid = req["target_uid"]
         new_role = req["new_role"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         operator_role = forum_cursor.get_member_role(fid, uid)
         if operator_role is None or operator_role < 50:
@@ -2059,7 +2282,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         fid = req["fid"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -2078,7 +2301,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         fid = req["fid"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         current_role = forum_cursor.get_member_role(fid, uid)
         if current_role is None:
@@ -2091,7 +2314,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def forum_my_memberships(req):
         uid = req["uid"]
         password = req["password"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         rows = forum_cursor.query(
             "SELECT fid, role FROM forum_members WHERE uid = ?", (uid,)
@@ -2107,7 +2330,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         fid = req["fid"]
         pid = req["pid"]
         comment : str = req["comment"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -2169,7 +2392,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if not isinstance(uid, int):
             return bool_res()[False]
         password = req["password"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         fid = req["fid"]
         pid = req["pid"]
@@ -2225,7 +2448,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def upload_forum_avatar(req):
         uid = req["uid"]
         password = req["password"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         fid = req["fid"]
         pic_b64 = req["pic"]
@@ -2251,7 +2474,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def upload_user_avatar(req):
         uid = req["uid"]
         password = req["password"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         pic_b64 = req["pic"]
         if not validate_avatar_upload(pic_b64, read_config()):
@@ -2268,7 +2491,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         password = req["password"]
         gid = req["gid"]
         pic_b64 = req["pic"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         if not group_cursor.is_admin(gid, uid):
             return bool_res()[False]
@@ -2299,7 +2522,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         pic_b64 = req["pic"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -2317,7 +2540,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         password = req["password"]
         filename = req["filename"]
         file_b64 = req["file_b64"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -2385,7 +2608,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
             if not isinstance(uid, int):
                 return json.dumps({"success": False, "error": "Invalid uid"}, ensure_ascii=False)
-            if not user_cursor.verify_user(uid, password):
+            if not verify_user(uid, password):
                 return json.dumps({"success": False, "error": "Password incorrect"}, ensure_ascii=False)
             user_row = get_user_row(uid)
             if user_row is None:
@@ -2455,7 +2678,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         hashes = req["hash"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         retain_cross_db_file_references(uid, hashes)
         file_last_time = read_config().get("file_last_time", 72)
@@ -2465,7 +2688,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def get_user_files(req):
         uid = req["uid"]
         password = req["password"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         rows = file_cursor.get_user_files(uid)
         result = []
@@ -2491,7 +2714,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def get_storage_info(req):
         uid = req["uid"]
         password = req["password"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         cfg = read_config()
         quota = cfg.get("user_storage_quota", -1)
@@ -2507,7 +2730,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         hashes = req["hash"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         retain_cross_db_file_references(uid, hashes)
         return bool_res()[file.delete_user_file(port_api, uid, hashes, file_cursor)]
@@ -2516,7 +2739,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def admin_get_all_files(req):
         uid = req["uid"]
         password = req["password"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -2559,7 +2782,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         hashes = req["hash"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -2627,7 +2850,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         file_b64 = req["file_b64"]
         if sticker_cursor is None:
             return json.dumps({"success": False, "error": "unavailable"}, ensure_ascii=False)
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return json.dumps({"success": False, "error": "auth_failed"}, ensure_ascii=False)
         user_row = get_user_row(uid)
         if user_row is None:
@@ -2720,7 +2943,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         content = req["content"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -2738,7 +2961,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         password = req["password"]
         time_stamp = req["time_stamp"]
         content = req["content"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -2756,7 +2979,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         time_stamp = req["time_stamp"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -2787,7 +3010,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         enter_hint = req.get("enter_hint", "")
         allow_direct_join = bool(req.get("allow_direct_join", False))
         require_review = bool(req.get("require_review", True))
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -2823,7 +3046,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def add_admin(req):
         uid = req["uid"]
         password = req["password"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -2850,7 +3073,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     # def invite_member(req):
     #     uid = req['uid']
     #     password = req['password']
-    #     if not user_cursor.verify_user(uid, password):
+    #     if not verify_user(uid, password):
     #         return bool_res()[False]
     # TODO 这里应该有好友检查
     #     gid = req['gid']
@@ -2865,7 +3088,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         password = req["password"]
         gid = req["gid"]
         mid = req["mid"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         stat = group_cursor.is_admin(gid, uid);
         if stat < 1:
@@ -2897,7 +3120,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         password = req["password"]
         gid = req["gid"]
         mid = req["mid"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         stat = group_cursor.is_admin(gid, uid);
         if stat < 1:
@@ -2927,7 +3150,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         gid = req["gid"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         if not group_cursor.is_member(gid, uid):
             return bool_res()[False]
@@ -2939,7 +3162,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         password = req["password"]
         gid = req["gid"]
         removed = req["removed"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -2967,7 +3190,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         gid = req["gid"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -2997,7 +3220,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         password = req["password"]
         gid = req["gid"]
         removed = req["removed"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -3022,7 +3245,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         gid = req["gid"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -3055,7 +3278,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         password = req["password"]
         gid = req["gid"]
         new_owner = req["new_owner"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -3078,7 +3301,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         gid = req["gid"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -3095,7 +3318,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         gid = req["gid"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -3125,7 +3348,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def pin_message(req):
         uid = req["uid"]
         password = req["password"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -3155,7 +3378,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def unpin_message(req):
         uid = req["uid"]
         password = req["password"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -3179,7 +3402,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def pinned_messages(req):
         uid = req["uid"]
         password = req["password"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -3209,7 +3432,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         gid = req["gid"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -3244,7 +3467,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         gid = req["gid"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -3284,7 +3507,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         password = req["password"]
         gid = req["gid"]
         invited_uid = req["invited_uid"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -3328,7 +3551,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         gid = req["gid"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -3360,7 +3583,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         password = req["password"]
         rid = req["rid"]
         approved = bool(req.get("approved", False))
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -3393,7 +3616,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         """好友列表返回"""
         uid = req["uid"]
         password = req["password"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         rows = user_cursor.query(
             "SELECT user1, user2, adder FROM friendship WHERE relationship = 'friend' AND (user1 = ? OR user2 = ?)",
@@ -3429,7 +3652,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                     return bool_res()[False]
                 content = file_hash
 
-            if not user_cursor.verify_user(uid, password):
+            if not verify_user(uid, password):
                 return bool_res()[False]
             user_row = get_user_row(uid)
             if user_row is None:
@@ -3630,7 +3853,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         """返回所有聊天会话及最后一条消息和对方资料。"""
         uid = req["uid"]
         password = req["password"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             print("[WARN] chat_list: verify_user failed for uid={}".format(uid))
             return json.dumps({"error": "auth_failed"}, ensure_ascii=False)
         user_row = get_user_row(uid)
@@ -3766,7 +3989,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         room_id = str(req.get("room_id", ""))
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         if len(room_id) < 2:
             return bool_res()[False]
@@ -3803,7 +4026,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             mid = int(req["mid"])
         except (KeyError, TypeError, ValueError):
             return json.dumps({"success": False, "error": "invalid_request"})
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return json.dumps({"success": False, "error": "auth_failed"})
         operator = get_user_row(uid)
         message = messages_cursor.get_message(mid, include_recalled_original=True)
@@ -3899,7 +4122,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         except (ValueError, TypeError):
             return bool_res()[False]
 
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None:
@@ -3946,7 +4169,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             limit = max(1, min(int(req.get("limit", 100)), SYNC_MAX_LIMIT))
         except (KeyError, TypeError, ValueError):
             return bool_res()[False]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         user_row = get_user_row(uid)
         if user_row is None or user_row[4] == 'banned':
@@ -4011,7 +4234,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         password = req["password"]
         added = req["added"]
         req_word = req["req_word"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         if not user_cursor.uid_query(added):
             return bool_res()[False]
@@ -4027,7 +4250,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         password = req["password"]
         dealt = req["dealt"]
         stat = req["stat"]
-        if not user_cursor.verify_user(uid, password):
+        if not verify_user(uid, password):
             return bool_res()[False]
         if stat not in ("allow", "reject"):
             return bool_res()[False]

@@ -2,7 +2,9 @@
 
 **请确保在阅读本文档前阅读了[主文档](main.md)。**
 
-- `^ POST /auth/login` 校验用户密码与账号是否对应 
+- `^ POST /auth/login` 校验用户密码与账号是否对应（请注意：该 API 携带的验证信息一定为用户名与密码，而不能使用 JWT 替代）
+
+**旧版，不推荐：直接使用 UID 和 密码 登录，见主文档。*
 
 请求体：
 
@@ -13,6 +15,56 @@
 ```
 
 返回：若身份核验成功，则返回值为时间戳加上 `True`。若身份核验失败，则返回值为时间戳加上 `False`。
+
+**JWT 登录（推荐）**：请求体中加入 `"jwt": true` 时返回 JWT：
+
+```
+{
+    "jwt": true
+}
+```
+
+成功返回 `{"token": "<jwt>", "expires_in": 604800, "expires_at": <ts>}`；凭据错误返回 `{"error": "auth_failed"}`；达到单用户最大 token 数返回 `{"error": "token_limit_reached"}`。详见[主文档](main.md)的 JWT 认证章节。
+
+- `^ POST /auth/validate` 会话探活（仅 JWT）
+
+请求体：
+
+```
+{
+    "token": "<jwt>"
+}
+```
+
+返回：token 有效时返回 `{"valid": true, "uid": <uid>, "stat": <stat>}`；无认证信息返回 `{"error": "not_authenticated"}`；token 无效/过期/被吊销返回 `{"error": "token_expired"}`。
+
+- `^ POST /auth/tokens/list` 列出当前用户的活跃 token（设备）列表（JWT 或旧版认证皆可）
+
+请求体：空（携带 `token`，或旧版 `uid` + `password`）。
+
+返回：`{"tokens": [{"jti": ..., "issued_at": <ts>, "expires_at": <ts>, "ip": ..., "ua": ..., "is_current": <bool>}], "max_per_user": <n>}`；`is_current` 标记当前请求所使用的 token。
+
+管理员可在请求体携带 `"target_uid": <uid>` 列出指定用户的设备（权限与 `/auth/manage/*` 一致：admin 可查看 user/banned，root 可查看全部）；无权限返回 `{"error": "forbidden"}`。
+
+- `^ POST /auth/tokens/revoke` 移除指定 token（踢出设备）
+
+请求体：
+
+```
+{
+    "jti": "<jti>"
+}
+```
+
+返回：成功 `{"success": true}`；jti 无效 `{"error": "invalid_request"}`；试图移除当前请求所用 token 返回 `{"error": "current_token"}`。被移除的 token 立即失效，其 WebSocket 连接会被主动断开。
+
+管理员可在请求体携带 `"target_uid": <uid>` 移除指定用户的设备（权限同上，不受 `current_token` 限制）。
+
+- `^ POST /auth/logout` 登出：吊销当前请求所使用的 token
+
+请求体：空（携带 `token`，或旧版 `uid` + `password`）。
+
+返回：`{"success": true}`。当前 token 被吊销并立即失效，其 WebSocket 连接会被主动断开；旧版认证（无 token）直接返回成功。
 
 - `^ POST  /auth/change_sign` 改变个性签名
 
@@ -55,6 +107,8 @@
 其中 `<new_pwd>` 是新密码。
 
 返回：若密码更改成功，返回时间戳加 `True`，否则返回时间戳加 `False`。
+
+**注意：修改密码会使该用户已签发的全部 JWT 立即失效。**
 
 - `^ POST /auth/change_auth`
 

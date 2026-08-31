@@ -158,7 +158,10 @@ def create_new_server():
         "max_file_size" : 73400320,
         "user_storage_quota" : 73400320,
         "max_user_storage_quota" : 73400320,
-        "max_sticker_storage_quota" : 31457280
+        "max_sticker_storage_quota" : 31457280,
+        "legacy_auth_enabled" : True,
+        "jwt_expires_seconds" : 604800,
+        "jwt_max_per_user" : 5
     }
     write_json("res/{}/config.json".format(PORT_API), cfg)
     write_json("res/{}/captcha/captcha.json".format(PORT_API), {})
@@ -449,6 +452,8 @@ def main(args=None):
         GROUP_CURSOR = db.GroupDb(db_dsn, PORT_API, dialect=dialect)
     else:
         USER_CURSOR = db.UserDb(HASHER, "res/{}/db/user.db".format(PORT_API), PORT_API, PORT_TCP)
+        USER_CURSOR.create_user_table()
+        USER_CURSOR.create_friend_table()
         FORUM_CURSOR = db.ForumDb("res/{}/db/forum.db".format(PORT_API), PORT_API, PORT_TCP)
         FORUM_CURSOR.create_forum_table()
         FILE_CURSOR = db.FileDb("res/{}/file/file.db".format(PORT_API), PORT_API)

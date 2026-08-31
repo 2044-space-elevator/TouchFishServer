@@ -13,6 +13,7 @@ import json
 import functools
 
 from flask import request
+from jwt_tool import LEGACY_NOTE
 
 def load_pri(path : str):
     """
@@ -38,11 +39,15 @@ def load_pub(path : str):
     
     return public_key
 
-def return_app_route(app,  pri):
+def return_app_route(app,  pri, auth_resolver=None):
     """
     app 是一个 flask 对象
     这个装饰器的目的是为了重载 app.route 方法，使其默认支持加密
     两个参数 app 和 key，key 是 cryptography 私钥对象
+
+    auth_resolver: 可选的身份解析回调，签名 resolver(content) -> (ok, result)
+        ok=True: result = (identity dict, legacy bool)，identity 至少包含 uid
+        ok=False: result = 错误响应（dict 或 str）
     """
     def res(*args, **kwargs):
         """
@@ -55,7 +60,21 @@ def return_app_route(app,  pri):
                 try:
                     aes_key, iv_bytes, content = deal_req_data(req_data, pri)
                     content = json.loads(json.dumps(content))
-                    ret = func(content, *wrapper_args, **wrapper_kwargs)
+                    if auth_resolver is not None:
+                        ok, resolved = auth_resolver(content)
+                        if not ok:
+                            ret = resolved
+                        else:
+                            identity, legacy = resolved
+                            if identity is not None:
+                                content["uid"] = identity["uid"]
+                                content.setdefault("password", "")
+                            ret = func(content, *wrapper_args, **wrapper_kwargs)
+                            if legacy and isinstance(ret, dict) and "token" not in ret:
+                                ret = dict(ret)
+                                ret["note"] = LEGACY_NOTE
+                    else:
+                        ret = func(content, *wrapper_args, **wrapper_kwargs)
                     if not isinstance(ret, str):
                         ret = json.dumps(ret)
                     iv, ret = aes_encrypt(ret, aes_key)

@@ -3,6 +3,7 @@ from db.tool import Db
 from crypto import sha256, pwd_verify
 import re
 import json
+import time
 
 email_regex = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
 ALLOWED_USER_STATS = {"user", "banned", "admin", "root"}
@@ -222,10 +223,138 @@ class UserDb(Db):
         stat TEXT DEFAULT 'user',
         create_time REAL,
         sign TEXT,
-        introduction TEXT
+        introduction TEXT,
+        auth_version INTEGER DEFAULT 0
     )
     """
         self.execute(cmd)
+        self._migrate_auth_version()
+        self.create_token_table()
+
+    def _migrate_auth_version(self):
+        """为旧数据库补充 auth_version"""
+        try:
+            columns = [row[1] for row in self.query("PRAGMA table_info(users)")]
+        except Exception:
+            return
+        if "auth_version" not in columns:
+            try:
+                self.execute("ALTER TABLE users ADD COLUMN auth_version INTEGER DEFAULT 0")
+            except Exception:
+                pass
+
+    def create_token_table(self):
+        cmd = """
+    CREATE TABLE IF NOT EXISTS tokens (
+        jti TEXT PRIMARY KEY,
+        uid INTEGER NOT NULL,
+        issued_at REAL NOT NULL,
+        expires_at REAL NOT NULL,
+        ip TEXT,
+        ua TEXT
+    )
+    """
+        self.execute(cmd)
+        self._migrate_token_columns()
+        try:
+            self.execute("CREATE INDEX IF NOT EXISTS idx_tokens_uid ON tokens(uid)")
+        except Exception:
+            pass
+
+    def _migrate_token_columns(self):
+        """为旧数据库补充 tokens（是词元吗） 表的 ip/ua 列"""
+        try:
+            columns = [row[1] for row in self.query("PRAGMA table_info(tokens)")]
+        except Exception:
+            return
+        for column, definition in (("ip", "TEXT"), ("ua", "TEXT")):
+            if column not in columns:
+                try:
+                    self.execute("ALTER TABLE tokens ADD COLUMN {} {}".format(column, definition))
+                except Exception:
+                    pass
+
+    def issue_token(self, jti, uid, issued_at, expires_at, ip=None, ua=None):
+        """登记已签发的 JWT（对了，要记录 REDAgent.exe 和 IP）"""
+        try:
+            self.execute(
+                "INSERT INTO tokens (jti, uid, issued_at, expires_at, ip, ua) VALUES (?, ?, ?, ?, ?, ?)",
+                (jti, uid, issued_at, expires_at, ip, ua),
+            )
+            return True
+        except Exception as e:
+            print(e)
+            return False
+
+    def list_tokens(self, uid):
+        """列出某用户的全部未过期 token。"""
+        return self.query(
+            "SELECT jti, issued_at, expires_at, ip, ua FROM tokens WHERE uid = ? ORDER BY issued_at DESC",
+            (uid,),
+        )
+
+    def token_exists(self, jti):
+        """校验 token是否仍存在"""
+        ret = self.query("SELECT 1 FROM tokens WHERE jti = ?", (jti,))
+        return bool(ret)
+
+    def delete_token(self, jti, uid):
+        """按 jti 移除某用户的词元"""
+        try:
+            self.execute("DELETE FROM tokens WHERE jti = ? AND uid = ?", (jti, uid))
+            return True
+        except Exception as e:
+            print(e)
+            return False
+
+    def count_active_tokens(self, uid, now=None):
+        """统计某用户未过期的词元消耗（bushi）"""
+        now = time.time() if now is None else now
+        ret = self.query(
+            "SELECT COUNT(*) FROM tokens WHERE uid = ? AND expires_at > ?",
+            (uid, now),
+        )
+        if not ret:
+            return 0
+        return ret[0][0]
+
+    def prune_expired_tokens(self, now=None):
+        """清理已过期的 token 登记。"""
+        now = time.time() if now is None else now
+        try:
+            self.execute("DELETE FROM tokens WHERE expires_at < ?", (now,))
+            return True
+        except Exception as e:
+            print(e)
+            return False
+
+    def delete_tokens(self, uid):
+        """删除某用户的全部 token 登记（用户删除时清理）。"""
+        try:
+            self.execute("DELETE FROM tokens WHERE uid = ?", (uid,))
+            return True
+        except Exception as e:
+            print(e)
+            return False
+
+    def get_auth_version(self, uid):
+        ret = self.query("SELECT auth_version FROM users WHERE uid = ?", (uid,))
+        if not ret or ret[0][0] is None:
+            return 0
+        return int(ret[0][0])
+
+    def bump_auth_version(self, uid):
+        """使该用户已签发的全部 JWT 失效，并释放其 token 登记（避免占用配额）。"""
+        try:
+            self.execute(
+                "UPDATE users SET auth_version = auth_version + 1 WHERE uid = ?",
+                (uid,),
+            )
+            self.delete_tokens(uid)
+            return True
+        except Exception as e:
+            print(e)
+            return False
     
     def create_friend_table(self):
         cmd = """

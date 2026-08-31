@@ -268,6 +268,17 @@ ws://<server_host>:<port_tcp>
 }
 ```
 
+**JWT 认证（推荐）**：使用 HTTP 登录获得的 JWT 完成握手，请求体解密后为：
+
+```json
+{
+    "type" : "AUTH.LOGIN",
+    "token" : <jwt>
+}
+```
+
+token 无效/过期/吊销（改密、封禁）时登录失败，连接会被关闭；客户端应重新通过 HTTP 登录获取新 token 后重连。旧版 `uid` + `password` 握手仍受服务器 `legacy_auth_enabled` 配置控制（默认开启）。
+
 如果登录成功，服务器会返回一个 secret 类型的加密响应，解密后内容如下：
 
 ```json

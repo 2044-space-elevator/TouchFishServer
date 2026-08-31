@@ -31,9 +31,9 @@
 
 至于何为 secret 类型 API，何为 public 类型 API，详见[API类型和对应请求方法](#api-类型和对应请求方法)。
 
-约定 2：要带用户 uid 和密码的 API 条目前面**加** ^ 号，不带用户 uid 和密码的 API 条目前面**不加** ^ 号。
+约定 2：要带~~用户 uid 和密码~~ 验证信息的 API 条目前面**加** ^ 号，不带~~用户 uid 和密码~~ 验证信息的 API 条目前面**不加** ^ 号。
 
-**用户密码要以明文字段放在真正的请求体里**，但保证带有 ^ 号的一定不加 * 号。以确保密码传输时仍走 secret 类型加密。
+**~~用户密码~~ 验证信息要以明文字段放在真正的请求体里**，但保证带有 ^ 号的一定不加 * 号。以确保密码传输时仍走 secret 类型加密。
 
 对于约定 2 中如何上传请求体，详见[API类型和对应请求方法](#api-类型和对应请求方法)。
 
@@ -112,6 +112,91 @@ os.urandom(32)
     ...
 }
 ```
+
+### JWT 认证（推荐）
+
+在 TFV5 的 5.0.0 以上版本，**推荐使用 JWT 替代在每次请求中携带 `uid` + `password`**。
+
+可极大减少服务器负担并支持更多功能！
+
+1. **登录**：在 `/auth/login` 的加密请求体中加入 `"jwt": true`：
+
+   ```json
+   {
+       "uid": 0,
+       "password": "xxx",
+       "jwt": true
+   }
+   ```
+
+   成功后返回（同样为 AES 加密后的 JSON）：
+
+   ```json
+   {
+       "token": "<jwt>",
+       "expires_in": 604800,
+       "expires_at": 1788748172
+   }
+   ```
+
+   - `expires_in` / `expires_at` 为 token 有效期（秒）与过期时间戳（秒）。
+   - 若达到该用户的最大 token 数（服务器配置 `jwt_max_per_user`），返回 `{"error": "token_limit_reached"}`。
+   - 凭据错误返回 `{"error": "auth_failed"}`。
+   - **注意**：旧版服务器无法识别 `jwt` 字段，会照旧返回 `"<timestamp>True/False"` 字符串——客户端可据此自动降级为旧版认证。
+
+2. **请求携带 token**：所有需要认证的 secret API，请求体中用 `token` 字段代替 `uid` + `password`：
+
+   ```json
+   {
+       "token": "<jwt>",
+       ...
+   }
+   ```
+
+   token 与 `uid`/`password` 同时存在时，服务器优先校验 token。token 无效或过期时返回 `{"error": "token_expired"}`。
+
+3. **会话探活**：`POST /auth/validate`（加密，携带 token）返回 `{"valid": true, "uid": 0, "stat": "root"}`，用于客户端启动时恢复会话。
+
+4. **吊销**：用户修改密码、被封禁或删除时，已签发的全部 JWT 立即失效（`auth_version` 计数），客户端将收到 `{"error": "token_expired"}` 并需要重新登录。单台设备可随时通过 `/auth/tokens/revoke` 单独吊销（见下文"设备管理"）。
+
+5. **会话数量**：服务器配置 `jwt_max_per_user`（默认 5）限制每用户可同时持有的 token 数量；`jwt_expires_seconds`（默认 604800，即 7 天）控制有效期。两者均可通过 `/auth/server_settings/update` 修改。
+
+6. **设备（Token）管理**：签发时服务器会记录来源 IP 与 User-Agent。
+
+   - `POST /auth/tokens/list`（需认证）列出当前用户的全部活跃 token：
+
+     ```json
+     {
+         "tokens": [
+             {
+                 "jti": "<jti>",
+                 "issued_at": 1788748172,
+                 "expires_at": 1789352972,
+                 "ip": "1.2.3.4",
+                 "ua": "Mozilla/5.0 ...",
+                 "is_current": true
+             }
+         ],
+         "max_per_user": 5
+     }
+     ```
+
+   - `POST /auth/tokens/revoke`（需认证），请求体 `{"jti": "<jti>"}` 移除指定 token：该 token 立即失效（后续请求返回 `{"error": "token_expired"}`），且其已建立的 WebSocket 连接会被主动断开（即"踢出设备"）。不能移除当前请求所用的 token（返回 `{"error": "current_token"}`）。
+
+### 旧版认证（uid + password）与兼容模式
+
+- 服务器配置 `legacy_auth_enabled`（默认开启）控制是否接受旧版认证。
+- 开启时，请求体携带 `uid` + `password` 的 secret API 照常工作；**若返回体为 JSON，将额外包含一个 `note` 字段**：
+
+  ```json
+  {
+      "note": "using uid and password for general authorization is deprecated, please use the jwt auth (see details in docs)",
+      ...
+  }
+  ```
+
+  > 字符串形式的返回体（如 `"<timestamp>True/False"`）无法携带 `note`。
+- 关闭时，旧版认证请求返回 `{"error": "auth_failed"}`；JWT 登录不受影响。
 
 ### 对于 secret 类型 API 的返回值
 

@@ -14,6 +14,7 @@ import threading
 import logging
 from collections import defaultdict
 from mention_utils import resolve_mentioned_uids, should_alert
+import jwt_tool
 
 async def to_thread(func, *args, **kwargs):
     loop = asyncio.get_running_loop()
@@ -67,18 +68,21 @@ def can_access_room(user_cursor, group_cursor, uid: int, room_id: str) -> bool:
 
 class InstantConnect():
     def __init__(self, port_api, port_tcp, notification_cursor, user_cursor, messages_cursor,
-                 group_cursor, file_cursor=None):
+                 group_cursor, file_cursor=None, jwt_secret=None):
         self.port_api = port_api
         self.port_tcp = port_tcp
         self.notification_cursor = notification_cursor
         self.connected_clients = dict()
         self.connected_clients[-1] = []
         self.clients_belonged = dict()
+        self.clients_token = dict()
         self.send_queue = dict()
         self.user_cursor = user_cursor
         self.group_cursor = group_cursor
         self.messages_cursor = messages_cursor
         self.file_cursor = file_cursor
+        self.jwt_secret = jwt_tool.load_secret(port_api) if jwt_secret is None else jwt_secret
+        self.legacy_auth_enabled = True
         self._load_config()
         self.aes_key = dict()
         self.pri_key = crypto.load_pri("res/{}/secret/pri.pem".format(port_api))
@@ -131,6 +135,30 @@ class InstantConnect():
             self._auth_timestamps[ip] = timestamps
             return True
 
+    def _verify_ws_token(self, token: str):
+        """
+        校验词元（bushi）
+        返回 (uid, jti) 或 None。
+        """
+        def _check():
+            payload = jwt_tool.verify_token(self.jwt_secret, token)
+            if payload is None:
+                return None
+            try:
+                uid = int(payload.get("sub"))
+            except (TypeError, ValueError):
+                return None
+            jti = payload.get("jti")
+            if not self.user_cursor.token_exists(jti):
+                return None
+            row = self.user_cursor.uid_query(uid)
+            if not row:
+                return None
+            if self.user_cursor.get_auth_version(uid) != int(payload.get("av", -1)):
+                return None
+            return (uid, jti)
+        return to_thread(_check)
+
     def _check_ws_rate(self, uid: int, max_per_second: int = 10, bucket: str = "msg") -> bool:
         now = time.time()
         ts_dict = self._ws_typing_timestamps if bucket == "typing" else self._ws_timestamps
@@ -151,6 +179,7 @@ class InstantConnect():
             except Exception:
                 cfg = {}
         self.max_message_length = cfg.get("max_message_length", 10000)
+        self.legacy_auth_enabled = bool(cfg.get("legacy_auth_enabled", True))
     
     def encrypt_response(self, req : dict, websocket):
         json_req = json.dumps(req)
@@ -182,6 +211,7 @@ class InstantConnect():
     def _cleanup_client(self, websocket):
         with self._clients_lock:
             uid = self.clients_belonged.pop(websocket, -1)
+            self.clients_token.pop(websocket, None)
             if uid in self.connected_clients and websocket in self.connected_clients[uid]:
                 self.connected_clients[uid].remove(websocket)
                 if uid != -1 and not self.connected_clients[uid]:
@@ -335,6 +365,36 @@ class InstantConnect():
             return
 
         asyncio.run_coroutine_threadsafe(self._disconnect_user(uid), self.loop)
+
+    async def _disconnect_jti(self, jti : str):
+        with self._clients_lock:
+            clients = [
+                websocket
+                for websocket, token in self.clients_token.items()
+                if token == jti
+            ]
+        for websocket in clients:
+            try:
+                await websocket.close()
+            except Exception:
+                pass
+            finally:
+                self._cleanup_client(websocket)
+
+    def disconnect_jti(self, jti : str):
+        """按 jti 去 fuck 连接"""
+        if self.loop is None:
+            with self._clients_lock:
+                clients = [
+                    websocket
+                    for websocket, token in self.clients_token.items()
+                    if token == jti
+                ]
+            for websocket in clients:
+                self._cleanup_client(websocket)
+            return
+
+        asyncio.run_coroutine_threadsafe(self._disconnect_jti(jti), self.loop)
     
     async def sender(self, websocket, queue):
         try:
@@ -369,19 +429,33 @@ class InstantConnect():
             message = json.loads(crypto.aes_decrypt(base64.b64decode(message['iv']), base64.b64decode(message['content']), self.aes_key[websocket]))
             if message['type'] != 'AUTH.LOGIN':
                 raise ValueError("{} 而非 AUTH.LOGIN".format(message.get('type')))
-            async with self._auth_semaphore:
-                verified = await asyncio.wait_for(
-                    to_thread(self.user_cursor.verify_user, message['uid'], message['password']),
-                    timeout=10.0,
-                )
-            if not verified:
-                raise ValueError("UID {} 验证失败".format(message.get('uid')))
+            token = message.get("token")
+            verified_jti = None
+            if token:
+                verified = await self._verify_ws_token(token)
+                if verified is not None:
+                    verified_uid, verified_jti = verified
+                else:
+                    verified_uid = None
+            else:
+                if not self.legacy_auth_enabled:
+                    verified_uid = None
+                else:
+                    async with self._auth_semaphore:
+                        verified = await asyncio.wait_for(
+                            to_thread(self.user_cursor.verify_user, message['uid'], message['password']),
+                            timeout=10.0,
+                        )
+                    verified_uid = message.get('uid') if verified else None
+            if verified_uid is None:
+                raise ValueError("UID 验证失败：{}".format(message.get('uid', 'token')))
             with self._clients_lock:
                 self.connected_clients[-1].remove(websocket)
-                if not message["uid"] in self.connected_clients.keys():
-                    self.connected_clients[message['uid']] = []
-                self.connected_clients[message['uid']].append(websocket)
-                self.clients_belonged[websocket] = message['uid']
+                if verified_uid not in self.connected_clients.keys():
+                    self.connected_clients[verified_uid] = []
+                self.connected_clients[verified_uid].append(websocket)
+                self.clients_belonged[websocket] = verified_uid
+                self.clients_token[websocket] = verified_jti
             self.send_queue[websocket] = asyncio.Queue()
             await websocket.send(self.encrypt_response({"type" : "AUTH.LOGIN_SUCCEEDED"}, websocket))
 
