@@ -375,6 +375,34 @@ CREATE TABLE IF NOT EXISTS notification_meta (
         )
         return True
 
+    def delete_events_by_sender(self, uid: int, event: str, sender: int) -> int:
+        """删除某用户收到的指定事件通知（按发送者过滤），返回删除条数。
+
+        用于好友申请被处理（通过/拒绝）后清理对应的 friend.request 通知，
+        避免客户端重复展示已处理的申请。
+        """
+        uid = int(uid)
+        sender = int(sender)
+        rows = self.query(
+            "SELECT id, info FROM notifications WHERE uid = ? AND (kind IS NULL OR kind = 0)",
+            (uid,),
+        )
+        target_ids = []
+        for nid, raw_info in rows:
+            info = self._deserialize_event(raw_info)
+            if info.get("event") != event:
+                continue
+            s = info.get("sender")
+            if s == sender or s == str(sender) or s == "U{}".format(sender):
+                target_ids.append(nid)
+        if target_ids:
+            placeholders = ",".join("?" * len(target_ids))
+            self.execute(
+                "DELETE FROM notifications WHERE id IN ({})".format(placeholders),
+                tuple(target_ids),
+            )
+        return len(target_ids)
+
     def delete_all_events(self, uid: int) -> bool:
         uid = int(uid)
         self.execute("DELETE FROM notifications WHERE uid = ?", (uid,))

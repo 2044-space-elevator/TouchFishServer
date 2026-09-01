@@ -1025,6 +1025,55 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             user_cursor.change_auth(uid, "user")
             return bool_res()[True]
         return bool_res()[False]
+
+    @api("/auth/forgot_password", methods=["POST"])
+    def forgot_password(req):
+        """忘记密码：向用户注册邮箱发送验证码（复用邮箱验证配置）。"""
+        email = req.get("email")
+        if not isinstance(email, str) or not email:
+            return bool_res()[False]
+        cfg = read_config()
+        sender_email = cfg.get("email_activate", "")
+        if not sender_email:
+            return bool_res()[False]
+        email_pwd = cfg.get("email_password", "")
+        rows = user_cursor.email_query(email)
+        if not rows:
+            # 邮箱不存在也统一返回 False，不泄露账号信息
+            return bool_res()[False]
+        try:
+            if not register_tool.email_code(sender_email, port_api, email, email_pwd, locks['config'], locks['activate']):
+                return bool_res()[False]
+        except Exception as e:
+            print("[WARN] forgot_password email send failed: {}".format(e))
+            return bool_res()[False]
+        return bool_res()[True]
+
+    @api("/auth/reset_password", methods=["POST"])
+    def reset_password(req):
+        """忘记密码：验证邮箱验证码后重置密码，并吊销该用户全部 token。"""
+        email = req.get("email")
+        activate_code = req.get("activate_code")
+        new_pwd = req.get("new_pwd")
+        if not isinstance(email, str) or not email:
+            return bool_res()[False]
+        if not isinstance(new_pwd, str) or not new_pwd:
+            return bool_res()[False]
+        try:
+            code = int(activate_code)
+        except (TypeError, ValueError):
+            return bool_res()[False]
+        rows = user_cursor.email_query(email)
+        if not rows:
+            return bool_res()[False]
+        uid = rows[0][0]
+        if not register_tool.verify_email(port_api, email, code, locks['activate']):
+            return bool_res()[False]
+        user_cursor.change_pwd(uid, new_pwd)
+        user_cursor.bump_auth_version(uid)
+        user_cursor.delete_tokens(uid)
+        return bool_res()[True]
+
      
 
     @api("/auth/change_auth", methods=["POST"])
@@ -1872,6 +1921,19 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                     return None
                 chosen = queue[str(qid)]
                 chosen_type = chosen.get("type", "create")
+                # 论坛名不允许重名（编辑时排除自身）
+                name_rows = forum_cursor.query(
+                    "SELECT fid FROM forums WHERE forumname = ?",
+                    (chosen["forumname"],),
+                )
+                dup_exists = any(
+                    row[0] != chosen.get("fid")
+                    for row in name_rows
+                )
+                if dup_exists:
+                    del queue[str(qid)]
+                    queue["queue_num"] = max(queue["queue_num"] - 1, 0)
+                    return False
                 if chosen_type == "edit":
                     edit_fid = chosen["fid"]
                     if not forum_cursor.query_forum_fid(edit_fid):
@@ -2230,6 +2292,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         fid = req["fid"]
         target_uid = req["target_uid"]
         role = req.get("role", 0)
+        try:
+            role = int(role)
+        except (TypeError, ValueError):
+            return bool_res()[False]
         if not verify_user(uid, password):
             return bool_res()[False]
         operator_role = forum_cursor.get_member_role(fid, uid)
@@ -2237,9 +2303,18 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return bool_res()[False]
         if not user_cursor.uid_query(target_uid):
             return bool_res()[False]
-        # 避免被管理员背刺
-        if role >= operator_role and operator_role < 100:
+        # wyf 不准拉自己
+        if target_uid == uid:
             return bool_res()[False]
+        # 角色只能授予 0（成员）/50（管理员），且必须低于操作者；100（论坛主）不可授予
+        if role not in (0, 50) or role >= operator_role:
+            return bool_res()[False]
+        existing_role = forum_cursor.get_member_role(fid, target_uid)
+        if existing_role is not None:
+            # 已是成员：不得通过拉人覆盖更高/同级角色
+            if existing_role >= operator_role:
+                return bool_res()[False]
+            return bool_res()[forum_cursor.change_member_role(fid, target_uid, role)]
         return bool_res()[forum_cursor.add_member(fid, target_uid, role)]
 
     @api("/forum/remove_member", methods=["POST"])
@@ -2253,6 +2328,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         operator_role = forum_cursor.get_member_role(fid, uid)
         if operator_role is None or operator_role < 50:
             return bool_res()[False]
+        if target_uid == uid:
+            return bool_res()[False]
         target_role = forum_cursor.get_member_role(fid, target_uid)
         if target_role is not None and target_role >= operator_role:
             return bool_res()[False]
@@ -2265,15 +2342,25 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         fid = req["fid"]
         target_uid = req["target_uid"]
         new_role = req["new_role"]
+        try:
+            new_role = int(new_role)
+        except (TypeError, ValueError):
+            return bool_res()[False]
         if not verify_user(uid, password):
             return bool_res()[False]
         operator_role = forum_cursor.get_member_role(fid, uid)
         if operator_role is None or operator_role < 50:
             return bool_res()[False]
-        target_role = forum_cursor.get_member_role(fid, target_uid)
-        if target_role is not None and target_role >= operator_role and operator_role < 100:
+        # 不允许改自己的角色（防止论坛主自我降级后退出，导致论坛无人管理）
+        if target_uid == uid:
             return bool_res()[False]
-        if new_role >= operator_role and operator_role < 100:
+        # 论坛主（100）不可授予/降级：任何操作者都不能设置 100
+        if new_role not in (0, 50):
+            return bool_res()[False]
+        target_role = forum_cursor.get_member_role(fid, target_uid)
+        if target_role is not None and target_role >= operator_role:
+            return bool_res()[False]
+        if new_role >= operator_role:
             return bool_res()[False]
         return bool_res()[forum_cursor.change_member_role(fid, target_uid, new_role)]
 
@@ -3309,7 +3396,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         user_stat = user_row[4]
         if user_stat == 'banned':
             return bool_res()[False]
-        if not group_cursor.is_admin(gid, uid):
+        if not group_cursor.is_member(gid, uid):
             return bool_res()[False]
         return json.dumps(group_cursor.get_group_settings(gid), ensure_ascii=False)
 
@@ -4044,6 +4131,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return json.dumps({"success": False, "error": "already_recalled"})
         if message.get("file_hash"):
             file_cursor.remove_reference(message["file_hash"], "message", mid)
+        # 撤回的若是群置顶消息，同步取消置顶，避免置顶残留
+        if message.get("group_id") is not None:
+            messages_cursor.unpin_message_by_mid(mid, message["group_id"])
 
         recalled = messages_cursor.get_message(mid)
         event = {
@@ -4258,9 +4348,15 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if not relationship:
             return bool_res()[False]
         rel = relationship[0]
+        # rel: (user1, user2, relationship, adder, blocked_by_user1, blocked_by_user2)
         if rel[3] != dealt:
             return bool_res()[False]
-        if rel[2] not in ('pending', 'friend'):
+        # 只有申请接收方（非添加方）可以处理，防止申请方自行通过
+        receiver = rel[1] if rel[3] == rel[0] else rel[0]
+        if uid != receiver:
+            return bool_res()[False]
+        # 仅 pending 状态可处理；已成为好友后不允许重复同意/拒绝（拒绝会误伤已有关系）
+        if rel[2] != 'pending':
             return bool_res()[False]
         if stat == "allow":
             succeeded = user_cursor.change_relationship(uid, dealt, 'friend')
@@ -4270,6 +4366,12 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         else:
             user_cursor.delete_relationship(uid, dealt)
             succeeded = True
+        # 申请已处理，删除接收方的 friend.request 通知，避免客户端重复展示通过/拒绝按钮
+        if succeeded:
+            try:
+                notification_cursor.delete_events_by_sender(uid, "friend.request", dealt)
+            except Exception as e:
+                print("[WARN] deal_ship 清理 friend.request 通知失败: {}".format(e))
         return bool_res()[succeeded]
     
     return app
