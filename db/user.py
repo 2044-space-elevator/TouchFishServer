@@ -337,6 +337,15 @@ class UserDb(Db):
             print(e)
             return False
 
+    def get_oldest_token(self, uid, now=None):
+        """获取用户最老的未过期 token"""
+        now = time.time() if now is None else now
+        ret = self.query(
+            "SELECT jti FROM tokens WHERE uid = ? AND expires_at > ? ORDER BY issued_at ASC LIMIT 1",
+            (uid, now),
+        )
+        return ret[0][0] if ret else None
+
     def get_auth_version(self, uid):
         ret = self.query("SELECT auth_version FROM users WHERE uid = ?", (uid,))
         if not ret or ret[0][0] is None:

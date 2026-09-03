@@ -754,7 +754,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def login_with_jwt(uid, pwd):
         """
         JWT 登录：校验凭据后签发 JWT 并登记 registry.tfpmjs.c0m
-        超限（jwt_max_per_user）时不签 visa
+        超限（jwt_max_per_user）时吊销最老的 token
         """
         if not verify_user(uid, pwd):
             return {"error": "auth_failed"}
@@ -763,8 +763,21 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         expires = int(cfg.get("jwt_expires_seconds", 604800))
         auth_version = user_cursor.get_auth_version(uid)
         user_cursor.prune_expired_tokens()
+        revoked_oldest = False
         if max_tokens > 0 and user_cursor.count_active_tokens(uid) >= max_tokens:
-            return {"error": "token_limit_reached"}
+            # 达到限制，吊销最老的 token
+            oldest_jti = user_cursor.get_oldest_token(uid)
+            if oldest_jti:
+                user_cursor.delete_token(oldest_jti, uid)
+                flask_current_app.after_response_funcs.setdefault(None, []).append(
+                    lambda: instant_contact.disconnect_jti(oldest_jti)
+                )
+                flask_current_app.after_response_funcs.setdefault(None, []).append(
+                    lambda: notify_user(uid, "token_revoked", "会话已被替换", "由于达到登录设备数量上限，您最早的登录会话已被自动吊销。")
+                )
+                revoked_oldest = True
+            else:
+                return {"error": "token_limit_reached"}
         client_ip = flask_request.remote_addr or ""
         user_agent = flask_request.user_agent.string or ""
         if len(user_agent) > 256:
@@ -772,7 +785,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         token, payload = jwt_tool.issue_token(jwt_secret, uid, auth_version, expires, port_api)
         if not user_cursor.issue_token(payload["jti"], uid, payload["iat"], payload["exp"], ip=client_ip, ua=user_agent):
             return {"error": "auth_failed"}
-        return {"token": token, "expires_in": int(expires), "expires_at": payload["exp"]}
+        result = {"token": token, "expires_in": int(expires), "expires_at": payload["exp"]}
+        if revoked_oldest:
+            result["revoked_oldest"] = True
+        return result
 
     @api("/auth/tokens/list", methods=["POST"])
     def list_auth_tokens(req):
