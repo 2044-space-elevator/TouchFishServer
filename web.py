@@ -18,7 +18,7 @@ import time
 import threading
 from config_utils import normalize_default_join_targets
 from json_store import read_json, update_json
-from datetime import datetime
+from datetime import datetime, timedelta
 from file_types import detect_file_type, is_sticker_type
 import oss_store
 from sync_limits import SYNC_MAX_LIMIT, parse_sync_missing_sequences
@@ -2924,6 +2924,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                     download_name=download_name,
                     as_attachment=True,
                     mimetype=mime_from_name(download_name),
+                    max_age=timedelta(days=365),
                 )
                 # 发送完成后立即删除本地临时文件（带重试，避免 WinError 32）
                 @resp.call_on_close
@@ -2938,6 +2939,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             download_name=download_name,
             as_attachment=True,
             mimetype=mime_from_name(download_name),
+            max_age=timedelta(days=365),
         )
 
     @api('/sticker/upload', methods=['POST'])
@@ -3024,6 +3026,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                     download_name=download_name,
                     as_attachment=True,
                     mimetype=mimetype_map.get(ext),
+                    # hash 寻址内容不可变：URL 相同内容不变，一年内缓存无需校验
+                    max_age=timedelta(days=365),
                 )
                 @resp.call_on_close
                 def _cleanup_sticker_temp():
@@ -3039,6 +3043,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             download_name=download_name,
             as_attachment=True,
             mimetype=mimetype_map.get(ext),
+            # hash 寻址内容不可变：URL 相同内容不变，一年内缓存无需校验
+            max_age=timedelta(days=365),
         )
     
     @api("/announcement/upload_announcement", methods=['POST'])
