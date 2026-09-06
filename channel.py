@@ -320,6 +320,90 @@ class InstantConnect():
             )
         return message
 
+    def push_raw(self, uid : int, message : dict):
+        """按原样中继一条信令/消息给某用户的所有在线连接（不包 MESSAGE.NEW）"""
+        if self.loop is None:
+            return
+        with self._clients_lock:
+            clients = list(self.connected_clients.get(uid, []))
+        for websocket in clients:
+            asyncio.run_coroutine_threadsafe(
+                self._queue_message(websocket, message),
+                self.loop
+            )
+
+    def _queue_call_ack(self, websocket, call_id, request, status):
+        """针对 call.* 信令的回执（相当于 call 专用版 _queue_ack）"""
+        if not call_id or websocket not in self.send_queue or self.loop is None:
+            return
+        ack = {
+            "type": "call.ack",
+            "call_id": call_id,
+            "for": request,
+            "status": status,
+        }
+        asyncio.run_coroutine_threadsafe(self.send_queue[websocket].put(ack), self.loop)
+
+    async def _handle_call_message(self, websocket, message : dict):
+        """视频通话信令中继：服务端只管两个好友之间转运，不持有任何通话状态。
+
+        call.invite / call.answer / call.ice / call.hangup 均校验好友关系与速率，
+        并以 {'type': ..., 'call_id': ..., 'from_uid': <发送者>, ...} 转发给目标。
+        """
+        sender_uid = self.clients_belonged[websocket]
+        if not self._check_ws_rate(sender_uid):
+            self._queue_call_ack(websocket, message.get('call_id'), message['type'], "rate_limited")
+            return
+        target_uid = message.get('target_uid')
+        call_id = message.get('call_id')
+        if isinstance(target_uid, bool) or not isinstance(target_uid, int) or target_uid < 0:
+            self._queue_call_ack(websocket, call_id, message['type'], "invalid_target")
+            return
+        if target_uid == sender_uid:
+            self._queue_call_ack(websocket, call_id, message['type'], "invalid_target")
+            return
+        if not isinstance(call_id, str) or not call_id or len(call_id) > 64:
+            self._queue_call_ack(websocket, call_id, message['type'], "invalid_call_id")
+            return
+        if not await to_thread(self.user_cursor.is_friend, sender_uid, target_uid):
+            self._queue_call_ack(websocket, call_id, message['type'], "not_friends")
+            return
+
+        mtype = message['type']
+        relay = {"type": mtype, "call_id": call_id, "from_uid": sender_uid}
+        if mtype in ("call.invite", "call.answer"):
+            payload = message.get('payload')
+            if not isinstance(payload, dict) or not isinstance(payload.get('sdp'), str):
+                self._queue_call_ack(websocket, call_id, mtype, "invalid_request")
+                return
+            candidates = payload.get('candidates')
+            if candidates is not None and not isinstance(candidates, list):
+                self._queue_call_ack(websocket, call_id, mtype, "invalid_request")
+                return
+            relay["payload"] = payload
+        elif mtype == "call.ice":
+            candidate = message.get('candidate')
+            if not isinstance(candidate, dict) or not isinstance(candidate.get('candidate'), str):
+                self._queue_call_ack(websocket, call_id, mtype, "invalid_request")
+                return
+            relay["candidate"] = candidate
+        elif mtype == "call.hangup":
+            reason = message.get('reason')
+            if not isinstance(reason, str) or reason not in ("hangup", "decline", "cancel", "busy", "error"):
+                self._queue_call_ack(websocket, call_id, mtype, "invalid_request")
+                return
+            relay["reason"] = reason
+        else:
+            self._queue_call_ack(websocket, call_id, mtype, "invalid_request")
+            return
+
+        online = bool(self.connected_clients.get(target_uid))
+        self.push_raw(target_uid, relay)
+        self._queue_call_ack(
+            websocket, call_id, mtype,
+            "delivered" if (online or mtype != "call.invite") else "offline",
+        )
+
     def push_recall(self, uid : int, message : dict):
         """实时推送消息撤回事件（MESSAGE.RECALLED），不写入 notifications"""
         if self.loop is None:
@@ -834,6 +918,9 @@ class InstantConnect():
 
                     else:
                         self._queue_ack(websocket, client_mid, status="failed", error="invalid_target")
+
+                elif message["type"] in ("call.invite", "call.answer", "call.ice", "call.hangup"):
+                    await self._handle_call_message(websocket, message)
 
                 elif message["type"] in ("typing.start", "typing.stop"):
                     if not self._check_ws_rate(sender_uid, max_per_second=20, bucket="typing"):
