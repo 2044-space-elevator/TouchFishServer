@@ -326,6 +326,22 @@ class FileDb(Db):
         path = "res/{}/file/{}.file".format(self.port_api, hashes)
         return os.path.getsize(path) if os.path.isfile(path) else 0
 
+    def get_blob_info(self, hashes : str):
+        """按 hash 取任一 active owner 行的元数据（秒传时把既有内容信息带给新登记方）"""
+        rows = self.query(
+            "SELECT file_name, extension, mime_type, size FROM user_file "
+            "WHERE hash = ? AND active = TRUE ORDER BY upload_time LIMIT 1",
+            (hashes,),
+        )
+        if not rows:
+            return None
+        return {
+            "file_name": rows[0][0],
+            "extension": rows[0][1] or "",
+            "mime_type": rows[0][2],
+            "size": int(rows[0][3] or 0),
+        }
+
     def increment_ref(self, hashes : str):
         return self.file_exists(hashes)
 

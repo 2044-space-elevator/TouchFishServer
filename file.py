@@ -152,6 +152,27 @@ def upload_sticker(port_api : int, uid : int, file_b64 : str, file_name : str, s
     return hashes
 
 
+def instant_upload_file(port_api : int, uid : int, file_hash : str, file_name : str,
+                        size : int, mime_type, extension, file_cursor : FileDb) -> bool:
+    """
+    秒传登记内容已存在
+    """
+    present = os.path.isfile(file_path(port_api, file_hash))
+    if not present and oss_store.is_oss_enabled(port_api):
+        present = oss_store.get_size_from_oss(port_api, "file", file_hash) > 0
+    if not present or not file_cursor.file_exists(file_hash):
+        return False
+    with _upload_lock:
+        try:
+            file_cursor.register_upload(
+                uid, file_hash, file_name, time.time(), size,
+                mime_type=mime_type, extension=extension,
+            )
+        except Exception:
+            return False
+    return True
+
+
 def dereference_file(port_api : int, uid : int, hashes : str, file_cursor : FileDb, file_last_time : float = 72.0):
     return delete_user_file(port_api, uid, hashes, file_cursor)
 

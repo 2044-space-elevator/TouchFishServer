@@ -2776,6 +2776,80 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         except Exception:
             return json.dumps({"success": False, "error": "Server error"}, ensure_ascii=False)
 
+    # 高级的秒传
+    @api('/file/instant_upload', methods=['POST'])
+    def instant_upload(req):
+        try:
+            uid = req["uid"]
+            password = req["password"]
+            filename = req["filename"]
+            file_hash = req.get("file_hash") or req.get("hash") or ""
+
+            if not isinstance(uid, int):
+                return {"success": False, "error": "Invalid uid"}
+            if not verify_user(uid, password):
+                return {"success": False, "error": "Password incorrect"}
+            user_row = get_user_row(uid)
+            if user_row is None:
+                return {"success": False, "error": "User not found"}
+            if user_row[4] == 'banned':
+                return {"success": False, "error": "User banned"}
+
+            normalized_name = normalize_upload_filename(filename)
+            if normalized_name is None:
+                return {"success": False, "error": "Invalid filename"}
+            cfg = read_config()
+            allowed_extensions = read_allowed_file_extensions(cfg)
+            if allowed_extensions:
+                _, ext = os.path.splitext(normalized_name.lower())
+                if not ext or ext not in allowed_extensions:
+                    return {"success": False, "error": "Extension not allowed"}
+
+            if not isinstance(file_hash, str) or len(file_hash) != 64:
+                return {"success": False, "error": "Invalid file hash"}
+            if not all(c in "0123456789abcdefABCDEF" for c in file_hash):
+                return {"success": False, "error": "Invalid file hash"}
+            file_hash = file_hash.lower()
+            present = os.path.isfile(file.file_path(port_api, file_hash))
+            if not present and oss_store.is_oss_enabled(port_api):
+                present = oss_store.get_size_from_oss(port_api, "file", file_hash) > 0
+            if not file_cursor.file_exists(file_hash) or not present:
+                return {"success": True, "instant": False}
+
+            blob_info = file_cursor.get_blob_info(file_hash) or {}
+            extension = blob_info.get("extension") or os.path.splitext(normalized_name)[1].lower()
+            mime_type = blob_info.get("mime_type")
+            new_size = blob_info.get("size") or resolve_file_size(file_hash)
+
+            quota = cfg.get("user_storage_quota", -1)
+            max_quota = cfg.get("max_user_storage_quota", 73400320)
+            current_usage = file_cursor.get_user_storage_used(uid)
+            if new_size and not file_cursor.has_active_user_file(uid, file_hash):
+                if quota != -1 and current_usage + new_size > quota:
+                    return {"success": False, "error": "Storage quota exceeded"}
+                if max_quota != -1 and current_usage + new_size > max_quota:
+                    return {"success": False, "error": "Storage quota exceeded"}
+
+            ok = file.instant_upload_file(
+                port_api, uid, file_hash, normalized_name, new_size,
+                mime_type, extension, file_cursor,
+            )
+            if not ok:
+                return {"success": True, "instant": False}
+            return {
+                "success": True,
+                "instant": True,
+                "file_hash": file_hash,
+                "hash": file_hash,
+                "download_url": "/file/get_file/{}".format(file_hash),
+                "info_url": "/file/get_file_info/{}".format(file_hash),
+                "file": file_metadata(file_hash, uid),
+            }
+        except KeyError:
+            return {"success": False, "error": "Missing parameter"}
+        except Exception:
+            return {"success": False, "error": "Server error"}
+
     @api('/file/dereference_file', methods=['POST'])
     def dereference_file(req):
         uid = req["uid"]
