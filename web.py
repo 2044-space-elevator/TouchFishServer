@@ -242,11 +242,47 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             _config_cache = state["cfg"]
             return dict(_config_cache)
 
+    def _build_ice_servers(rtc_cfg):
+        """冰服务器！（ICE）"""
+        default_stun = [{
+            "urls": [
+                "stun:stun.epygi.com",
+                "stun:stun.fitauto.ru",
+            ]
+        }]
+        if not isinstance(rtc_cfg, dict):
+            return default_stun
+        if not rtc_cfg.get("turn_enabled", False):
+            return default_stun
+
+        configured = rtc_cfg.get("ice_servers")
+        if not isinstance(configured, list):
+            return default_stun
+        result = []
+        for server in configured:
+            if not isinstance(server, dict):
+                continue
+            urls = server.get("urls")
+            if isinstance(urls, str):
+                urls = [urls]
+            if not isinstance(urls, list):
+                continue
+            urls = [url for url in urls if isinstance(url, str) and url]
+            if not urls:
+                continue
+            item = {"urls": urls}
+            for key in ("username", "credential"):
+                if isinstance(server.get(key), str):
+                    item[key] = server[key]
+            result.append(item)
+        return result or default_stun
+
     def serialize_server_settings(cfg, include_manage=False):
         ret = {
             "server_name" : cfg.get("server_name", "TouchFish"),
             "port_api" : port_api,
             "port_tcp" : port_tcp,
+            "ice_servers" : _build_ice_servers(cfg.get("rtc", {})),
             "captcha" : bool(cfg.get("captcha", False)),
             "file_last_time" : cfg.get("file_last_time", 72),
             "groups_limit" : cfg.get("groups_limit", 30),

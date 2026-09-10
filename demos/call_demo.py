@@ -36,7 +36,7 @@ PORT_TCP = 19998
 PUB_PATH  = f"res/{PORT_API}/secret/pub.pem"
 PRI_PATH  = f"res/{PORT_API}/secret/pri.pem"
 PASS1, PASS2 = "demo_alice_1", "demo_bob_2"
-STUN_URLS = ["stun:stun.miwifi.com:3478"]
+STUN_URLS = ["stun:stun.epygi.com", "stun:stun.fitauto.ru"]
 
 # ---------- 导入 TFS 工具 ----------
 

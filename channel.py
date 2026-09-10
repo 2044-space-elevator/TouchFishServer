@@ -180,6 +180,9 @@ class InstantConnect():
                 cfg = {}
         self.max_message_length = cfg.get("max_message_length", 10000)
         self.legacy_auth_enabled = bool(cfg.get("legacy_auth_enabled", True))
+        rtc_cfg = cfg.get("rtc", {})
+        self.rtc_turn_enabled = bool(rtc_cfg.get("turn_enabled", False)) if isinstance(rtc_cfg, dict) else False
+        self.rtc_ice_servers = rtc_cfg.get("ice_servers", []) if isinstance(rtc_cfg, dict) else []
     
     def encrypt_response(self, req : dict, websocket):
         json_req = json.dumps(req)
