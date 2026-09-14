@@ -14,6 +14,7 @@ import functools
 
 from flask import request
 from jwt_tool import LEGACY_NOTE
+from error_codes import normalize_error
 
 def load_pri(path : str):
     """
@@ -60,6 +61,7 @@ def return_app_route(app,  pri, auth_resolver=None):
                 try:
                     aes_key, iv_bytes, content = deal_req_data(req_data, pri)
                     content = json.loads(json.dumps(content))
+                    detailed = content.get("detail_error") is True
                     if auth_resolver is not None:
                         ok, resolved = auth_resolver(content)
                         if not ok:
@@ -75,12 +77,25 @@ def return_app_route(app,  pri, auth_resolver=None):
                                 ret["note"] = LEGACY_NOTE
                     else:
                         ret = func(content, *wrapper_args, **wrapper_kwargs)
+                    ret_status = 200
+                    if isinstance(ret, tuple) and len(ret) == 2 and isinstance(ret[1], int):
+                        ret, tuple_status = ret
+                        if detailed:
+                            ret_status = tuple_status
+                    if isinstance(ret, str):
+                        try:
+                            ret = json.loads(ret)
+                        except (TypeError, json.JSONDecodeError):
+                            pass
+                    ret, normalized_status = normalize_error(ret, detailed)
+                    if detailed:
+                        ret_status = normalized_status
                     if not isinstance(ret, str):
                         ret = json.dumps(ret)
                     iv, ret = aes_encrypt(ret, aes_key)
                     iv = base64.b64encode(iv).decode("utf-8")
                     ret = base64.b64encode(ret).decode("utf-8")
-                    return {"iv" : iv, "content" : ret}
+                    return {"iv" : iv, "content" : ret}, ret_status
                 except Exception as e:
                     print("[ERR] 来自客户端错误访问导致的异常：{}".format(e))
                     aes_key = ""

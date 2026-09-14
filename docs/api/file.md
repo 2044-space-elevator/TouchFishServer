@@ -86,6 +86,55 @@ TFV5 的文件存储系统基于哈希去重和用户配额管理。同一文件
 - 文件名和扩展名是否合法
 - 用户存储配额是否足够（若文件内容已存在且用户已有该文件则不重复计费）
 
+### 秒传
+
+- `^ POST /file/instant_upload` 使用文件的 SHA256 哈希登记用户文件，避免重复上传已经存在于服务器上的文件。
+
+请求体：
+
+```json
+{
+    "filename": "example.png",
+    "file_hash": "<64 位十六进制 SHA256>",
+    "detail_error": true
+}
+```
+
+也可以使用兼容字段 `hash` 代替 `file_hash`。请求还需要按照主文档携带认证信息：旧版认证使用 `uid` 和 `password`，JWT 认证使用 `token`。
+
+服务端会依次检查用户身份、封禁状态、文件名和扩展名、哈希格式，以及文件是否已在本地或对象存储中存在。文件不存在时不会报错，而是返回 `instant: false`，调用方应改用普通上传或分块上传。
+
+文件已存在并成功登记时返回：
+
+```json
+{
+    "success": true,
+    "instant": true,
+    "file_hash": "<sha256>",
+    "hash": "<sha256>",
+    "download_url": "/file/get_file/<sha256>",
+    "info_url": "/file/get_file_info/<sha256>",
+    "file": {
+        "hash": "<sha256>",
+        "file_name": "example.png",
+        "size": 1024,
+        "mime_type": "image/png",
+        "extension": ".png"
+    }
+}
+```
+
+文件不存在，或文件登记失败但没有发生参数、权限或配额错误时返回：
+
+```json
+{
+    "success": true,
+    "instant": false
+}
+```
+
+可能的详细错误包括：`AUTH_FAILED`、`AUTH_INVALID_PASSWORD`、`RESOURCE_USER_NOT_FOUND`、`RESOURCE_USER_BANNED`、`VALIDATION_INVALID_FILENAME`、`VALIDATION_EXTENSION_NOT_ALLOWED`、`VALIDATION_INVALID_FILE_HASH`、`FILE_STORAGE_QUOTA_EXCEEDED`、`VALIDATION_MISSING_PARAMETER` 和 `SERVER_ERROR`。详细错误格式参见[错误码文档](errors.md)。
+
 ### 查看用户文件
 
 - `^ POST /file/get_user_files` 查看当前用户的所有已上传文件（仍存在的）。
