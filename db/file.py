@@ -36,6 +36,29 @@ class FileDb(Db):
                 hash TEXT PRIMARY KEY, zero_references_at REAL NOT NULL
             )
         """)
+        self.execute("""
+            CREATE TABLE IF NOT EXISTS chunk_upload_tasks (
+                file_id TEXT PRIMARY KEY,
+                uid INTEGER NOT NULL,
+                file_name TEXT,
+                chunk_total INTEGER NOT NULL,
+                expected_hash TEXT,
+                status TEXT NOT NULL,
+                file_hash TEXT,
+                verified INTEGER,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+        """)
+        self.execute("""
+            CREATE TABLE IF NOT EXISTS chunk_upload_parts (
+                file_id TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                size INTEGER NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(file_id, chunk_index)
+            )
+        """)
         self.execute("""INSERT OR IGNORE INTO file_uploaders(hash, uid, created_at)
                         SELECT hash, uid, COALESCE(upload_time, ?) FROM user_file WHERE active = TRUE""", (time.time(),))
 
@@ -143,6 +166,10 @@ class FileDb(Db):
                 return delete_now
             return self._execute_with_retry(operation)
 
+    def has_uploader(self, hashes: str):
+        rows = self.query("SELECT 1 FROM file_uploaders WHERE hash = ? LIMIT 1", (hashes,))
+        return bool(rows)
+
     def collect_expired_hashes(self, expiry_hours: float, zero_ref_seconds: float = 1800.0):
         """检查过期文件"""
         now = time.time()
@@ -156,6 +183,20 @@ class FileDb(Db):
         """, (now - zero_ref_seconds, cutoff))
         return [row[0] for row in rows]
 
+    def should_collect(self, hashes : str, expiry_hours: float = 0.0, zero_ref_seconds: float = 1800.0):
+        """复核单个 hash 是否仍满足回收"""
+        now = time.time()
+        cutoff = now - max(float(expiry_hours), 0) * 3600
+        rows = self.query("""
+            SELECT 1 FROM file f
+            WHERE f.hash = ?
+              AND (NOT EXISTS(SELECT 1 FROM file_uploaders u WHERE u.hash = f.hash)
+               OR EXISTS(SELECT 1 FROM file_gc g WHERE g.hash = f.hash AND g.zero_references_at <= ?)
+               OR EXISTS(SELECT 1 FROM file_references r WHERE r.hash = f.hash
+                         GROUP BY r.hash HAVING MAX(r.last_referenced_at) <= ?))
+        """, (hashes, now - zero_ref_seconds, cutoff))
+        return bool(rows)
+
     def delete_blob_relations(self, hashes: str):
         with self.lock:
             def operation():
@@ -167,12 +208,146 @@ class FileDb(Db):
                 self.conn.commit()
             return self._execute_with_retry(operation)
 
+    # ---- 分块 pro max plus ultra ----
+
+    def create_chunk_task(self, uid : int, file_id : str, file_name : str, chunk_total : int,
+                          expected_hash : str = None, max_active : int = 5,
+                          stale_seconds : float = 3600.0):
+        """创建分块上传任务。返回 (error, expired_file_ids)：
+        error 为 None 表示 ok！"""
+        now = time.time()
+        cutoff = now - stale_seconds
+        with self.lock:
+            def operation():
+                self.cursor.execute(
+                    "SELECT file_id FROM chunk_upload_tasks WHERE uid = ? AND status IN ('uploading', 'finalizing') AND updated_at <= ?",
+                    (uid, cutoff),
+                )
+                expired = [row[0] for row in self.cursor.fetchall()]
+                for expired_id in expired:
+                    self.cursor.execute("DELETE FROM chunk_upload_parts WHERE file_id = ?", (expired_id,))
+                    self.cursor.execute("DELETE FROM chunk_upload_tasks WHERE file_id = ?", (expired_id,))
+                self.cursor.execute(
+                    "SELECT COUNT(*) FROM chunk_upload_tasks WHERE uid = ? AND status IN ('uploading', 'finalizing')",
+                    (uid,),
+                )
+                active = self.cursor.fetchone()[0]
+                if active >= max_active:
+                    self.conn.commit()
+                    return "Too many concurrent uploads", expired
+                self.cursor.execute(
+                    """INSERT INTO chunk_upload_tasks
+                       (file_id, uid, file_name, chunk_total, expected_hash, status, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, 'uploading', ?, ?)""",
+                    (file_id, uid, file_name, chunk_total, expected_hash, now, now),
+                )
+                self.conn.commit()
+                return None, expired
+            return self._execute_with_retry(operation)
+
+    def get_chunk_task(self, file_id : str):
+        rows = self.query(
+            """SELECT file_id, uid, file_name, chunk_total, expected_hash, status, file_hash, verified, created_at, updated_at
+               FROM chunk_upload_tasks WHERE file_id = ?""",
+            (file_id,),
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        return {
+            "file_id": row[0],
+            "uid": row[1],
+            "file_name": row[2],
+            "chunk_total": int(row[3] or 0),
+            "expected_hash": row[4],
+            "status": row[5],
+            "file_hash": row[6],
+            "verified": bool(row[7]),
+            "created_at": row[8],
+            "updated_at": row[9],
+        }
+
+    def touch_chunk_task(self, file_id : str):
+        self.execute("UPDATE chunk_upload_tasks SET updated_at = ? WHERE file_id = ?", (time.time(), file_id))
+
+    def upsert_chunk_part(self, file_id : str, chunk_index : int, size : int):
+        """登记分块"""
+        return self.execute(
+            """INSERT INTO chunk_upload_parts (file_id, chunk_index, size, updated_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(file_id, chunk_index) DO UPDATE SET
+                   size = excluded.size, updated_at = excluded.updated_at""",
+            (file_id, chunk_index, size, time.time()),
+        )
+
+    def list_chunk_parts(self, file_id : str):
+        rows = self.query("SELECT chunk_index, size FROM chunk_upload_parts WHERE file_id = ?", (file_id,))
+        return {int(row[0]): int(row[1] or 0) for row in rows}
+
+    def claim_chunk_finalize(self, file_id : str):
+        """把任务从 uploading 抢占为 finalizing，防止并发合并"""
+        with self.lock:
+            def operation():
+                self.cursor.execute(
+                    "UPDATE chunk_upload_tasks SET status = 'finalizing', updated_at = ? WHERE file_id = ? AND status = 'uploading'",
+                    (time.time(), file_id),
+                )
+                if self.cursor.rowcount > 0:
+                    self.conn.commit()
+                    return "claimed"
+                self.cursor.execute("SELECT status FROM chunk_upload_tasks WHERE file_id = ?", (file_id,))
+                row = self.cursor.fetchone()
+                self.conn.commit()
+                if row is None:
+                    return "missing"
+                return "done" if row[0] == "done" else "busy"
+            return self._execute_with_retry(operation)
+
+    def release_chunk_finalize(self, file_id : str):
+        self.execute(
+            "UPDATE chunk_upload_tasks SET status = 'uploading', updated_at = ? WHERE file_id = ? AND status = 'finalizing'",
+            (time.time(), file_id),
+        )
+
+    def complete_chunk_task(self, file_id : str, file_hash : str, verified : bool):
+        with self.lock:
+            def operation():
+                self.cursor.execute(
+                    "UPDATE chunk_upload_tasks SET status = 'done', file_hash = ?, verified = ?, updated_at = ? WHERE file_id = ?",
+                    (file_hash, 1 if verified else 0, time.time(), file_id),
+                )
+                self.cursor.execute("DELETE FROM chunk_upload_parts WHERE file_id = ?", (file_id,))
+                self.conn.commit()
+            return self._execute_with_retry(operation)
+
+    def delete_chunk_task(self, file_id : str):
+        with self.lock:
+            def operation():
+                self.cursor.execute("DELETE FROM chunk_upload_parts WHERE file_id = ?", (file_id,))
+                self.cursor.execute("DELETE FROM chunk_upload_tasks WHERE file_id = ?", (file_id,))
+                self.conn.commit()
+            return self._execute_with_retry(operation)
+
+    def expire_stale_chunk_tasks(self, max_age : float = 3600.0):
+        """删除长时间无活动的任务（含已完成的），返回被删除的 file_id 列表。"""
+        cutoff = time.time() - max_age
+        with self.lock:
+            def operation():
+                self.cursor.execute("SELECT file_id FROM chunk_upload_tasks WHERE updated_at <= ?", (cutoff,))
+                expired = [row[0] for row in self.cursor.fetchall()]
+                for expired_id in expired:
+                    self.cursor.execute("DELETE FROM chunk_upload_parts WHERE file_id = ?", (expired_id,))
+                    self.cursor.execute("DELETE FROM chunk_upload_tasks WHERE file_id = ?", (expired_id,))
+                self.conn.commit()
+                return expired
+            return self._execute_with_retry(operation)
+
     def acquire_reference(self, uid : int, hashes : str):
         """获取内容引用"""
         with self.lock:
             def operation():
                 self.cursor.execute(
-                    """SELECT uf.file_name, uf.extension
+                    """SELECT uf.file_name, uf.extension, uf.size
                        FROM user_file uf JOIN file f ON f.hash = uf.hash
                        WHERE uf.uid = ? AND uf.hash = ? AND uf.active = TRUE""",
                     (uid, hashes),
@@ -185,7 +360,7 @@ class FileDb(Db):
                     "file_name": row[0],
                     "file_type": (row[1] or "").lstrip(".") or "unknown",
                     "extension": row[1] or "",
-                    "size": self.get_file_size(hashes),
+                    "size": int(row[2] or 0) or self.get_file_size(hashes),
                 }
 
             return self._execute_with_retry(operation)
@@ -195,7 +370,7 @@ class FileDb(Db):
         with self.lock:
             def operation():
                 self.cursor.execute(
-                    """SELECT uf.file_name, uf.extension FROM user_file uf
+                    """SELECT uf.file_name, uf.extension, uf.size FROM user_file uf
                        WHERE uf.hash = ? AND uf.active = TRUE ORDER BY uf.upload_time LIMIT 1""",
                     (hashes,),
                 )
@@ -207,7 +382,7 @@ class FileDb(Db):
                     "file_name": row[0],
                     "file_type": (row[1] or "").lstrip(".") or "unknown",
                     "extension": row[1] or "",
-                    "size": self.get_file_size(hashes),
+                    "size": int(row[2] or 0) or self.get_file_size(hashes),
                 }
 
             return self._execute_with_retry(operation)
@@ -268,17 +443,20 @@ class FileDb(Db):
             (uid,))
 
     def get_user_storage_used(self, uid : int):
-        rows = self.query("SELECT hash, COALESCE(size, 0) FROM user_file WHERE uid = ? AND active = TRUE", (uid,))
-        total = 0
-        for hashes, stored_size in rows:
-            if stored_size and stored_size > 0:
-                # 优先使用数据库中记录的大小（OSS2 模式下本地文件会被删除）
-                total += stored_size
-            else:
-                # 回退到本地文件大小（兼容旧数据）
-                path = "res/{}/file/{}.file".format(self.port_api, hashes)
-                if os.path.isfile(path):
+        rows = self.query(
+            "SELECT COALESCE(SUM(size), 0) FROM user_file WHERE uid = ? AND active = TRUE AND size > 0",
+            (uid,))
+        total = int(rows[0][0] or 0) if rows else 0
+        missing = self.query(
+            "SELECT hash FROM user_file WHERE uid = ? AND active = TRUE AND (size IS NULL OR size <= 0)",
+            (uid,))
+        for (hashes,) in missing:
+            path = "res/{}/file/{}.file".format(self.port_api, hashes)
+            if os.path.isfile(path):
+                try:
                     total += os.path.getsize(path)
+                except OSError:
+                    pass
         return total
 
     def backfill_missing_sizes(self):
@@ -350,8 +528,8 @@ class FileDb(Db):
             return None
         params = (hashes,) if owner_uid is None else (hashes, owner_uid)
         owner_filter = "" if owner_uid is None else " AND uid = ?"
-        rows = self.query("SELECT file_name, extension, upload_time, mime_type FROM user_file WHERE hash = ? AND active = TRUE{} ORDER BY upload_time LIMIT 1".format(owner_filter), params)
-        row = rows[0] if rows else (hashes, "", None, "unknown")
+        rows = self.query("SELECT file_name, extension, upload_time, mime_type, size FROM user_file WHERE hash = ? AND active = TRUE{} ORDER BY upload_time LIMIT 1".format(owner_filter), params)
+        row = rows[0] if rows else (hashes, "", None, "unknown", 0)
         stored_type = str(row[3] or "").lower().lstrip(".")
         if stored_type not in {"png", "jpg", "gif", "bmp", "svg", "tgs"}:
             stored_type = ""
@@ -362,7 +540,7 @@ class FileDb(Db):
             "hash": hashes,
             "file_name": row[0],
             "filename": row[0],
-            "size": self.get_file_size(hashes),
+            "size": int(row[4] or 0) or self.get_file_size(hashes),
             "file_type": (stored_type or fallback_type or "unknown").lstrip("."),
             "extension": row[1] or "",
             "download_url": "/file/get_file/{}".format(hashes),

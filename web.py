@@ -1,4 +1,4 @@
-from flask import Flask, send_file, request as flask_request, g as flask_g
+from flask import Flask, send_file, redirect, request as flask_request, g as flask_g
 from werkzeug.middleware.proxy_fix import ProxyFix
 import json
 import register_tool
@@ -19,7 +19,7 @@ import threading
 from config_utils import normalize_default_join_targets
 from json_store import read_json, update_json
 from datetime import datetime, timedelta
-from file_types import detect_file_type, is_sticker_type
+from file_types import IMAGE_TYPES, detect_file_type, is_sticker_type
 import oss_store
 from sync_limits import SYNC_MAX_LIMIT, parse_sync_missing_sequences
 
@@ -318,6 +318,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         }
         if include_manage:
             ret["rate_limits"] = cfg.get("rate_limits", {})
+            ret["file_download_mode"] = oss_store.get_download_mode(port_api, cfg)
             if cfg.get("email_activate"):
                 ret["verify_email"] = cfg.get("email_activate")
             ret["smtp_host"] = cfg.get("smtp_host", "")
@@ -1537,6 +1538,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             if "jwt_max_per_user" in req:
                 updates["jwt_max_per_user"] = parse_int_setting(req["jwt_max_per_user"], minimum=0, allow_unlimited=True)
 
+            if "file_download_mode" in req:
+                if req["file_download_mode"] not in ("redirect", "proxy"):
+                    return bool_res()[False]
+                updates["file_download_mode"] = req["file_download_mode"]
+
             if not updates:
                 return bool_res()[False]
 
@@ -1687,27 +1693,44 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         rows = user_cursor.uid_query(uid)
         return bool(rows and rows[0][4] in manager_auths)
 
-    def _hash_file_type(file_hash, sticker_managed=False):
-        target = file.sticker_path(port_api, file_hash) if sticker_managed else file.file_path(port_api, file_hash)
-        # OSS2 模式下本地可能没有该文件，用唯一临时文件拉取检查后立即删除
-        if not os.path.isfile(target) and oss_store.is_oss_enabled(port_api):
-            kind = "sticker" if sticker_managed else "file"
-            temp_path = oss_store.temp_download_path(port_api, kind, file_hash)
-            if not oss_store.download_from_oss(port_api, kind, file_hash, temp_path):
-                return "unknown"
+    def _read_blob_head(kind, hashes, length=4096):
+        """读取 blob 的 (总大小, 头部字节)"""
+        target = file.sticker_path(port_api, hashes) if kind == "sticker" else file.file_path(port_api, hashes)
+        if os.path.isfile(target):
             try:
-                with open(temp_path, "rb") as handle:
-                    result = detect_file_type(handle.read(), "")
-                return result
+                with open(target, "rb") as handle:
+                    return os.path.getsize(target), handle.read(length)
             except OSError:
-                return "unknown"
-            finally:
-                oss_store.safe_remove(temp_path)
-        try:
-            with open(target, "rb") as handle:
-                return detect_file_type(handle.read(), "")
-        except OSError:
-            return "unknown"
+                return None
+        if oss_store.is_oss_enabled(port_api):
+            return oss_store.head_and_prefix(port_api, kind, hashes, length)
+        return None
+
+    def _read_blob_bytes(kind, hashes):
+        """完整读取 blob 内容（仅用于 ≤10MB 的 gzip/tgs 嗅探回退）。"""
+        target = file.sticker_path(port_api, hashes) if kind == "sticker" else file.file_path(port_api, hashes)
+        if os.path.isfile(target):
+            try:
+                with open(target, "rb") as handle:
+                    return handle.read()
+            except OSError:
+                return None
+        if oss_store.is_oss_enabled(port_api):
+            return oss_store.download_bytes_from_oss(port_api, kind, hashes)
+        return None
+
+    def _blob_type_and_size(kind, hashes):
+        """GET blob 类型与大小"""
+        head = _read_blob_head(kind, hashes)
+        if head is None:
+            return None
+        size, prefix = head
+        file_type = detect_file_type(prefix, "")
+        if file_type == "unknown" and prefix.startswith(b"\x1f\x8b") and 0 < size <= 10 * 1024 * 1024:
+            content = _read_blob_bytes(kind, hashes)
+            if content is not None:
+                file_type = detect_file_type(content, "")
+        return file_type, size
 
     @app.route("/sticker/market")
     def sticker_market():
@@ -1785,32 +1808,19 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         sticker_managed = sticker_cursor.has_active_user_sticker(uid, file_hash)
         if not sticker_managed and not file_cursor.has_active_user_file(uid, file_hash):
             return json.dumps({"success": False, "error": "file_not_owned"})
+        kind = "sticker" if sticker_managed else "file"
         try:
-            file_type = _hash_file_type(file_hash, sticker_managed=sticker_managed)
+            type_and_size = _blob_type_and_size(kind, file_hash)
         except OSError:
+            type_and_size = None
+        if type_and_size is None:
             return json.dumps({"success": False, "error": "file_unavailable"})
-        sticker_path = file.sticker_path(port_api, file_hash) if sticker_managed else file.file_path(port_api, file_hash)
-        if os.path.isfile(sticker_path):
-            sticker_bytes = open(sticker_path, "rb").read()
-        elif oss_store.is_oss_enabled(port_api):
-            # OSS2 模式：用唯一临时文件拉取检查类型与大小，用后立即删除
-            kind = "sticker" if sticker_managed else "file"
-            temp_path = oss_store.temp_download_path(port_api, kind, file_hash)
-            if not oss_store.download_from_oss(port_api, kind, file_hash, temp_path):
-                return json.dumps({"success": False, "error": "file_unavailable"})
-            try:
-                sticker_bytes = open(temp_path, "rb").read()
-            except OSError:
-                return json.dumps({"success": False, "error": "file_unavailable"})
-            finally:
-                oss_store.safe_remove(temp_path)
-        else:
-            return json.dumps({"success": False, "error": "file_unavailable"})
-        if not is_sticker_type(sticker_bytes):
+        file_type, sticker_size = type_and_size
+        if file_type not in IMAGE_TYPES:
             return json.dumps({"success": False, "error": "unsupported_sticker_type"})
         cfg = read_config()
         max_sticker_size = cfg.get("max_sticker_size", 1048576)
-        if max_sticker_size != -1 and len(sticker_bytes) > max_sticker_size:
+        if max_sticker_size != -1 and sticker_size > max_sticker_size:
             return json.dumps({"success": False, "error": "sticker_too_large"})
         sticker_id, error = sticker_cursor.create_sticker(uid, pack_id, slug.strip(), req.get("name"), file_hash, file_type, int(req.get("size", 0)), int(req.get("mode", 0)), int(cfg.get("max_stickers_per_pack", 24)), _sticker_exempt(uid))
         if error:
@@ -2693,24 +2703,19 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return bool_res()[False]
         quota = cfg.get("user_storage_quota", -1)
         max_quota = cfg.get("max_user_storage_quota", 73400320)  # 默认 70MB
-        if quota != -1 and payload is not None:
-            new_size = len(payload)
-            new_hashes = file.sha256(payload)
-            current_usage = file_cursor.get_user_storage_used(uid)
+        new_hashes = file.sha256(payload)
+        if quota != -1 or max_quota != -1:
             if not file_cursor.has_active_user_file(uid, new_hashes):
-                if current_usage + new_size > quota:
+                new_size = len(payload)
+                current_usage = file_cursor.get_user_storage_used(uid)
+                if quota != -1 and current_usage + new_size > quota:
                     return bool_res()[False]
-        # 瞬时单用户文件总大小不得超过 max_user_storage_quota（默认 70MB）
-        if payload is not None and max_quota != -1:
-            new_size = len(payload)
-            new_hashes = file.sha256(payload)
-            current_usage = file_cursor.get_user_storage_used(uid)
-            if not file_cursor.has_active_user_file(uid, new_hashes):
-                if current_usage + new_size > max_quota:
+                # 瞬时单用户文件总大小不得超过 max_user_storage_quota（默认 70MB）
+                if max_quota != -1 and current_usage + new_size > max_quota:
                     return bool_res()[False]
         try:
-            hashes = file.upload_file(port_api, uid, file_b64, normalized_name, file_cursor,
-                                      cfg.get("file_last_time", 72))
+            hashes = file.upload_file(port_api, uid, payload, normalized_name, file_cursor,
+                                      cfg.get("file_last_time", 72), known_hash=new_hashes)
         except Exception:
             return bool_res()[False]
         return json.dumps({
@@ -3023,7 +3028,15 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return ("", 404)
         metadata = file_metadata(hashes) or {}
         download_name = metadata.get("file_name") or hashes
-        # OSS2 模式：先从 OSS 拉取到唯一临时文件，发送完成后立即删除
+        if oss_store.is_oss_enabled(port_api):
+            if oss_store.get_download_mode(port_api) == "redirect":
+                url = oss_store.presigned_download_url(
+                    port_api, "file", hashes, download_name,
+                    content_type=mime_from_name(download_name),
+                )
+                if url:
+                    return redirect(url, code=307)
+        # OSS2 模式（代理模式）：先从 OSS 拉取到唯一临时文件，发送完成后立即删除
         if oss_store.is_oss_enabled(port_api):
             temp_path = oss_store.temp_download_path(port_api, "file", hashes)
             try:
@@ -3086,14 +3099,14 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return json.dumps({"success": False, "error": "sticker_too_large"}, ensure_ascii=False)
         # 瞬时贴图总大小不得超过 max_sticker_storage_quota（默认 30MB）
         max_sticker_quota = cfg.get("max_sticker_storage_quota", 31457280)
+        new_hashes = file.sha256(payload)
         if max_sticker_quota != -1:
-            new_hashes = file.sha256(payload)
-            current_sticker_usage = sticker_cursor.get_user_sticker_used(uid)
             if not sticker_cursor.has_active_user_sticker(uid, new_hashes):
+                current_sticker_usage = sticker_cursor.get_user_sticker_used(uid)
                 if current_sticker_usage + len(payload) > max_sticker_quota:
                     return json.dumps({"success": False, "error": "sticker_storage_quota_exceeded"}, ensure_ascii=False)
         try:
-            hashes = file.upload_sticker(port_api, uid, file_b64, normalized_name, sticker_cursor)
+            hashes = file.upload_sticker(port_api, uid, payload, normalized_name, sticker_cursor, known_hash=new_hashes)
         except Exception:
             return json.dumps({"success": False, "error": "upload_failed"}, ensure_ascii=False)
         info = sticker_cursor.get_sticker_file_info(hashes)
@@ -3125,7 +3138,15 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             ".gif": "image/gif", ".bmp": "image/bmp", ".svg": "image/svg+xml",
             ".tgs": "application/octet-stream",
         }
-        # OSS2 mode: download to unique temp file, delete immediately after sending
+        if oss_store.is_oss_enabled(port_api):
+            if oss_store.get_download_mode(port_api) == "redirect":
+                url = oss_store.presigned_download_url(
+                    port_api, "sticker", hashes, download_name,
+                    content_type=mimetype_map.get(ext),
+                )
+                if url:
+                    return redirect(url, code=307)
+        # OSS2 mode (proxy): download to unique temp file, delete immediately after sending
         if oss_store.is_oss_enabled(port_api):
             temp_path = oss_store.temp_download_path(port_api, "sticker", hashes)
             try:

@@ -4,6 +4,7 @@
 from __future__ import annotations
 import gzip
 import json
+import zlib
 
 
 IMAGE_TYPES = {"png", "jpg", "gif", "bmp", "svg", "tgs"}
@@ -33,7 +34,7 @@ def detect_file_type(content: bytes, fallback_name: str = "") -> str:
                 "tgs" in payload or ("v" in payload and "layers" in payload)
             ):
                 return "tgs"
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, EOFError, zlib.error):
             pass
 
     suffix = fallback_name.rsplit(".", 1)[-1].lower() if "." in fallback_name else ""

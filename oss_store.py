@@ -16,6 +16,8 @@ import os
 import time
 import json
 import threading
+import unicodedata
+import urllib.parse
 import uuid
 import glob
 
@@ -146,6 +148,124 @@ def get_size_from_oss(port_api: int, kind: str, hashes: str, cfg: dict = None) -
         return 0
 
 
+_DOWNLOAD_MODES = ("redirect", "proxy")
+
+
+def get_download_mode(port_api: int, cfg: dict = None) -> str:
+    """返回下载模式：redirect（预签名 307）或 proxy（服务端中转）。默认 redirect。"""
+    if cfg is None:
+        cfg = _read_config(port_api)
+    mode = cfg.get("file_download_mode")
+    if mode not in _DOWNLOAD_MODES:
+        return "redirect"
+    return mode
+
+
+def _content_disposition_value(filename: str):
+    """生成与 werkzeug send_file 完全一致的 attachment 头（含 RFC 5987 filename*）。"""
+    try:
+        from werkzeug.datastructures import Headers
+        try:
+            filename.encode("ascii")
+            names = {"filename": filename}
+        except UnicodeEncodeError:
+            simple = unicodedata.normalize("NFKD", filename).encode("ascii", "ignore").decode("ascii")
+            quoted = urllib.parse.quote(filename, safe="!#$&+-.^_`|~")
+            names = {"filename": simple, "filename*": "UTF-8''" + quoted}
+        headers = Headers()
+        headers.set("Content-Disposition", "attachment", **names)
+        return headers["Content-Disposition"]
+    except Exception:
+        return None
+
+
+def presigned_download_url(port_api: int, kind: str, hashes: str, filename: str = None,
+                           content_type: str = None, expires: int = 900,
+                           cfg: dict = None) -> str:
+    """生成 OSS2 预签名下载 URL！未启用 OSS、签名失败时返回空字符串。"""
+    if not is_oss_enabled(port_api, cfg):
+        return ""
+    if cfg is None:
+        cfg = _read_config(port_api)
+    bucket = _get_bucket(port_api, cfg)
+    key = object_key(kind, hashes)
+    params = {}
+    if filename:
+        disposition = _content_disposition_value(filename)
+        if disposition:
+            params["response-content-disposition"] = disposition
+    if content_type:
+        params["response-content-type"] = content_type
+    try:
+        return bucket.sign_url("GET", key, expires, params=params or None, slash_safe=True)
+    except Exception as e:
+        print("[WARN] OSS2 预签名失败 ({}): {}".format(key, e))
+        return ""
+
+
+def head_and_prefix(port_api: int, kind: str, hashes: str, length: int = 4096,
+                    cfg: dict = None):
+    """返回 (对象总大小, 头部若干字节) 0byte head only pls"""
+    if length <= 0:
+        length = 4096
+    if not is_oss_enabled(port_api, cfg):
+        return None
+    if cfg is None:
+        cfg = _read_config(port_api)
+    bucket = _get_bucket(port_api, cfg)
+    key = object_key(kind, hashes)
+    try:
+        size = int(bucket.head_object(key).content_length or 0)
+    except Exception as e:
+        print("[WARN] OSS2 head 失败 ({}): {}".format(key, e))
+        return None
+    if size <= 0:
+        return size, b""
+    try:
+        obj = bucket.get_object(key, byte_range=(0, min(length, size) - 1))
+        try:
+            data = obj.read()
+        finally:
+            try:
+                obj.close()
+            except Exception:
+                pass
+        return size, data or b""
+    except Exception as e:
+        print("[WARN] OSS2 范围读取失败 ({}): {}".format(key, e))
+        return None
+
+
+def download_bytes_from_oss(port_api: int, kind: str, hashes: str,
+                            max_size: int = 10 * 1024 * 1024, cfg: dict = None):
+    """完整拉取小块对象（仅用于 ≤max_size """
+    if not is_oss_enabled(port_api, cfg):
+        return None
+    if cfg is None:
+        cfg = _read_config(port_api)
+    bucket = _get_bucket(port_api, cfg)
+    key = object_key(kind, hashes)
+    try:
+        size = int(bucket.head_object(key).content_length or 0)
+    except Exception as e:
+        print("[WARN] OSS2 head 失败 ({}): {}".format(key, e))
+        return None
+    if size <= 0 or size > max_size:
+        return None
+    try:
+        obj = bucket.get_object(key)
+        try:
+            return obj.read()
+        finally:
+            try:
+                obj.close()
+            except Exception:
+                pass
+    except Exception as e:
+        print("[WARN] OSS2 读取失败 ({}): {}".format(key, e))
+        return None
+
+
 def delete_from_oss(port_api: int, kind: str, hashes: str, cfg: dict = None) -> bool:
     """从 OSS2 删除对象。"""
     if not is_oss_enabled(port_api, cfg):
@@ -164,11 +284,11 @@ def delete_from_oss(port_api: int, kind: str, hashes: str, cfg: dict = None) -> 
 
 def temp_download_path(port_api: int, kind: str, hashes: str) -> str:
     """
-    生成一个唯一的 OSS 下载临时文件路径。
+    生成一个唯一的 OSS 下载临时文件路径
     使用 .oss_ 前缀 + uuid，避免与本地存储的正式文件冲突，
     也避免并发下载同一 hash 时互相覆盖。
     """
-    return "res/{}/{}/.oss_{}_{}.file".format(port_api, kind, uuid.uuid4().hex, hashes)
+    return "res/{}/tmp/.oss_{}_{}_{}.file".format(port_api, kind, uuid.uuid4().hex, hashes)
 
 
 def safe_remove(path: str, retries: int = 5, delay: float = 0.2):
@@ -195,23 +315,24 @@ def safe_remove(path: str, retries: int = 5, delay: float = 0.2):
 
 def cleanup_temp_files(port_api: int, kind: str, max_age: float = 3600.0):
     """
-    清理指定目录下残留的 .oss_ 临时文件。
+    清理残留的 .oss_ 
     正常情况下临时文件用后即删；这里兜底清理因异常崩溃等未能删除的残留。
     max_age 秒数：只清理超过该时间的旧文件，避免误删正在使用的文件。
     """
     if kind not in ("file", "sticker"):
         return
-    directory = "res/{}/{}".format(port_api, kind)
-    if not os.path.isdir(directory):
-        return
+    directories = ("res/{}/tmp".format(port_api), "res/{}/{}".format(port_api, kind))
     now = time.time()
-    try:
-        pattern = os.path.join(directory, ".oss_*.file")
-        for path in glob.glob(pattern):
-            try:
-                if now - os.path.getmtime(path) > max_age:
-                    safe_remove(path)
-            except OSError:
-                pass
-    except OSError:
-        pass
+    for directory in directories:
+        if not os.path.isdir(directory):
+            continue
+        try:
+            pattern = os.path.join(directory, ".oss_*")
+            for path in glob.glob(pattern):
+                try:
+                    if now - os.path.getmtime(path) > max_age:
+                        safe_remove(path)
+                except OSError:
+                    pass
+        except OSError:
+            pass

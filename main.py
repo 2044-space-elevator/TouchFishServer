@@ -10,7 +10,7 @@ from json_store import update_json, write_json
 import db
 from db.dialect import SQLiteDialect, MySQLDialect, PostgreSQLDialect
 import avatar
-from file import init, collect_expired
+from file import init, collect_expired, sweep_stale_chunk_uploads
 import logging
 from crypto import generate_rsa_keys, load_pub, load_pri
 import time
@@ -149,6 +149,7 @@ def create_new_server():
         "reverse_proxy_enabled" : False,
         "proxy_count" : 1,
         "file_last_time" : 72,
+        "file_download_mode" : "redirect",
         "groups_limit" : 30,
         "single_group_max_people" : 200,
         "default_join_targets" : [],
@@ -499,11 +500,12 @@ def main(args=None):
                         expiry = json.load(handle).get("file_last_time", 72)
                     last_config_read = now
                 collect_expired(PORT_API, STICKER_CURSOR, FILE_CURSOR, expiry)
-                # 清理 OSS2 模式下载遗留的 .oss_ 临时文件（每 10 分钟一次）
+                # 清理 OSS2 模式下载遗留的 .oss_ 临时文件与超时分块上传任务（每 10 分钟一次）
                 if now - last_oss_cleanup > 600:
                     import oss_store
                     oss_store.cleanup_temp_files(PORT_API, "file")
                     oss_store.cleanup_temp_files(PORT_API, "sticker")
+                    sweep_stale_chunk_uploads(PORT_API, FILE_CURSOR)
                     last_oss_cleanup = now
             except Exception as error:
                 print("[WARN] 文件回收失败: {}".format(error))
