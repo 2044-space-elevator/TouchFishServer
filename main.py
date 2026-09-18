@@ -10,7 +10,8 @@ from json_store import update_json, write_json
 import db
 from db.dialect import SQLiteDialect, MySQLDialect, PostgreSQLDialect
 import avatar
-from file import init, collect_expired, sweep_stale_chunk_uploads
+from file import (init, collect_expired, sweep_stale_chunk_uploads,
+                  sweep_orphan_media, start_media_worker, set_media_notifier)
 import logging
 from crypto import generate_rsa_keys, load_pub, load_pri
 import time
@@ -150,6 +151,7 @@ def create_new_server():
         "proxy_count" : 1,
         "file_last_time" : 72,
         "file_download_mode" : "redirect",
+        "media_features" : True,
         "groups_limit" : 30,
         "single_group_max_people" : 200,
         "default_join_targets" : [],
@@ -500,12 +502,13 @@ def main(args=None):
                         expiry = json.load(handle).get("file_last_time", 72)
                     last_config_read = now
                 collect_expired(PORT_API, STICKER_CURSOR, FILE_CURSOR, expiry)
-                # 清理 OSS2 模式下载遗留的 .oss_ 临时文件与超时分块上传任务（每 10 分钟一次）
+                # 清理 OSS2 模式下载遗留的 .oss_ 临时文件、超时分块任务与无主缩略图（每 10 分钟一次）
                 if now - last_oss_cleanup > 600:
                     import oss_store
                     oss_store.cleanup_temp_files(PORT_API, "file")
                     oss_store.cleanup_temp_files(PORT_API, "sticker")
                     sweep_stale_chunk_uploads(PORT_API, FILE_CURSOR)
+                    sweep_orphan_media(PORT_API, FILE_CURSOR)
                     last_oss_cleanup = now
             except Exception as error:
                 print("[WARN] 文件回收失败: {}".format(error))
@@ -515,6 +518,110 @@ def main(args=None):
         PORT_API, PORT_TCP, NOTIFICATION_CURSOR, USER_CURSOR,
         MESSAGES_CURSOR, GROUP_CURSOR, FILE_CURSOR,
     )
+
+    # 媒体推送
+    media_push_buffer = {}
+    media_push_lock = threading.Lock()
+    media_push_timer = [None]
+    MEDIA_PUSH_WINDOW = 0.5
+    MEDIA_PUSH_BATCH_LIMIT = 50
+    MEDIA_PUSH_GROUP_ONLINE_LIMIT = 100
+
+    def _media_push_recipients(hashes):
+        """所有者 + 引用该文件的会话在线成员（不过可能会因为计算量过“小”而 downgrade 到 gpt-4o）"""
+        recipients = set()
+        try:
+            for (owner_uid,) in FILE_CURSOR.query(
+                    "SELECT uid FROM file_uploaders WHERE hash = ?", (hashes,)):
+                recipients.add(int(owner_uid))
+        except Exception:
+            pass
+        try:
+            refs = FILE_CURSOR.query(
+                "SELECT source_id FROM file_references WHERE hash = ? AND source_type = 'message'",
+                (hashes,))
+        except Exception:
+            refs = []
+        groups = set()
+        for (source_id,) in refs:
+            try:
+                message = MESSAGES_CURSOR.get_message(int(source_id))
+            except Exception:
+                continue
+            if message is None or message.get("deleted"):
+                continue
+            if message.get("group_id"):
+                groups.add(int(message["group_id"]))
+            elif message.get("receiver_uid"):
+                recipients.add(int(message["receiver_uid"]))
+        for gid in groups:
+            try:
+                members = GROUP_CURSOR.get_member_uids(gid) or []
+            except Exception:
+                continue
+            online = INSTANT_CONTACT.filter_online(members)
+            if len(online) > MEDIA_PUSH_GROUP_ONLINE_LIMIT:
+                continue
+            recipients.update(online)
+        return INSTANT_CONTACT.filter_online(recipients)
+
+    def _flush_media_pushes():
+        with media_push_lock:
+            pending = media_push_buffer.copy()
+            media_push_buffer.clear()
+            media_push_timer[0] = None
+        for uid, items in pending.items():
+            try:
+                INSTANT_CONTACT.push_raw(uid, {"type": "FILE.MEDIA_READY", "items": list(items.values())})
+            except Exception:
+                pass
+
+    def _media_ready_notifier(port_api, hashes):
+        """生成完成回调并入缓冲并延迟下发。"""
+        try:
+            media = FILE_CURSOR.get_media(hashes)
+        except Exception:
+            return
+        if media is None or media["status"] != "done":
+            return
+        item = {
+            "hash": hashes,
+            "width": media["width"],
+            "height": media["height"],
+            "blurhash": media["blurhash"],
+            "has_thumb": media["thumb_size"] is not None or media["thumb_is_original"],
+            "thumb_url": "/file/get_thumbnail/{}".format(hashes),
+        }
+        recipients = _media_push_recipients(hashes)
+        if not recipients:
+            return
+        flush_now = False
+        with media_push_lock:
+            for uid in recipients:
+                bucket = media_push_buffer.setdefault(uid, {})
+                bucket[hashes] = item
+                if len(bucket) >= MEDIA_PUSH_BATCH_LIMIT:
+                    flush_now = True
+            if media_push_timer[0] is None and not flush_now:
+                timer = threading.Timer(MEDIA_PUSH_WINDOW, _flush_media_pushes)
+                timer.daemon = True
+                media_push_timer[0] = timer
+                timer.start()
+        if flush_now:
+            _flush_media_pushes()
+
+    try:
+        cfg_path = "res/{}/config.json".format(PORT_API)
+        with open(cfg_path, "r", encoding="utf-8") as handle:
+            media_cfg = json.load(handle)
+        if media_cfg.get("media_features", True) and "media_features_since" not in media_cfg:
+            update_json(cfg_path, lambda current: current.setdefault("media_features_since", time.time()))
+            prt("已记录媒体功能启用时间：存量文件不参与自动补齐。", "green")
+    except Exception as e:
+        prt("[WARN] 媒体功能时间戳写入失败: {}".format(e), "yellow")
+    set_media_notifier(_media_ready_notifier)
+    start_media_worker(PORT_API, FILE_CURSOR)
+
     FLASK_APP = web.main(PORT_API, PORT_TCP, pub_pem, PRI_KEY, IMGCAPTCHA, USER_CURSOR, FORUM_CURSOR, FILE_CURSOR, NOTIFICATION_CURSOR, MESSAGES_CURSOR, GROUP_CURSOR, INSTANT_CONTACT, STICKER_CURSOR)
     start_api = args.start_api
     if not args.cli_mode:

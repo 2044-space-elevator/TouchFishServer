@@ -31,6 +31,10 @@ TFV5 的文件存储系统基于哈希去重和用户配额管理。同一文件
 
 `file_download_mode` 设为 `proxy` 时和旧版相同。
 
+- `GET /file/get_thumbnail/<hashes>` 获取图片缩略图（大边 512 的 WebP）。
+
+无需加密。仅对生成成功的图片有效：缩略图未生成、文件不是图片、或（开关关闭前未生成的）存量文件返回 404，客户端应回退到原图。原图本身不超过 512px 时该端点直接返回原图。OSS2 模式下同样遵循 `file_download_mode` 的 redirect / proxy 行为。
+
 - `GET /file/get_file_info/<hashes>` 获取文件基本信息。
 
 无需加密。返回体：
@@ -48,7 +52,12 @@ TFV5 的文件存储系统基于哈希去重和用户配额管理。同一文件
     "mime_type" : <mime_type>,
     "extension" : <extension>,
     "upload_user_count" : <upload_user_count>,
-    "download_url" : "/file/get_file/<hash>"
+    "download_url" : "/file/get_file/<hash>",
+    "width" : <image_width_or_null>,
+    "height" : <image_height_or_null>,
+    "blurhash" : "<blurhash_or_null>",
+    "has_thumb" : <bool>,
+    "thumb_url" : "/file/get_thumbnail/<hash>（无缩略图时为 null）"
 }
 ```
 
@@ -305,8 +314,39 @@ TFV5 的文件存储系统基于哈希去重和用户配额管理。同一文件
 - `max_file_size`：单个文件最大上传大小（字节），`-1` 不限。
 - `user_storage_quota`：每个用户的存储配额（字节），`-1` 不限。新增于 TFV5。
 - `file_download_mode`：下载模式，`redirect`（默认，OSS2 模式下返回 307 预签名直链）或 `proxy`（服务端中转）。仅在启用 OSS2 对象存储时生效；可随时切换，无需重启。
+- `media_features`：媒体元数据与缩略图开关（布尔，默认 `true`）。关闭后新上传不再生成、已有缩略图/blurhash 继续下发；重新打开后由惰性自愈逐步补齐缺口。
 
 此外 `file_last_time` 控制引用计数为 0 且超时的文件自动清理（单位：小时）。
+
+## 媒体元数据与缩略图
+
+启用 `media_features`（默认）后，图片类文件（png/jpg/gif/bmp/webp）会附带媒体元数据：
+
+- **宽高在响应中立即可用**（上传时同步读取文件头）；**缩略图与 blurhash 由后台队列异步生成**，生成完成后通过 WebSocket 推送 `FILE.MEDIA_READY` 事件。
+- 元数据字段（`file` 对象 / `get_file_info` / 消息附件的 `metadata` 中）：`width`、`height`、`blurhash`（4×3，可用于模糊占位图）、`has_thumb`、`thumb_url`。
+- 缩略图规格：大边 512 的 WebP（质量 80）；原图不超过 512px 时不生成缩略图，`thumb_url` 直接指向原图（服务端自动处理）。
+- 存量边界：功能首次启用时会记录 `media_features_since` 时间戳，早于该时刻上传的文件不会被自动补齐（客户端对这类文件继续直出原图）。
+- 生命周期：缩略图与元数据跟随原文件；原文件被删除/回收时级联清理，不参与 `file_last_time` 自动回收。
+
+`FILE.MEDIA_READY` WebSocket 事件（推送给文件所有者与引用该文件的会话在线成员）：
+
+```json
+{
+    "type": "FILE.MEDIA_READY",
+    "items": [
+        {
+            "hash": "<sha256>",
+            "width": 1920,
+            "height": 1080,
+            "blurhash": "L6Pj0^...",
+            "has_thumb": true,
+            "thumb_url": "/file/get_thumbnail/<sha256>"
+        }
+    ]
+}
+```
+
+客户端收到后应按 `hash` 更新已渲染消息的媒体信息；未收到（离线/错过）时，下次拉取消息/文件列表时的新元数据即为最新值。
 
 ## 自动清理机制
 

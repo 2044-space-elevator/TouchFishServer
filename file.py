@@ -1,13 +1,51 @@
 from __future__ import annotations
+import io
 import os
 import base64
 import time
 import uuid
+from collections import deque
 from db import FileDb
 import hashlib
 from file_types import detect_file_type
 import threading
 import oss_store
+
+try:
+    from PIL import Image, ImageOps
+    _PIL_AVAILABLE = True
+except ImportError:
+    Image = None
+    ImageOps = None
+    _PIL_AVAILABLE = False
+
+try:
+    import blurhash as _blurhash
+    _BLURHASH_AVAILABLE = True
+except ImportError:
+    _blurhash = None
+    _BLURHASH_AVAILABLE = False
+
+
+
+
+_THUMB_EXT = ".thumb.webp"
+_MEDIA_THUMB_EDGE = 512
+_MEDIA_THUMB_QUALITY = 80
+_MEDIA_MAX_PIXELS = 40_000_000
+_MEDIA_IMAGE_TYPES = {"png", "jpg", "jpeg", "gif", "bmp", "webp"}
+_MEDIA_QUEUE_LIMIT = 256
+_MEDIA_PENDING_STALE = 600.0
+_MEDIA_MISS_MEMO_TTL = 3600.0
+_MEDIA_MISS_MEMO_LIMIT = 4096
+
+_media_queue = deque()
+_media_queued = set()
+_media_cancelled = {}
+_media_miss_memo = {}
+_media_cond = threading.Condition()
+_media_notifier = None
+_media_worker_started = False
 
 # blob 的发布/登记与回收删除
 _HASH_LOCK_STRIPES = 64
@@ -38,8 +76,19 @@ def init(port_api : int):
         os.makedirs("res/{}/sticker".format(port_api))
     if not os.path.exists(tmp_dir(port_api)):
         os.makedirs(tmp_dir(port_api))
+    if not os.path.exists(thumb_dir(port_api)):
+        os.makedirs(thumb_dir(port_api))
     file_cursor = FileDb("res/{}/file/file.db".format(port_api), port_api)
     file_cursor.create_file_db()
+
+
+def thumb_dir(port_api : int):
+    """缩略图 dir"""
+    return "res/{}/thumb".format(port_api)
+
+
+def thumb_path(port_api : int, hashes : str):
+    return os.path.join(thumb_dir(port_api), "{}{}".format(hashes, _THUMB_EXT))
 
 
 def tmp_dir(port_api : int):
@@ -98,6 +147,8 @@ def upload_file(port_api : int, uid : int, file_b64, file_name : str, file_curso
     hashes = known_hash or sha256(content)
     file_type = detect_file_type(content, file_name)
     extension = os.path.splitext(file_name)[1].lower()
+    media_enabled = media_features_enabled(port_api) and _media_type_supported(file_type, extension)
+    media_size = _read_image_size(content) if media_enabled else None
 
     disk_path = file_path(port_api, hashes)
     oss_enabled = oss_store.is_oss_enabled(port_api)
@@ -138,6 +189,11 @@ def upload_file(port_api : int, uid : int, file_b64, file_name : str, file_curso
                     except Exception:
                         pass
                 raise
+            if media_enabled:
+                try:
+                    file_cursor.upsert_media_dimensions(hashes, *(media_size or (None, None)))
+                except Exception:
+                    pass
     finally:
         if stage_path is not None:
             oss_store.safe_remove(stage_path)
@@ -147,6 +203,9 @@ def upload_file(port_api : int, uid : int, file_b64, file_name : str, file_curso
             oss_store.safe_remove(disk_path)
     elif oss_enabled and os.path.isfile(disk_path):
         oss_store.safe_remove(disk_path)
+
+    if media_enabled:
+        enqueue_media(port_api, hashes)
 
     return hashes
 
@@ -224,6 +283,7 @@ def instant_upload_file(port_api : int, uid : int, file_hash : str, file_name : 
         present = oss_store.get_size_from_oss(port_api, "file", file_hash) > 0
     if not present or not file_cursor.file_exists(file_hash):
         return False
+    media_enabled = media_features_enabled(port_api) and _media_type_supported(mime_type, extension)
     with _hash_lock(file_hash):
         if not file_cursor.file_exists(file_hash):
             return False
@@ -232,8 +292,15 @@ def instant_upload_file(port_api : int, uid : int, file_hash : str, file_name : 
                 uid, file_hash, file_name, time.time(), size,
                 mime_type=mime_type, extension=extension,
             )
+            if media_enabled:
+                try:
+                    file_cursor.upsert_media_dimensions(file_hash, None, None)
+                except Exception:
+                    pass
         except Exception:
             return False
+    if media_enabled:
+        enqueue_media(port_api, file_hash)
     return True
 
 
@@ -249,6 +316,7 @@ def delete_user_file(port_api : int, uid : int, hashes : str, file_cursor : File
         # 存储空间回收
         if deleted:
             file_cursor.delete_blob_relations(hashes)
+            _remove_media_locked(port_api, hashes, file_cursor)
             if oss_store.is_oss_enabled(port_api):
                 oss_store.delete_from_oss(port_api, "file", hashes)
             target_path = file_path(port_api, hashes)
@@ -265,6 +333,7 @@ def clean_user_files(port_api : int, uid : int, file_cursor : FileDb):
             if file_cursor.has_uploader(hashes):
                 continue
             file_cursor.delete_blob_relations(hashes)
+            _remove_media_locked(port_api, hashes, file_cursor)
             if oss_store.is_oss_enabled(port_api):
                 oss_store.delete_from_oss(port_api, "file", hashes)
             target_path = file_path(port_api, hashes)
@@ -293,6 +362,7 @@ def collect_expired(port_api: int, sticker_cursor,  file_cursor: FileDb, file_la
             if not file_cursor.should_collect(hashes, file_last_time):
                 continue
             file_cursor.delete_blob_relations(hashes)
+            _remove_media_locked(port_api, hashes, file_cursor)
             if oss_store.is_oss_enabled(port_api):
                 oss_store.delete_from_oss(port_api, "file", hashes)
             if os.path.isfile(target_path):
@@ -305,6 +375,7 @@ def collect_expired(port_api: int, sticker_cursor,  file_cursor: FileDb, file_la
 def force_delete_file(port_api : int, hashes : str, file_cursor : FileDb):
     with _hash_lock(hashes):
         file_cursor.force_delete_file(hashes)
+        _remove_media_locked(port_api, hashes, file_cursor)
         if oss_store.is_oss_enabled(port_api):
             oss_store.delete_from_oss(port_api, "file", hashes)
         target_path = file_path(port_api, hashes)
@@ -467,6 +538,8 @@ def _finalize_chunked_upload(port_api : int, uid : int, file_name : str, file_id
         except Exception:
             file_type = detect_file_type(b"", file_name)
         extension = os.path.splitext(file_name)[1].lower()
+        media_enabled = media_features_enabled(port_api) and _media_type_supported(file_type, extension)
+        media_size = _read_image_size(combined) if media_enabled else None
 
         oss_enabled = oss_store.is_oss_enabled(port_api)
         need_blob = True
@@ -500,6 +573,11 @@ def _finalize_chunked_upload(port_api : int, uid : int, file_name : str, file_id
                     except Exception:
                         pass
                 raise
+            if media_enabled:
+                try:
+                    file_cursor.upsert_media_dimensions(file_hash, *(media_size or (None, None)))
+                except Exception:
+                    pass
 
         if os.path.isfile(combined):
             oss_store.safe_remove(combined)
@@ -507,6 +585,9 @@ def _finalize_chunked_upload(port_api : int, uid : int, file_name : str, file_id
         if oss_enabled and need_blob:
             if oss_store.upload_file_to_oss(port_api, final_path, "file", file_hash):
                 oss_store.safe_remove(final_path)
+
+        if media_enabled:
+            enqueue_media(port_api, file_hash)
 
         file_cursor.complete_chunk_task(file_id, file_hash, expected_hash is not None)
         _remove_chunk_files(port_api, file_id)
@@ -561,4 +642,333 @@ def sweep_stale_chunk_uploads(port_api : int, file_cursor : FileDb, max_age : fl
                     removed += 1
             except OSError:
                 pass
+    return removed
+
+
+# 媒体
+
+def media_features_enabled(port_api : int, cfg : dict = None) -> bool:
+    if cfg is None:
+        cfg = oss_store._read_config(port_api)
+    return bool(cfg.get("media_features", True))
+
+
+def media_cutover(port_api : int):
+    """媒体功能启用时"""
+    cfg = oss_store._read_config(port_api)
+    try:
+        return float(cfg.get("media_features_since"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _media_type_supported(file_type, extension) -> bool:
+    stored = str(file_type or "").lower().lstrip(".")
+    if stored in _MEDIA_IMAGE_TYPES:
+        return True
+    ext = str(extension or "").lower().lstrip(".")
+    return ext in _MEDIA_IMAGE_TYPES
+
+
+def _read_image_size(source):
+    """读文件头取宽高"""
+    if not _PIL_AVAILABLE:
+        return None
+    try:
+        if isinstance(source, (bytes, bytearray)):
+            image = Image.open(io.BytesIO(bytes(source)))
+        else:
+            image = Image.open(source)
+        with image:
+            return image.width, image.height
+    except Exception:
+        return None
+
+
+def enqueue_media(port_api : int, hashes : str):
+    """把 hash 放进生成队列"""
+    with _media_cond:
+        if hashes in _media_queued:
+            return
+        if len(_media_queue) >= _MEDIA_QUEUE_LIMIT:
+            return
+        _media_queue.append(hashes)
+        _media_queued.add(hashes)
+        _media_cond.notify()
+
+
+def set_media_notifier(callback):
+    """注入生成完成回调"""
+    global _media_notifier
+    _media_notifier = callback
+
+
+def start_media_worker(port_api : int, file_cursor : FileDb):
+    global _media_worker_started
+    if _media_worker_started:
+        return
+    _media_worker_started = True
+    thread = threading.Thread(target=_media_worker_loop, args=(port_api, file_cursor),
+                              name="tfv5-media", daemon=True)
+    thread.start()
+
+
+def _media_worker_loop(port_api : int, file_cursor : FileDb):
+    while True:
+        hashes = None
+        try:
+            with _media_cond:
+                while not _media_queue:
+                    _media_cond.wait(timeout=60)
+                    _purge_media_cancelled()
+                hashes = _media_queue.popleft()
+                _media_queued.discard(hashes)
+                cancelled = hashes in _media_cancelled
+            if cancelled:
+                continue
+            _process_media(port_api, hashes, file_cursor)
+        except Exception as error:
+            print("[WARN] 媒体生成失败 ({}): {}".format(hashes, error))
+
+
+def _purge_media_cancelled():
+    if len(_media_cancelled) <= 1024:
+        return
+    cutoff = time.time() - 3600
+    for key in [k for k, ts in _media_cancelled.items() if ts < cutoff]:
+        _media_cancelled.pop(key, None)
+
+
+def _media_miss(hashes : str, now : float):
+    if len(_media_miss_memo) >= _MEDIA_MISS_MEMO_LIMIT:
+        _media_miss_memo.clear()
+    _media_miss_memo[hashes] = now
+
+
+def ensure_media(port_api : int, hashes : str, file_cursor : FileDb):
+    """Trump Will FIX IT"""
+    try:
+        now = time.time()
+        memo = _media_miss_memo.get(hashes)
+        if memo is not None and now - memo < _MEDIA_MISS_MEMO_TTL:
+            return
+        if not media_features_enabled(port_api):
+            return
+        media = file_cursor.get_media(hashes)
+        if media:
+            if media["status"] == "pending" and now - float(media["updated_at"] or 0) > _MEDIA_PENDING_STALE:
+                file_cursor.touch_media(hashes)
+                enqueue_media(port_api, hashes)
+            return
+        meta = file_cursor.get_metadata(hashes)
+        if meta is None:
+            return
+        if not _media_type_supported(meta.get("file_type"), meta.get("extension")):
+            _media_miss(hashes, now)
+            return
+        first_seen = file_cursor.get_blob_first_seen(hashes)
+        cutover = media_cutover(port_api)
+        if first_seen is None or cutover is None or first_seen < cutover:
+            _media_miss(hashes, now)
+            return
+        file_cursor.upsert_media_dimensions(hashes, None, None)
+        enqueue_media(port_api, hashes)
+    except Exception:
+        pass
+
+
+def _media_source_path(port_api : int, hashes : str):
+    """返回 (可读路径, 需清理的临时路径)"""
+    local_path = file_path(port_api, hashes)
+    if os.path.isfile(local_path):
+        return local_path, None
+    if not oss_store.is_oss_enabled(port_api):
+        return None, None
+    temp_path = oss_store.temp_download_path(port_api, "file", hashes)
+    if oss_store.download_from_oss(port_api, "file", hashes, temp_path):
+        return temp_path, temp_path
+    return None, None
+
+
+def _build_media_assets(path):
+    """生成 (width, height, blurhash, thumb_bytes, thumb_w, thumb_h, thumb_is_original)
+    """
+    if not _PIL_AVAILABLE:
+        return None
+    try:
+        image = Image.open(path)
+        with image:
+            width, height = image.width, image.height
+            if width <= 0 or height <= 0:
+                return None
+            if width * height > _MEDIA_MAX_PIXELS:
+                return (width, height, None, None, None, None, False)
+            image.load()
+            blur_value = None
+            if _BLURHASH_AVAILABLE:
+                try:
+                    blur_value = _encode_blurhash(image)
+                except Exception:
+                    blur_value = None
+            if max(width, height) <= _MEDIA_THUMB_EDGE:
+                return (width, height, blur_value, None, width, height, True)
+            thumb_bytes, thumb_w, thumb_h = _encode_thumbnail(image)
+            return (width, height, blur_value, thumb_bytes, thumb_w, thumb_h, False)
+    except Exception:
+        return None
+
+
+def _encode_blurhash(image):
+    rgb = image.convert("RGB")
+    rgb.thumbnail((32, 32))
+    width, height = rgb.size
+    pixels = rgb.load()
+    rows = [[pixels[x, y] for x in range(width)] for y in range(height)]
+    return _blurhash.encode(rows, 4, 3)
+
+
+def _encode_thumbnail(image):
+    rotated = ImageOps.exif_transpose(image) or image
+    if rotated.mode in ("RGBA", "LA", "P"):
+        working = rotated.convert("RGBA")
+    else:
+        working = rotated.convert("RGB")
+    working.thumbnail((_MEDIA_THUMB_EDGE, _MEDIA_THUMB_EDGE), Image.LANCZOS)
+    buffer = io.BytesIO()
+    working.save(buffer, format="WEBP", quality=_MEDIA_THUMB_QUALITY, method=4)
+    return buffer.getvalue(), working.width, working.height
+
+
+def _publish_thumb(port_api : int, hashes : str, data : bytes):
+    """把缩略图发布到 thumb"""
+    stage_path = _stage_bytes(port_api, data)
+    final_path = thumb_path(port_api, hashes)
+    os.makedirs(thumb_dir(port_api), exist_ok=True)
+    try:
+        os.replace(stage_path, final_path)
+    except OSError:
+        if not os.path.isfile(final_path):
+            raise
+    finally:
+        oss_store.safe_remove(stage_path)
+
+
+def _remove_thumb_file(port_api : int, hashes : str):
+    with _media_cond:
+        _media_cancelled[hashes] = time.time()
+        _media_queued.discard(hashes)
+    if oss_store.is_oss_enabled(port_api):
+        oss_store.delete_from_oss(port_api, "thumb", hashes)
+    path = thumb_path(port_api, hashes)
+    if os.path.isfile(path):
+        oss_store.safe_remove(path)
+
+
+def _remove_media_locked(port_api : int, hashes : str, file_cursor : FileDb):
+    """级联删除媒体行与缩略图"""
+    try:
+        file_cursor.delete_media(hashes)
+    except Exception:
+        pass
+    _remove_thumb_file(port_api, hashes)
+
+
+def _process_media(port_api : int, hashes : str, file_cursor : FileDb):
+    if not media_features_enabled(port_api):
+        return
+    media = file_cursor.get_media(hashes)
+    if media is None or media["status"] != "pending":
+        return
+    source_path, temp_path = _media_source_path(port_api, hashes)
+    if source_path is None:
+        # blob FXXKED
+        # wait please
+        return
+    try:
+        try:
+            source_size = os.path.getsize(source_path)
+        except OSError:
+            source_size = 0
+        assets = _build_media_assets(source_path)
+    finally:
+        if temp_path:
+            oss_store.safe_remove(temp_path)
+
+    if assets is None:
+        try:
+            file_cursor.mark_media_skipped(hashes)
+        except Exception:
+            pass
+        return
+
+    width, height, blur_value, thumb_bytes, thumb_w, thumb_h, thumb_is_original = assets
+    oss_enabled = oss_store.is_oss_enabled(port_api)
+    if thumb_is_original:
+        thumb_size = int(source_size) or None
+    else:
+        thumb_size = len(thumb_bytes) if thumb_bytes else None
+
+    with _hash_lock(hashes):
+        with _media_cond:
+            cancelled = hashes in _media_cancelled
+        if cancelled or not file_cursor.file_exists(hashes):
+            _remove_thumb_file(port_api, hashes)
+            return
+        try:
+            if thumb_bytes:
+                _publish_thumb(port_api, hashes, thumb_bytes)
+            file_cursor.set_media_artifacts(
+                hashes, blur_value, thumb_w, thumb_h, thumb_size, thumb_is_original)
+        except Exception as error:
+            print("[WARN] 媒体写入失败 ({}): {}".format(hashes, error))
+            return
+
+    if thumb_bytes and oss_enabled:
+        path = thumb_path(port_api, hashes)
+        if oss_store.upload_file_to_oss(port_api, path, "thumb", hashes):
+            oss_store.safe_remove(path)
+
+    notifier = _media_notifier
+    if notifier:
+        try:
+            notifier(port_api, hashes)
+        except Exception:
+            pass
+
+
+def sweep_orphan_media(port_api : int, file_cursor : FileDb, limit : int = 200,
+                       max_age : float = 3600.0):
+    """清理 file（可怜的孤儿呢）"""
+    removed = 0
+    try:
+        orphans = file_cursor.list_orphan_media(limit)
+    except Exception:
+        orphans = []
+    for hashes in orphans:
+        with _hash_lock(hashes):
+            _remove_media_locked(port_api, hashes, file_cursor)
+        removed += 1
+
+    directory = thumb_dir(port_api)
+    now = time.time()
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return removed
+    for name in names[:1000]:
+        if not name.endswith(_THUMB_EXT):
+            continue
+        path = os.path.join(directory, name)
+        try:
+            if now - os.path.getmtime(path) <= max_age:
+                continue
+        except OSError:
+            continue
+        hashes = name[:-len(_THUMB_EXT)]
+        try:
+            if file_cursor.get_media(hashes) is None:
+                oss_store.safe_remove(path)
+                removed += 1
+        except Exception:
+            pass
     return removed

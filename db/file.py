@@ -59,6 +59,21 @@ class FileDb(Db):
                 PRIMARY KEY(file_id, chunk_index)
             )
         """)
+        self.execute("""
+            CREATE TABLE IF NOT EXISTS file_media (
+                hash TEXT PRIMARY KEY,
+                width INTEGER,
+                height INTEGER,
+                blurhash TEXT,
+                thumb_width INTEGER,
+                thumb_height INTEGER,
+                thumb_size INTEGER,
+                thumb_is_original INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+        """)
         self.execute("""INSERT OR IGNORE INTO file_uploaders(hash, uid, created_at)
                         SELECT hash, uid, COALESCE(upload_time, ?) FROM user_file WHERE active = TRUE""", (time.time(),))
 
@@ -207,6 +222,103 @@ class FileDb(Db):
                 self.cursor.execute("DELETE FROM file WHERE hash = ?", (hashes,))
                 self.conn.commit()
             return self._execute_with_retry(operation)
+
+    # 媒体元数据与缩略图
+    # independent！！！
+
+    _MEDIA_COLUMNS = ("hash, width, height, blurhash, thumb_width, thumb_height, "
+                      "thumb_size, thumb_is_original, status, created_at, updated_at")
+
+    @staticmethod
+    def _media_row(row):
+        def _int_or_none(value):
+            return int(value) if value is not None else None
+        return {
+            "hash": row[0],
+            "width": _int_or_none(row[1]),
+            "height": _int_or_none(row[2]),
+            "blurhash": row[3],
+            "thumb_width": _int_or_none(row[4]),
+            "thumb_height": _int_or_none(row[5]),
+            "thumb_size": _int_or_none(row[6]),
+            "thumb_is_original": bool(row[7]),
+            "status": row[8],
+            "created_at": row[9],
+            "updated_at": row[10],
+        }
+
+    def get_media(self, hashes : str):
+        rows = self.query(
+            "SELECT {} FROM file_media WHERE hash = ?".format(self._MEDIA_COLUMNS),
+            (hashes,))
+        return self._media_row(rows[0]) if rows else None
+
+    def get_media_many(self, hashes_list):
+        result = {}
+        unique = list(dict.fromkeys(h for h in hashes_list if h))
+        for index in range(0, len(unique), 400):
+            chunk = unique[index:index + 400]
+            placeholders = ",".join("?" * len(chunk))
+            rows = self.query(
+                "SELECT {} FROM file_media WHERE hash IN ({})".format(self._MEDIA_COLUMNS, placeholders),
+                tuple(chunk))
+            for row in rows:
+                result[row[0]] = self._media_row(row)
+        return result
+
+    def upsert_media_dimensions(self, hashes : str, width, height):
+        """上传时同步登记宽高"""
+        now = time.time()
+        self.execute(
+            """INSERT INTO file_media (hash, width, height, thumb_is_original, status, created_at, updated_at)
+               VALUES (?, ?, ?, 0, 'pending', ?, ?)
+               ON CONFLICT(hash) DO UPDATE SET
+                   width = COALESCE(file_media.width, excluded.width),
+                   height = COALESCE(file_media.height, excluded.height)""",
+            (hashes, width, height, now, now))
+
+    def touch_media(self, hashes : str):
+        self.execute("UPDATE file_media SET updated_at = ? WHERE hash = ?", (time.time(), hashes))
+
+    def set_media_artifacts(self, hashes : str, blurhash, thumb_width, thumb_height,
+                            thumb_size, thumb_is_original : bool):
+        self.execute(
+            """UPDATE file_media SET blurhash = ?, thumb_width = ?, thumb_height = ?,
+                   thumb_size = ?, thumb_is_original = ?, status = 'done', updated_at = ?
+               WHERE hash = ?""",
+            (blurhash, thumb_width, thumb_height, thumb_size,
+             1 if thumb_is_original else 0, time.time(), hashes))
+
+    def mark_media_skipped(self, hashes : str, width=None, height=None):
+        """标记为无需生成"""
+        now = time.time()
+        self.execute(
+            """INSERT INTO file_media (hash, width, height, thumb_is_original, status, created_at, updated_at)
+               VALUES (?, ?, ?, 0, 'skipped', ?, ?)
+               ON CONFLICT(hash) DO UPDATE SET
+                   status = 'skipped',
+                   width = COALESCE(file_media.width, excluded.width),
+                   height = COALESCE(file_media.height, excluded.height),
+                   updated_at = excluded.updated_at""",
+            (hashes, width, height, now, now))
+
+    def delete_media(self, hashes : str):
+        self.execute("DELETE FROM file_media WHERE hash = ?", (hashes,))
+
+    def list_orphan_media(self, limit : int = 500):
+        """返回 file 表中已不存在的 Oliver Twist（bushi"""
+        rows = self.query(
+            """SELECT hash FROM file_media
+               WHERE NOT EXISTS(SELECT 1 FROM file f WHERE f.hash = file_media.hash)
+               LIMIT ?""",
+            (int(limit),))
+        return [row[0] for row in rows]
+
+    def get_blob_first_seen(self, hashes : str):
+        rows = self.query("SELECT MIN(created_at) FROM file_uploaders WHERE hash = ?", (hashes,))
+        if not rows or rows[0][0] is None:
+            return None
+        return float(rows[0][0])
 
     # ---- 分块 pro max plus ultra ----
 
@@ -528,8 +640,14 @@ class FileDb(Db):
             return None
         params = (hashes,) if owner_uid is None else (hashes, owner_uid)
         owner_filter = "" if owner_uid is None else " AND uid = ?"
-        rows = self.query("SELECT file_name, extension, upload_time, mime_type, size FROM user_file WHERE hash = ? AND active = TRUE{} ORDER BY upload_time LIMIT 1".format(owner_filter), params)
-        row = rows[0] if rows else (hashes, "", None, "unknown", 0)
+        rows = self.query(
+            """SELECT uf.file_name, uf.extension, uf.upload_time, uf.mime_type, uf.size,
+                      fm.width, fm.height, fm.blurhash, fm.thumb_size, fm.thumb_is_original
+               FROM user_file uf LEFT JOIN file_media fm ON fm.hash = uf.hash
+               WHERE uf.hash = ? AND uf.active = TRUE{}
+               ORDER BY uf.upload_time LIMIT 1""".format(owner_filter), params)
+        row = rows[0] if rows else (hashes, "", None, "unknown", 0, None, None, None, None, None)
+        has_thumb = row[8] is not None or bool(row[9])
         stored_type = str(row[3] or "").lower().lstrip(".")
         if stored_type not in {"png", "jpg", "gif", "bmp", "svg", "tgs"}:
             stored_type = ""
@@ -545,6 +663,11 @@ class FileDb(Db):
             "extension": row[1] or "",
             "download_url": "/file/get_file/{}".format(hashes),
             "send_time": row[2],
+            "width": int(row[5]) if row[5] else None,
+            "height": int(row[6]) if row[6] else None,
+            "blurhash": row[7],
+            "has_thumb": has_thumb,
+            "thumb_url": "/file/get_thumbnail/{}".format(hashes) if has_thumb else None,
         }
 
     def get_active_user_filename(self, uid : int, hashes : str):

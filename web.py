@@ -18,13 +18,16 @@ import time
 import threading
 from config_utils import normalize_default_join_targets
 from json_store import read_json, update_json
-from datetime import datetime, timedelta
+from datetime import datetime
 from file_types import IMAGE_TYPES, detect_file_type, is_sticker_type
 import oss_store
 from sync_limits import SYNC_MAX_LIMIT, parse_sync_missing_sequences
 
 def bool_res() -> tuple:
     return (str(time.time()) + "False", str(time.time()) + "True")
+
+# 陈年老 bug 没注意到，tf.xin 上早就修了
+FILE_CACHE_MAX_AGE = 365 * 24 * 3600
 
 FILE_MIMETYPES = {
     ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
@@ -285,6 +288,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             "ice_servers" : _build_ice_servers(cfg.get("rtc", {})),
             "captcha" : bool(cfg.get("captcha", False)),
             "file_last_time" : cfg.get("file_last_time", 72),
+            "media_features" : bool(cfg.get("media_features", True)),
             "groups_limit" : cfg.get("groups_limit", 30),
             "single_group_max_people" : cfg.get("single_group_max_people", 200),
             "max_file_size" : cfg.get("max_file_size", -1),
@@ -593,6 +597,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         )
         if meta and not meta.get("size") and oss_store.is_oss_enabled(port_api):
             meta["size"] = oss_store.get_size_from_oss(port_api, "file", file_hash)
+        if meta and file_hash:
+            # 惰性自愈：新文件缺媒体元数据 / pending 卡住时重新入队
+            file.ensure_media(port_api, file_hash, file_cursor)
         return meta
 
     def with_display_file_name(metadata, display_name):
@@ -1542,6 +1549,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 if req["file_download_mode"] not in ("redirect", "proxy"):
                     return bool_res()[False]
                 updates["file_download_mode"] = req["file_download_mode"]
+
+            if "media_features" in req:
+                if not isinstance(req["media_features"], bool):
+                    return bool_res()[False]
+                updates["media_features"] = req["media_features"]
 
             if not updates:
                 return bool_res()[False]
@@ -2925,6 +2937,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 "file_type" : meta.get("file_type", "unknown"),
                 "extension" : row[7] or "",
                 "download_url" : "/file/get_file/{}".format(hashes),
+                "width" : meta.get("width"),
+                "height" : meta.get("height"),
+                "blurhash" : meta.get("blurhash"),
+                "thumb_url" : meta.get("thumb_url"),
             })
         return json.dumps(result, ensure_ascii=False)
 
@@ -3047,7 +3063,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                     download_name=download_name,
                     as_attachment=True,
                     mimetype=mime_from_name(download_name),
-                    max_age=timedelta(days=365),
+                    max_age=FILE_CACHE_MAX_AGE,
                 )
                 # 发送完成后立即删除本地临时文件（带重试，避免 WinError 32）
                 @resp.call_on_close
@@ -3062,7 +3078,54 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             download_name=download_name,
             as_attachment=True,
             mimetype=mime_from_name(download_name),
-            max_age=timedelta(days=365),
+            max_age=FILE_CACHE_MAX_AGE,
+        )
+
+    @app.route("/file/get_thumbnail/<hashes>")
+    def get_thumbnail(hashes : str):
+        """缩略图"""
+        media = file_cursor.get_media(hashes)
+        if media is None or media["status"] != "done":
+            return ("", 404)
+        if media["thumb_is_original"]:
+            # 原图不超过缩略图规格：直接复用原图
+            return get_file(hashes)
+        if not media["thumb_size"]:
+            return ("", 404)
+        download_name = "{}.thumb.webp".format(hashes)
+        if oss_store.is_oss_enabled(port_api):
+            if oss_store.get_download_mode(port_api) == "redirect":
+                url = oss_store.presigned_download_url(
+                    port_api, "thumb", hashes, download_name, content_type="image/webp")
+                if url:
+                    return redirect(url, code=307)
+            temp_path = oss_store.temp_download_path(port_api, "thumb", hashes)
+            try:
+                if not oss_store.download_from_oss(port_api, "thumb", hashes, temp_path):
+                    return ("", 404)
+                resp = send_file(
+                    temp_path,
+                    download_name=download_name,
+                    as_attachment=False,
+                    mimetype="image/webp",
+                    max_age=FILE_CACHE_MAX_AGE,
+                )
+                @resp.call_on_close
+                def _cleanup_thumb_temp():
+                    oss_store.safe_remove(temp_path)
+                return resp
+            except Exception:
+                oss_store.safe_remove(temp_path)
+                raise
+        target_path = file.thumb_path(port_api, hashes)
+        if not os.path.isfile(target_path):
+            return ("", 404)
+        return send_file(
+            target_path,
+            download_name=download_name,
+            as_attachment=False,
+            mimetype="image/webp",
+            max_age=FILE_CACHE_MAX_AGE,
         )
 
     @api('/sticker/upload', methods=['POST'])
@@ -3158,7 +3221,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                     as_attachment=True,
                     mimetype=mimetype_map.get(ext),
                     # hash 寻址内容不可变：URL 相同内容不变，一年内缓存无需校验
-                    max_age=timedelta(days=365),
+                    max_age=FILE_CACHE_MAX_AGE,
                 )
                 @resp.call_on_close
                 def _cleanup_sticker_temp():
@@ -3175,7 +3238,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             as_attachment=True,
             mimetype=mimetype_map.get(ext),
             # hash 寻址内容不可变：URL 相同内容不变，一年内缓存无需校验
-            max_age=timedelta(days=365),
+            max_age=FILE_CACHE_MAX_AGE,
         )
     
     @api("/announcement/upload_announcement", methods=['POST'])
@@ -4191,6 +4254,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                     "is_friend": False,
                     "is_pinned": pref.get("is_pinned") if pref else None,
                     "notify_level": pref.get("notify_level") if pref else None,
+                    "alias": pref.get("alias") if pref else None,
+                    "description": pref.get("description") if pref else None,
                 })
             else:
                 room_id = "U{}".format(key)
@@ -4219,6 +4284,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                     "is_friend": key in friend_uids,
                     "is_pinned": pref.get("is_pinned") if pref else None,
                     "notify_level": pref.get("notify_level") if pref else None,
+                    "alias": pref.get("alias") if pref else None,
+                    "description": pref.get("description") if pref else None,
                 })
 
         result.sort(key=lambda x: x.get("last_time") or 0, reverse=True)
@@ -4247,6 +4314,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return bool_res()[False]
         is_pinned = req.get("is_pinned") if "is_pinned" in req else None
         notify_level = req.get("notify_level") if "notify_level" in req else None
+        alias = req.get("alias") if "alias" in req else None
+        description = req.get("description") if "description" in req else None
         if is_pinned is not None and not isinstance(is_pinned, bool):
             return bool_res()[False]
         if notify_level is not None:
@@ -4254,9 +4323,30 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 notify_level = int(notify_level)
             except (TypeError, ValueError):
                 return bool_res()[False]
-        return bool_res()[messages_cursor.update_room_preference(
-            uid, room_id, is_pinned=is_pinned, notify_level=notify_level
-        )]
+        if alias is not None and (not isinstance(alias, str) or len(alias) > 100):
+            return bool_res()[False]
+        if description is not None and (not isinstance(description, str) or len(description) > 1000):
+            return bool_res()[False]
+        updated = messages_cursor.update_room_preference(
+            uid, room_id, is_pinned=is_pinned, notify_level=notify_level,
+            alias=alias, description=description
+        )
+        if updated:
+            # 单用户多端同步：偏好变更静默推给该用户所有在线端（含发起端，应用幂等）
+            try:
+                current = messages_cursor.get_room_preference(uid, room_id)
+                instant_contact.push_raw(uid, {
+                    "type": "PREFERENCES.UPDATED",
+                    "scope": "room",
+                    "room_id": room_id,
+                    "is_pinned": current["is_pinned"],
+                    "notify_level": current["notify_level"],
+                    "alias": current["alias"],
+                    "description": current["description"],
+                })
+            except Exception:
+                pass
+        return bool_res()[updated]
 
     @api("/message/recall", methods=['POST'])
     def recall_message(req):

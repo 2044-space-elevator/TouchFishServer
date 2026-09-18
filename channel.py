@@ -335,6 +335,11 @@ class InstantConnect():
                 self.loop
             )
 
+    def filter_online(self, uids) -> list:
+        """返回给定 uid 集合中当前在线的子集"""
+        with self._clients_lock:
+            return [int(uid) for uid in set(uids) if self.connected_clients.get(int(uid))]
+
     def _queue_call_ack(self, websocket, call_id, request, status):
         """针对 call.* 信令的回执（相当于 call 专用版 _queue_ack）"""
         if not call_id or websocket not in self.send_queue or self.loop is None:

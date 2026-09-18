@@ -77,13 +77,16 @@ TFV5 的消息系统由两部分组成：
     "last_file" : <file_metadata_or_null>,
     "is_friend" : <true_or_false>,
     "is_pinned" : <true_or_false>,
-    "notify_level" : <0_or_1_or_2>
+    "notify_level" : <0_or_1_or_2>,
+    "alias" : <alias>,
+    "description" : <description>
 }
 ```
 
 - `is_friend`：`room_type = "direct"` 时表示当前是否仍为好友关系。
 - `is_pinned`：当前用户是否将此聊天室置顶。
 - `notify_level`：当前用户对此聊天室的通知级别。`0` = 全部通知，`1` = 仅 @提及，`2` = 静音。首次访问或未设置时返回 `null`。
+- `alias` / `description`：当前用户对聊天室设置的备注名/描述（私有，仅自己可见）。首次访问或未设置时返回 `null`。
 - `last_deleted`：最后一条消息是否已撤回。为 `true` 时 `last_content` 为 `null`。
 - `last_file`：最后一条未撤回消息为文件消息时的文件元数据，否则为 `null`。
 
@@ -118,7 +121,7 @@ TFV5 的消息系统由两部分组成：
 
 ### 聊天室偏好设置
 
-- `^ POST /chat/preferences/update` 更新当前用户对指定聊天室的偏好（置顶、通知级别）。
+- `^ POST /chat/preferences/update` 更新当前用户对指定聊天室的偏好（置顶、通知级别、备注名、描述）。
 
 请求体：
 
@@ -126,7 +129,9 @@ TFV5 的消息系统由两部分组成：
 {
     "room_id" : <room_id>,
     "is_pinned" : <true_or_false>,
-    "notify_level" : <0_or_1_or_2>
+    "notify_level" : <0_or_1_or_2>,
+    "alias" : <alias>,
+    "description" : <description>
 }
 ```
 
@@ -134,12 +139,38 @@ TFV5 的消息系统由两部分组成：
 - `<room_id>`（必填）聊天室标识，格式为 `"U<uid>"`（私聊）或 `"G<gid>"`（群聊）。
 - `<is_pinned>`（可选，布尔类型）是否置顶该聊天室。
 - `<notify_level>`（可选，整数类型）通知级别：`0` = 全部通知，`1` = 仅 @提及，`2` = 静音。
+- `<alias>`（可选，字符串，≤100 字符）备注名，空字符串表示清除。
+- `<description>`（可选，字符串，≤1000 字符）描述，空字符串表示清除。
 
-以上字段至少传入一个，只更新传入的字段。
+以上字段至少传入一个，只更新传入的字段。偏好为**单用户私有**数据，多端共享同一份。
 
 权限约束：操作者必须与目标私聊用户为好友关系，或为目标群的成员。
 
 返回：成功返回时间戳加 `True`，否则返回时间戳加 `False`。
+
+更新成功后，服务端会向该用户的所有在线连接推送静默事件（见下文 `PREFERENCES.UPDATED`）。
+
+---
+
+### 偏好同步事件（WebSocket）
+
+当偏好更新成功后，服务端向该用户的所有在线端（含发起端）推送：
+
+```json
+{
+    "type" : "PREFERENCES.UPDATED",
+    "scope" : "room",
+    "room_id" : <room_id>,
+    "is_pinned" : <true_or_false>,
+    "notify_level" : <0_or_1_or_2>,
+    "alias" : <alias>,
+    "description" : <description>
+}
+```
+
+字段为更新后的**完整当前值**（非增量），客户端收到后应整体覆盖本地该类偏好
+
+`scope` 目前仅 `"room"`，为后续其它用户级设置同步预留。
 
 ---
 

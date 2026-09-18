@@ -46,10 +46,19 @@ class MessagesDb(Db):
                 room_id TEXT NOT NULL,
                 is_pinned INTEGER NOT NULL DEFAULT 0,
                 notify_level INTEGER NOT NULL DEFAULT 0,
+                alias TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
                 updated_at REAL NOT NULL,
                 PRIMARY KEY (uid, room_id)
             )
         """)
+        for col in ("alias", "description"):
+            try:
+                self.execute(
+                    "ALTER TABLE room_preferences ADD COLUMN {} TEXT NOT NULL DEFAULT ''".format(col)
+                )
+            except Exception:
+                pass
         self.execute("""
             CREATE TABLE IF NOT EXISTS message_mentions (
                 mid INTEGER NOT NULL,
@@ -586,11 +595,17 @@ class MessagesDb(Db):
 
     def get_room_preferences(self, uid: int) -> dict:
         rows = self.query(
-            "SELECT room_id, is_pinned, notify_level FROM room_preferences WHERE uid = ?",
+            "SELECT room_id, is_pinned, notify_level, alias, description "
+            "FROM room_preferences WHERE uid = ?",
             (uid,),
         )
         return {
-            row[0]: {"is_pinned": bool(row[1]), "notify_level": int(row[2])}
+            row[0]: {
+                "is_pinned": bool(row[1]),
+                "notify_level": int(row[2]),
+                "alias": row[3] or "",
+                "description": row[4] or "",
+            }
             for row in rows
         }
 
@@ -612,17 +627,25 @@ class MessagesDb(Db):
 
     def get_room_preference(self, uid: int, room_id: str) -> dict:
         rows = self.query(
-            "SELECT is_pinned, notify_level FROM room_preferences WHERE uid = ? AND room_id = ?",
+            "SELECT is_pinned, notify_level, alias, description "
+            "FROM room_preferences WHERE uid = ? AND room_id = ?",
             (uid, room_id),
         )
         if not rows:
-            return {"is_pinned": False, "notify_level": 0}
-        return {"is_pinned": bool(rows[0][0]), "notify_level": int(rows[0][1])}
+            return {"is_pinned": False, "notify_level": 0, "alias": "", "description": ""}
+        return {
+            "is_pinned": bool(rows[0][0]),
+            "notify_level": int(rows[0][1]),
+            "alias": rows[0][2] or "",
+            "description": rows[0][3] or "",
+        }
 
     def update_room_preference(self, uid: int, room_id: str,
-                               is_pinned=None, notify_level=None) -> bool:
+                               is_pinned=None, notify_level=None,
+                               alias=None, description=None) -> bool:
         current = self.query(
-            "SELECT is_pinned, notify_level FROM room_preferences WHERE uid = ? AND room_id = ?",
+            "SELECT is_pinned, notify_level, alias, description "
+            "FROM room_preferences WHERE uid = ? AND room_id = ?",
             (uid, room_id),
         )
         pinned = int(bool(is_pinned)) if is_pinned is not None else (
@@ -633,14 +656,22 @@ class MessagesDb(Db):
         )
         if level not in (0, 1, 2):
             return False
+        alias_value = str(alias) if alias is not None else (
+            (current[0][2] or "") if current else ""
+        )
+        description_value = str(description) if description is not None else (
+            (current[0][3] or "") if current else ""
+        )
         self.execute(
-            """INSERT INTO room_preferences(uid, room_id, is_pinned, notify_level, updated_at)
-               VALUES (?, ?, ?, ?, ?)
+            """INSERT INTO room_preferences(uid, room_id, is_pinned, notify_level, alias, description, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(uid, room_id) DO UPDATE SET
                  is_pinned = excluded.is_pinned,
                  notify_level = excluded.notify_level,
+                 alias = excluded.alias,
+                 description = excluded.description,
                  updated_at = excluded.updated_at""",
-            (uid, room_id, pinned, level, time.time()),
+            (uid, room_id, pinned, level, alias_value, description_value, time.time()),
         )
         return True
 

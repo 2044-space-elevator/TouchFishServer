@@ -72,7 +72,9 @@ def _get_bucket(port_api: int, cfg: dict = None):
 
 
 def object_key(kind: str, hashes: str) -> str:
-    """生成 OSS2 Object Key：file/<hash>.file 或 sticker/<hash>.file"""
+    """生成 OSS2 Object Key：file/<hash>.file、sticker/<hash>.file 或 thumb/<hash>.thumb.webp"""
+    if kind == "thumb":
+        return "thumb/{}.thumb.webp".format(hashes)
     if kind not in ("file", "sticker"):
         raise ValueError("invalid kind: {}".format(kind))
     return "{}/{}.file".format(kind, hashes)
