@@ -937,19 +937,51 @@ class InstantConnect():
                     sender_uid = self.clients_belonged[websocket]
                     if not can_access_room(self.user_cursor, self.group_cursor, sender_uid, room_id):
                         continue
-                    broadcast = {
-                        "type": message["type"],
-                        "room_id": room_id,
-                        "uid": sender_uid,
-                    }
+                    # 新增字段：scope（缺省 typing）、progress（仅 uploading）、ts（服务器兜底）
+                    scope = message.get("scope", "typing")
+                    if scope not in ("typing", "uploading"):
+                        continue
+                    progress = message.get("progress")
+                    if progress is not None:
+                        if not isinstance(progress, (int, float)) or not (0 <= progress <= 1):
+                            continue
+                    ts = message.get("ts")
+                    if ts is not None:
+                        if not isinstance(ts, (int, float)):
+                            ts = None
+                        else:
+                            ts = int(ts)
+                    if ts is None:
+                        ts = int(time.time() * 1000)
                     if room_id.startswith('U'):
+                        # 私聊：广播给接收方时 room_id 需为接收方视角
+                        # 不然就会 BOOM~~
+                        # 是的这个 BUG 八百年不能发现
                         target = int(room_id[1:])
+                        broadcast = {
+                            "type": message["type"],
+                            "room_id": "U{}".format(sender_uid),
+                            "uid": sender_uid,
+                            "scope": scope,
+                            "ts": ts,
+                        }
+                        if progress is not None:
+                            broadcast["progress"] = progress
                         with self._clients_lock:
                             clients = list(self.connected_clients.get(target, []))
                         for ws in clients:
                             asyncio.run_coroutine_threadsafe(
                                 self._queue_message(ws, broadcast), self.loop)
                     elif room_id.startswith('G'):
+                        broadcast = {
+                            "type": message["type"],
+                            "room_id": room_id,
+                            "uid": sender_uid,
+                            "scope": scope,
+                            "ts": ts,
+                        }
+                        if progress is not None:
+                            broadcast["progress"] = progress
                         gid = int(room_id[1:])
                         members = self.group_cursor.get_member_uids(gid)
                         for user in members:

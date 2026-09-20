@@ -453,14 +453,36 @@ TFV5 在 WebSocket 中支持发送文本和文件消息，可带引用。
 }
 ```
 
+请求可选字段：
+
+- `scope`：活动类型，`typing` 或 `uploading`（缺省 `typing`）。
+- `ts`：客户端毫秒时间戳（可选；缺省使用服务器时间）。
+- `progress`：上传进度，`0 ~ 1` 的浮点数（仅 `scope=uploading` 时有效，可选）。
+
+带新字段的请求示例：
+
+```json
+{
+    "type" : "typing.start",
+    "room_id" : "U123",
+    "scope" : "uploading",
+    "ts" : 1770000000000,
+    "progress" : 0.65
+}
+```
+
 广播：
 ```json
 {
     "type" : "typing.start",
     "room_id" : "<room_id>",
-    "uid" : <typer_uid>
+    "uid" : <typer_uid>,
+    "scope" : "<typing|uploading>",
+    "ts" : <server_unix_ms>
 }
 ```
+
+`progress` 仅当请求携带且合法时才会出现在广播负载中（`uploading` 时为 `0 ~ 1` 浮点数，否则为 `null`）。
 
 ### 心跳（PING / PONG）
 
