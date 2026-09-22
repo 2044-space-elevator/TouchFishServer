@@ -153,7 +153,7 @@ class InstantConnect():
             if not self.user_cursor.token_exists(jti):
                 return None
             sid = payload.get("sid")
-            if sid and not self.user_cursor.session_is_active(sid, uid):
+            if not sid or not self.user_cursor.session_is_active(sid, uid):
                 return None
             row = self.user_cursor.uid_query(uid)
             if not row:

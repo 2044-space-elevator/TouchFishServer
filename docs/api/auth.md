@@ -54,6 +54,8 @@
 
 成功返回与 JWT 登录相同的结构（新的 access token + 新的 refresh token，旧的 refresh token 立即失效）；refresh token 无效/过期/会话已吊销返回 `{"error": "auth_failed"}`。access token 失效后，客户端应优先调用本接口续期，而非重新用密码登录。
 
+> **关于旧版 JWT（升级前签发）**：会话模型升级后，旧 token 已不再受 session 管理。服务端会拒绝这类 token（返回 `{"error": "token_expired"}`）
+
 - `^ POST /auth/validate` 会话探活（仅 JWT）
 
 请求体：

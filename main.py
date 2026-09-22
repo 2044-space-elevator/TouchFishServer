@@ -163,7 +163,8 @@ def create_new_server():
         "max_user_storage_quota" : 73400320,
         "max_sticker_storage_quota" : 31457280,
         "legacy_auth_enabled" : True,
-        "jwt_expires_seconds" : 604800,
+        "jwt_expires_seconds" : 3600,
+        "jwt_refresh_expires_seconds" : 604800,
         "jwt_max_per_user" : 5
     }
     write_json("res/{}/config.json".format(PORT_API), cfg)

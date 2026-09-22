@@ -87,8 +87,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                     # token 登记已被移除（设备被用靴子踢屁股了）
                     return False, {"error": "token_expired"}
                 sid = payload.get("sid")
-                if sid and not user_cursor.session_is_active(sid, uid):
-                    # session 已被吊销
+                if not sid or not user_cursor.session_is_active(sid, uid):
+                    # 旧版 token（无 sid）或 session 已被吊销（登出/踢出/改密）
                     return False, {"error": "token_expired"}
                 row = user_cursor.uid_query(uid)
                 if not row:
@@ -337,7 +337,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             "max_sticker_size" : cfg.get("max_sticker_size", 1048576),
             "email_activate" : bool(cfg.get("email_activate")),
             "legacy_auth_enabled" : bool(cfg.get("legacy_auth_enabled", True)),
-            "jwt_expires_seconds" : int(cfg.get("jwt_expires_seconds", 604800)),
+            "jwt_expires_seconds" : int(cfg.get("jwt_expires_seconds", 3600)),
+            "jwt_refresh_expires_seconds" : int(cfg.get("jwt_refresh_expires_seconds", 604800)),
             "jwt_max_per_user" : int(cfg.get("jwt_max_per_user", 5)),
             "default_asset_urls" : {
                 "logo" : "/avatar/get_logo",
@@ -1728,6 +1729,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
             if "jwt_expires_seconds" in req:
                 updates["jwt_expires_seconds"] = parse_int_setting(req["jwt_expires_seconds"], minimum=60)
+
+            if "jwt_refresh_expires_seconds" in req:
+                updates["jwt_refresh_expires_seconds"] = parse_int_setting(req["jwt_refresh_expires_seconds"], minimum=60)
 
             if "jwt_max_per_user" in req:
                 updates["jwt_max_per_user"] = parse_int_setting(req["jwt_max_per_user"], minimum=0, allow_unlimited=True)
