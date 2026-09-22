@@ -76,6 +76,7 @@ class InstantConnect():
         self.connected_clients[-1] = []
         self.clients_belonged = dict()
         self.clients_token = dict()
+        self.clients_session = dict()
         self.send_queue = dict()
         self.user_cursor = user_cursor
         self.group_cursor = group_cursor
@@ -138,7 +139,7 @@ class InstantConnect():
     def _verify_ws_token(self, token: str):
         """
         校验词元（bushi）
-        返回 (uid, jti) 或 None。
+        返回 (uid, jti, sid) 或 None。
         """
         def _check():
             payload = jwt_tool.verify_token(self.jwt_secret, token)
@@ -151,12 +152,15 @@ class InstantConnect():
             jti = payload.get("jti")
             if not self.user_cursor.token_exists(jti):
                 return None
+            sid = payload.get("sid")
+            if sid and not self.user_cursor.session_is_active(sid, uid):
+                return None
             row = self.user_cursor.uid_query(uid)
             if not row:
                 return None
             if self.user_cursor.get_auth_version(uid) != int(payload.get("av", -1)):
                 return None
-            return (uid, jti)
+            return (uid, jti, sid)
         return to_thread(_check)
 
     def _check_ws_rate(self, uid: int, max_per_second: int = 10, bucket: str = "msg") -> bool:
@@ -215,6 +219,7 @@ class InstantConnect():
         with self._clients_lock:
             uid = self.clients_belonged.pop(websocket, -1)
             self.clients_token.pop(websocket, None)
+            self.clients_session.pop(websocket, None)
             if uid in self.connected_clients and websocket in self.connected_clients[uid]:
                 self.connected_clients[uid].remove(websocket)
                 if uid != -1 and not self.connected_clients[uid]:
@@ -487,6 +492,36 @@ class InstantConnect():
             return
 
         asyncio.run_coroutine_threadsafe(self._disconnect_jti(jti), self.loop)
+
+    async def _disconnect_session(self, session_id : str):
+        with self._clients_lock:
+            clients = [
+                websocket
+                for websocket, sid in self.clients_session.items()
+                if sid == session_id
+            ]
+        for websocket in clients:
+            try:
+                await websocket.close()
+            except Exception:
+                pass
+            finally:
+                self._cleanup_client(websocket)
+
+    def disconnect_session(self, session_id : str):
+        """按 session_id 断开该会话的所有 WebSocket 连接。"""
+        if self.loop is None:
+            with self._clients_lock:
+                clients = [
+                    websocket
+                    for websocket, sid in self.clients_session.items()
+                    if sid == session_id
+                ]
+            for websocket in clients:
+                self._cleanup_client(websocket)
+            return
+
+        asyncio.run_coroutine_threadsafe(self._disconnect_session(session_id), self.loop)
     
     async def sender(self, websocket, queue):
         try:
@@ -523,10 +558,11 @@ class InstantConnect():
                 raise ValueError("{} 而非 AUTH.LOGIN".format(message.get('type')))
             token = message.get("token")
             verified_jti = None
+            verified_sid = None
             if token:
                 verified = await self._verify_ws_token(token)
                 if verified is not None:
-                    verified_uid, verified_jti = verified
+                    verified_uid, verified_jti, verified_sid = verified
                 else:
                     verified_uid = None
             else:
@@ -548,6 +584,7 @@ class InstantConnect():
                 self.connected_clients[verified_uid].append(websocket)
                 self.clients_belonged[websocket] = verified_uid
                 self.clients_token[websocket] = verified_jti
+                self.clients_session[websocket] = verified_sid
             self.send_queue[websocket] = asyncio.Queue()
             await websocket.send(self.encrypt_response({"type" : "AUTH.LOGIN_SUCCEEDED"}, websocket))
 

@@ -24,7 +24,35 @@
 }
 ```
 
-成功返回 `{"token": "<jwt>", "expires_in": 604800, "expires_at": <ts>}`；凭据错误返回 `{"error": "auth_failed"}`；达到单用户最大 token 数返回 `{"error": "token_limit_reached"}`。详见[主文档](main.md)的 JWT 认证章节。
+成功返回：
+
+```
+{
+    "token": "<access_jwt>",
+    "refresh_token": "<refresh_token>",
+    "expires_in": <access_seconds>,
+    "refresh_expires_in": <refresh_seconds>,
+    "expires_at": <ts>
+}
+```
+
+- `token` 为短期 access token（默认 3600 秒），用于业务请求。
+- `refresh_token` 为长期刷新凭证（默认 604800 秒），仅用于 `/auth/refresh` 轮换。
+- `expires_in` / `refresh_expires_in` 可分别通过配置 `jwt_expires_seconds` / `jwt_refresh_expires_seconds` 调整。
+
+凭据错误返回 `{"error": "auth_failed"}`；达到单用户最大会话数返回 `{"error": "token_limit_reached"}`。详见[主文档](main.md)的 JWT 认证章节。
+
+- `^ POST /auth/refresh` 用 refresh token 轮换会话（无需 access token / 旧版凭据）
+
+请求体：
+
+```
+{
+    "refresh_token": "<refresh_token>"
+}
+```
+
+成功返回与 JWT 登录相同的结构（新的 access token + 新的 refresh token，旧的 refresh token 立即失效）；refresh token 无效/过期/会话已吊销返回 `{"error": "auth_failed"}`。access token 失效后，客户端应优先调用本接口续期，而非重新用密码登录。
 
 - `^ POST /auth/validate` 会话探活（仅 JWT）
 
@@ -38,27 +66,37 @@
 
 返回：token 有效时返回 `{"valid": true, "uid": <uid>, "stat": <stat>}`；无认证信息返回 `{"error": "not_authenticated"}`；token 无效/过期/被吊销返回 `{"error": "token_expired"}`。
 
-- `^ POST /auth/tokens/list` 列出当前用户的活跃 token（设备）列表（JWT 或旧版认证皆可）
+- `^ POST /auth/sessions/list` 列出当前用户的活跃会话（设备）列表（session 粒度）
 
 请求体：空（携带 `token`，或旧版 `uid` + `password`）。
 
-返回：`{"tokens": [{"jti": ..., "issued_at": <ts>, "expires_at": <ts>, "ip": ..., "ua": ..., "is_current": <bool>}], "max_per_user": <n>}`；`is_current` 标记当前请求所使用的 token。
+返回：`{"sessions": [{"session_id": ..., "created_at": <ts>, "last_seen_at": <ts>, "expires_at": <ts>, "ip": ..., "ua": ..., "is_current": <bool>}], "max_per_user": <n>}`；`is_current` 标记当前请求所属会话。
 
-管理员可在请求体携带 `"target_uid": <uid>` 列出指定用户的设备（权限与 `/auth/manage/*` 一致：admin 可查看 user/banned，root 可查看全部）；无权限返回 `{"error": "forbidden"}`。
+管理员可在请求体携带 `"target_uid": <uid>` 列出指定用户的会话（权限与 `/auth/manage/*` 一致：admin 可查看 user/banned，root 可查看全部）；无权限返回 `{"error": "forbidden"}`。
 
-- `^ POST /auth/tokens/revoke` 移除指定 token（踢出设备）
+- `^ POST /auth/sessions/revoke` 按 `session_id` 吊销指定会话（踢出设备）
 
 请求体：
 
 ```
 {
-    "jti": "<jti>"
+    "session_id": "<session_id>"
 }
 ```
 
-返回：成功 `{"success": true}`；jti 无效 `{"error": "invalid_request"}`；试图移除当前请求所用 token 返回 `{"error": "current_token"}`。被移除的 token 立即失效，其 WebSocket 连接会被主动断开。
+返回：成功 `{"success": true}`；会话无效 `{"error": "invalid_request"}`；试图吊销当前会话返回 `{"error": "current_session"}`。被吊销会话立即失效，其 WebSocket 连接会被主动断开。
 
-管理员可在请求体携带 `"target_uid": <uid>` 移除指定用户的设备（权限同上，不受 `current_token` 限制）。
+管理员可在请求体携带 `"target_uid": <uid>` 吊销指定用户的会话（权限同上，不受 `current_session` 限制）。
+
+- `^ POST /auth/sessions/revoke_all` 吊销其他会话
+
+普通用户：吊销除当前会话外的全部会话；管理员携带 `"target_uid": <uid>` 时吊销该用户全部会话。返回 `{"success": true}`。
+
+- `^ POST /auth/tokens/list` **[deprecated]** 兼容旧客户端，语义等价于 `/auth/sessions/list`（返回同时含 `tokens` 与 `sessions` 两个字段，条目内 `jti` 即 `session_id`）。
+
+- `^ POST /auth/tokens/revoke` **[deprecated]** 兼容旧客户端，语义等价于 `/auth/sessions/revoke`（`jti` 字段即 `session_id`）。
+
+> 自会话模型引入后，`jti` 不再作为独立设备标识；一切设备管理以 `session_id` 为粒度。旧字段仅作为兼容别名保留。
 
 - `^ POST /auth/logout` 登出：吊销当前请求所使用的 token
 
@@ -502,3 +540,58 @@
 如果服务器不启用邮箱激活，`<email>` 是可以省略的。
 
 注册成功返回时间戳加 True，否则返回时间戳加 False。需注意如果要邮箱验证，用户初始状态为 `banned`。
+
+## 第三方签发（OIDC 基础）
+
+当前服务端**默认仅自签 HS256 access/refresh token**，准备支持第三方验证服务，接入时修改 `res/<port_api>/config.json` 增加 `jwt_external_issuers` 配置即可。
+
+### 配置方式
+
+在 `config.json` 中新增 `jwt_external_issuers` 数组，每个元素描述一个可信的外部签发方：
+
+```json
+{
+  "jwt_external_issuers": [
+    {
+      "iss": "https://idp.example.com",
+      "algorithms": ["RS256"],
+      "audience": "touchfish",
+      "public_key_pem": "res/<port_api>/secret/idp_public.pem"
+    }
+  ]
+}
+```
+
+字段说明：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `iss` | 是 | 外部签发方的 `issuer`，token 的 `iss` 必须与之匹配 |
+| `algorithms` | 否 | 允许的签名算法，默认 `["RS256"]`（支持 RS256/ES256 等非对称算法） |
+| `audience` | 否 | 期望的 `aud`；不填则不校验 audience |
+| `public_key_pem` | 是 | 签发方的公钥（RSA/EC PEM 字符串，或指向 PEM 文件的路径） |
+
+`public_key_pem` 既可以直接内联 PEM 文本，也可以填文件路径（如 `res/<port_api>/secret/idp_public.pem`）。
+
+### 外部 token
+
+由外部服务签发的 token 验签通过后才会被接受：
+
+- `sub`：本地用户 `uid`（整数，或可 `int()` 转换的字符串）
+- `av`：本地用户的 `auth_version`（改密/封禁后递增，外部 token 若 `av` 不匹配同样会被拒绝）
+- `iss`：必须命中 `jwt_external_issuers` 中的某个 `iss`
+
+外部 token **不查询**本地 `tokens` / `auth_sessions`。
+
+### 校验流程
+
+`resolve_auth` 的 token 校验顺序：
+
+1. 先用本地 HS256 密钥验签（自签 token 路径，含 `jti` 登记 + `sid` 会话校验）；
+2. 本地验签失败时，若配置了 `jwt_external_issuers`，则逐一尝试外部签发方验签；
+3. 都失败返回 `token_expired`。
+
+### 不支持
+
+- 不拉取远程 JWKS（`jwks_uri` 尚未实现，需静态提供公钥 PEM）。
+- `sub` 账号自动创建未实现（外部 `sub` 必须是已存在的本地 `uid`）。

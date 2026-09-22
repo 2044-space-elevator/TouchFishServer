@@ -5,6 +5,7 @@ import register_tool
 import base64
 import binascii
 import os
+import secrets
 from db import *
 import avatar
 import file
@@ -74,26 +75,51 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         """
         token = content.get("token")
         if token:
+            # 本地自签 HS256 token
             payload = jwt_tool.verify_token(jwt_secret, token)
-            if payload is None:
-                return False, {"error": "token_expired"}
-            try:
-                uid = int(payload.get("sub"))
-            except (TypeError, ValueError):
-                return False, {"error": "token_expired"}
-            jti = payload.get("jti")
-            if not user_cursor.token_exists(jti):
-                # token 登记已被移除（设备被用靴子踢屁股了）
-                return False, {"error": "token_expired"}
-            row = user_cursor.uid_query(uid)
-            if not row:
-                return False, {"error": "token_expired"}
-            auth_version = user_cursor.get_auth_version(uid)
-            if int(payload.get("av", -1)) != auth_version:
-                return False, {"error": "token_expired"}
-            identity = {"uid": uid, "stat": row[0][4], "auth_version": auth_version, "jti": jti}
-            flask_g.auth_identity = identity
-            return True, (identity, False)
+            if payload is not None:
+                try:
+                    uid = int(payload.get("sub"))
+                except (TypeError, ValueError):
+                    return False, {"error": "token_expired"}
+                jti = payload.get("jti")
+                if not user_cursor.token_exists(jti):
+                    # token 登记已被移除（设备被用靴子踢屁股了）
+                    return False, {"error": "token_expired"}
+                sid = payload.get("sid")
+                if sid and not user_cursor.session_is_active(sid, uid):
+                    # session 已被吊销
+                    return False, {"error": "token_expired"}
+                row = user_cursor.uid_query(uid)
+                if not row:
+                    return False, {"error": "token_expired"}
+                auth_version = user_cursor.get_auth_version(uid)
+                if int(payload.get("av", -1)) != auth_version:
+                    return False, {"error": "token_expired"}
+                identity = {"uid": uid, "stat": row[0][4], "auth_version": auth_version, "jti": jti, "sid": sid, "external": False}
+                flask_g.auth_identity = identity
+                return True, (identity, False)
+
+            # 外部签发 token
+            external_issuers = read_config().get("jwt_external_issuers")
+            if external_issuers:
+                payload = jwt_tool.verify_external_token(token, external_issuers)
+                if payload is not None:
+                    try:
+                        uid = int(payload.get("sub"))
+                    except (TypeError, ValueError):
+                        return False, {"error": "token_expired"}
+                    row = user_cursor.uid_query(uid)
+                    if not row:
+                        return False, {"error": "token_expired"}
+                    auth_version = user_cursor.get_auth_version(uid)
+                    if int(payload.get("av", -1)) != auth_version:
+                        return False, {"error": "token_expired"}
+                    identity = {"uid": uid, "stat": row[0][4], "auth_version": auth_version, "jti": payload.get("jti"), "sid": payload.get("sid"), "external": True}
+                    flask_g.auth_identity = identity
+                    return True, (identity, False)
+
+            return False, {"error": "token_expired"}
 
         uid = content.get("uid")
         pwd = content.get("password")
@@ -795,130 +821,291 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         except Exception:
             return bool_res()[False]
 
+    @api("/auth/refresh", methods=["POST"])
+    def refresh(req):
+        """
+        用 refresh token 轮换会话
+        """
+        try:
+            refresh_token = req.get("refresh_token")
+            if not isinstance(refresh_token, str) or not refresh_token:
+                return {"error": "invalid_request"}
+            return refresh_with_jwt(refresh_token)
+        except Exception:
+            return {"error": "auth_failed"}
+
     def login_with_jwt(uid, pwd):
         """
-        JWT 登录：校验凭据后签发 JWT 并登记 registry.tfpmjs.c0m
-        超限（jwt_max_per_user）时吊销最老的 token
+        JWT 登录：校验凭据后签发 access token 并建立可刷新 Session。
+        超限（jwt_max_per_user）时吊销最老的会话。
         """
         if not verify_user(uid, pwd):
             return {"error": "auth_failed"}
         cfg = read_config()
-        max_tokens = int(cfg.get("jwt_max_per_user", 5))
-        expires = int(cfg.get("jwt_expires_seconds", 604800))
+        max_sessions = int(cfg.get("jwt_max_per_user", 5))
+        access_expires = int(cfg.get("jwt_expires_seconds", 3600))
+        refresh_expires = int(cfg.get("jwt_refresh_expires_seconds", 604800))
         auth_version = user_cursor.get_auth_version(uid)
         user_cursor.prune_expired_tokens()
-        revoked_oldest = False
-        if max_tokens > 0 and user_cursor.count_active_tokens(uid) >= max_tokens:
-            # 达到限制，吊销最老的 token
-            oldest_jti = user_cursor.get_oldest_token(uid)
-            if oldest_jti:
-                user_cursor.delete_token(oldest_jti, uid)
-                flask_current_app.after_response_funcs.setdefault(None, []).append(
-                    lambda: instant_contact.disconnect_jti(oldest_jti)
-                )
-                flask_current_app.after_response_funcs.setdefault(None, []).append(
-                    lambda: notify_user(uid, "token_revoked", "会话已被替换", "由于达到登录设备数量上限，您最早的登录会话已被自动吊销。")
-                )
-                revoked_oldest = True
-            else:
-                return {"error": "token_limit_reached"}
         client_ip = flask_request.remote_addr or ""
         user_agent = flask_request.user_agent.string or ""
         if len(user_agent) > 256:
             user_agent = user_agent[:256]
-        token, payload = jwt_tool.issue_token(jwt_secret, uid, auth_version, expires, port_api)
-        if not user_cursor.issue_token(payload["jti"], uid, payload["iat"], payload["exp"], ip=client_ip, ua=user_agent):
+
+        # 达到会话上限时吊销最老的 session
+        revoked_oldest = False
+        if max_sessions > 0 and user_cursor.count_active_sessions(uid) >= max_sessions:
+            oldest_sid = user_cursor.get_oldest_session(uid)
+            if oldest_sid:
+                user_cursor.revoke_session(oldest_sid, uid)
+                flask_current_app.after_response_funcs.setdefault(None, []).append(
+                    lambda: instant_contact.disconnect_session(oldest_sid)
+                )
+                flask_current_app.after_response_funcs.setdefault(None, []).append(
+                    lambda: notify_user(uid, "session_replaced", "会话已被替换", "由于达到登录设备数量上限，您最早的登录会话已被自动吊销。")
+                )
+                revoked_oldest = True
+            else:
+                return {"error": "token_limit_reached"}
+
+        # 签发 refresh token 并建立 session
+        refresh_token = secrets.token_hex(32)
+        now = time.time()
+        session_expires = now + refresh_expires
+        session_id = user_cursor.create_session(
+            uid, refresh_token, now, session_expires, ip=client_ip, ua=user_agent
+        )
+        if not session_id:
             return {"error": "auth_failed"}
-        result = {"token": token, "expires_in": int(expires), "expires_at": payload["exp"]}
+
+        token, payload = jwt_tool.issue_token(
+            jwt_secret, uid, auth_version, access_expires, port_api, session_id=session_id
+        )
+        if not user_cursor.issue_token(payload["jti"], uid, payload["iat"], payload["exp"], ip=client_ip, ua=user_agent):
+            user_cursor.revoke_session(session_id, uid)
+            return {"error": "auth_failed"}
+
+        result = {
+            "token": token,
+            "refresh_token": refresh_token,
+            "expires_in": int(access_expires),
+            "refresh_expires_in": int(refresh_expires),
+            "expires_at": payload["exp"],
+        }
         if revoked_oldest:
             result["revoked_oldest"] = True
         return result
 
-    @api("/auth/tokens/list", methods=["POST"])
-    def list_auth_tokens(req):
+    def refresh_with_jwt(refresh_token):
         """
-        列出活跃 token
+        refresh token 轮换
+        """
+        cfg = read_config()
+        access_expires = int(cfg.get("jwt_expires_seconds", 3600))
+        refresh_expires = int(cfg.get("jwt_refresh_expires_seconds", 604800))
+        now = time.time()
+
+        row = user_cursor.get_session_by_refresh(refresh_token)
+        if not row:
+            return {"error": "auth_failed"}
+        session_id, uid, _created, _last_seen, expires_at, _version, revoked_at, _ip, _ua = row
+        if revoked_at is not None or expires_at <= now:
+            return {"error": "auth_failed"}
+        auth_version = user_cursor.get_auth_version(uid)
+
+        new_refresh_token = secrets.token_hex(32)
+        new_expires = now + refresh_expires
+        if not user_cursor.rotate_session(session_id, refresh_token, new_refresh_token, now, new_expires):
+            return {"error": "auth_failed"}
+
+        token, payload = jwt_tool.issue_token(
+            jwt_secret, uid, auth_version, access_expires, port_api, session_id=session_id
+        )
+        if not user_cursor.issue_token(payload["jti"], uid, payload["iat"], payload["exp"]):
+            return {"error": "auth_failed"}
+
+        return {
+            "token": token,
+            "refresh_token": new_refresh_token,
+            "expires_in": int(access_expires),
+            "refresh_expires_in": int(refresh_expires),
+            "expires_at": payload["exp"],
+        }
+
+    def _resolve_session_target(req, identity):
+        """
+        解析会话管理请求的目标用户与当前会话 id。
+        返回 (uid, current_sid) 或 (None, None)（错误时由调用方判断）。
+        """
+        uid = identity["uid"]
+        current_sid = identity.get("sid")
+        target_uid = req.get("target_uid")
+        if target_uid is not None:
+            if not isinstance(target_uid, int):
+                return None, None
+            operator = verify_manager(uid, identity.get("password"))
+            if operator is None:
+                return None, None
+            if resolve_managed_target(operator[4], target_uid) is None:
+                return None, None
+            uid = target_uid
+            current_sid = None
+        return uid, current_sid
+
+    @api("/auth/sessions/list", methods=["POST"])
+    def list_auth_sessions(req):
+        """
+        列出当前用户的活跃会话（session 粒度）。
         """
         identity = flask_g.get("auth_identity")
         if identity is None:
             return {"error": "not_authenticated"}
-        uid = identity["uid"]
-        current_jti = identity.get("jti")
-        target_uid = req.get("target_uid")
-        if target_uid is not None:
-            if not isinstance(target_uid, int):
-                return {"error": "invalid_request"}
-            operator = verify_manager(uid, identity.get("password"))
-            if operator is None:
-                return {"error": "forbidden"}
-            if resolve_managed_target(operator[4], target_uid) is None:
-                return {"error": "forbidden"}
-            uid = target_uid
-            current_jti = None
-        now = time.time()
-        tokens = []
-        for jti, issued_at, expires_at, ip, ua in user_cursor.list_tokens(uid):
-            if expires_at <= now:
-                continue
-            tokens.append({
-                "jti": jti,
-                "issued_at": int(issued_at),
+        uid, current_sid = _resolve_session_target(req, identity)
+        if uid is None:
+            return {"error": "forbidden"}
+        sessions = []
+        for session_id, created_at, last_seen_at, expires_at, _version, ip, ua in user_cursor.list_sessions(uid):
+            sessions.append({
+                "session_id": session_id,
+                "created_at": int(created_at),
+                "last_seen_at": int(last_seen_at),
                 "expires_at": int(expires_at),
                 "ip": ip or "",
                 "ua": ua or "",
-                "is_current": jti == current_jti,
+                "is_current": session_id == current_sid,
+            })
+        return {
+            "sessions": sessions,
+            "max_per_user": int(read_config().get("jwt_max_per_user", 5)),
+        }
+
+    @api("/auth/sessions/revoke", methods=["POST"])
+    def revoke_auth_session(req):
+        """
+        按 session_id 吊销指定会话（踢出设备）。
+        """
+        identity = flask_g.get("auth_identity")
+        if identity is None:
+            return {"error": "not_authenticated"}
+        uid, current_sid = _resolve_session_target(req, identity)
+        if uid is None:
+            return {"error": "forbidden"}
+        session_id = req.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            return {"error": "invalid_request"}
+        if session_id == current_sid:
+            return {"error": "current_session"}
+        if not user_cursor.session_is_active(session_id, uid):
+            return {"error": "not_found"}
+        user_cursor.revoke_session(session_id, uid)
+        run_side_effect(
+            "disconnect_session_owner",
+            lambda: instant_contact.disconnect_session(session_id)
+        )
+        return {"success": True}
+
+    @api("/auth/sessions/revoke_all", methods=["POST"])
+    def revoke_all_other_sessions(req):
+        """
+        吊销除当前会话外的全部会话（管理员可吊销目标用户全部会话）。
+        """
+        identity = flask_g.get("auth_identity")
+        if identity is None:
+            return {"error": "not_authenticated"}
+        uid, current_sid = _resolve_session_target(req, identity)
+        if uid is None:
+            return {"error": "forbidden"}
+        target_uid = req.get("target_uid")
+        if target_uid is not None:
+            # 管理员操作目标用户：吊销其全部会话
+            user_cursor.revoke_sessions(uid)
+            run_side_effect(
+                "disconnect_user_owner",
+                lambda: instant_contact.disconnect_user(uid)
+            )
+            return {"success": True}
+        # 普通用户：吊销除当前会话外的全部会话
+        for session_id, *_rest in user_cursor.list_sessions(uid):
+            if session_id == current_sid:
+                continue
+            user_cursor.revoke_session(session_id, uid)
+            run_side_effect(
+                "disconnect_session_owner",
+                lambda sid=session_id: instant_contact.disconnect_session(sid)
+            )
+        return {"success": True}
+
+    # d e p r e c a t e d ! ! pls !
+    @api("/auth/tokens/list", methods=["POST"])
+    def list_auth_tokens(req):
+        """
+        [deprecated] 列出活跃会话，兼容旧字段名（tokens 视图，会话粒度）。
+        新客户端请使用 /auth/sessions/list。
+        """
+        identity = flask_g.get("auth_identity")
+        if identity is None:
+            return {"error": "not_authenticated"}
+        uid, current_sid = _resolve_session_target(req, identity)
+        if uid is None:
+            return {"error": "forbidden"}
+        tokens = []
+        for session_id, created_at, last_seen_at, expires_at, _version, ip, ua in user_cursor.list_sessions(uid):
+            tokens.append({
+                "jti": session_id,
+                "session_id": session_id,
+                "issued_at": int(created_at),
+                "last_seen_at": int(last_seen_at),
+                "expires_at": int(expires_at),
+                "ip": ip or "",
+                "ua": ua or "",
+                "is_current": session_id == current_sid,
             })
         return {
             "tokens": tokens,
+            "sessions": tokens,
             "max_per_user": int(read_config().get("jwt_max_per_user", 5)),
         }
 
     @api("/auth/tokens/revoke", methods=["POST"])
     def revoke_auth_token(req):
         """
-        移除指定 jti 的 token(/kick @e)
+        [deprecated] 按 session_id 吊销会话（兼容旧 jti 字段）。
+        新客户端请使用 /auth/sessions/revoke。
         """
         identity = flask_g.get("auth_identity")
         if identity is None:
             return {"error": "not_authenticated"}
-        uid = identity["uid"]
-        jti = req.get("jti")
-        if not isinstance(jti, str) or not jti:
+        uid, current_sid = _resolve_session_target(req, identity)
+        if uid is None:
+            return {"error": "forbidden"}
+        session_id = req.get("session_id") or req.get("jti")
+        if not isinstance(session_id, str) or not session_id:
             return {"error": "invalid_request"}
-        target_uid = req.get("target_uid")
-        if target_uid is not None:
-            if not isinstance(target_uid, int):
-                return {"error": "invalid_request"}
-            operator = verify_manager(uid, identity.get("password"))
-            if operator is None:
-                return {"error": "forbidden"}
-            if resolve_managed_target(operator[4], target_uid) is None:
-                return {"error": "forbidden"}
-            uid = target_uid
-        elif jti == identity.get("jti"):
-            return {"error": "current_token"}
-        if not user_cursor.delete_token(jti, uid):
+        if session_id == current_sid:
+            return {"error": "current_session"}
+        if not user_cursor.session_is_active(session_id, uid):
             return {"error": "not_found"}
+        user_cursor.revoke_session(session_id, uid)
         run_side_effect(
-            "disconnect_token_owner",
-            lambda: instant_contact.disconnect_jti(jti)
+            "disconnect_session_owner",
+            lambda: instant_contact.disconnect_session(session_id)
         )
         return {"success": True}
 
     @api("/auth/logout", methods=["POST"])
     def logout_current_token(req):
         """
-        登出：吊销当前请求所使用的 token（若有），并断开该设备的 WebSocket。
+        登出：吊销当前请求所使用的会话（若有），并断开该设备的 WebSocket。
         """
         identity = flask_g.get("auth_identity")
         if identity is None:
             return {"success": True}
-        jti = identity.get("jti")
-        if jti:
-            user_cursor.delete_token(jti, identity["uid"])
+        sid = identity.get("sid")
+        if sid:
+            user_cursor.revoke_session(sid, identity["uid"])
             run_side_effect(
-                "disconnect_token_owner",
-                lambda: instant_contact.disconnect_jti(jti)
+                "disconnect_session_owner",
+                lambda: instant_contact.disconnect_session(sid)
             )
         return {"success": True}
 

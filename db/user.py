@@ -2,6 +2,8 @@ from __future__ import annotations
 from db.tool import Db
 from crypto import sha256, pwd_verify
 import re
+import secrets
+import hashlib
 import json
 import time
 
@@ -261,6 +263,138 @@ class UserDb(Db):
         except Exception:
             pass
 
+        self._create_session_table()
+
+    def _create_session_table(self):
+        self.execute("""
+    CREATE TABLE IF NOT EXISTS auth_sessions (
+        session_id TEXT PRIMARY KEY,
+        uid INTEGER NOT NULL,
+        created_at REAL NOT NULL,
+        last_seen_at REAL NOT NULL,
+        expires_at REAL NOT NULL,
+        refresh_hash TEXT NOT NULL UNIQUE,
+        session_version INTEGER NOT NULL DEFAULT 0,
+        revoked_at REAL,
+        ip TEXT,
+        ua TEXT
+    )
+    """)
+        try:
+            self.execute("CREATE INDEX IF NOT EXISTS idx_auth_sessions_uid ON auth_sessions(uid)")
+        except Exception:
+            pass
+
+    @staticmethod
+    def hash_refresh_token(refresh_token):
+        return hashlib.sha256(refresh_token.encode("utf-8")).hexdigest()
+
+    def create_session(self, uid, refresh_token, created_at, expires_at, ip=None, ua=None):
+        session_id = secrets.token_hex(16)
+        try:
+            self.execute(
+                "INSERT INTO auth_sessions (session_id, uid, created_at, last_seen_at, expires_at, refresh_hash, ip, ua) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (session_id, uid, created_at, created_at, expires_at, self.hash_refresh_token(refresh_token), ip, ua),
+            )
+            return session_id
+        except Exception as e:
+            print(e)
+            return None
+
+    def get_session_by_refresh(self, refresh_token):
+        refresh_hash = self.hash_refresh_token(refresh_token)
+        rows = self.query(
+            "SELECT session_id, uid, created_at, last_seen_at, expires_at, session_version, revoked_at, ip, ua FROM auth_sessions WHERE refresh_hash = ?",
+            (refresh_hash,),
+        )
+        return rows[0] if rows else None
+
+    def session_is_active(self, session_id, uid=None, now=None):
+        now = time.time() if now is None else now
+        query = "SELECT 1 FROM auth_sessions WHERE session_id = ? AND revoked_at IS NULL AND expires_at > ?"
+        params = [session_id, now]
+        if uid is not None:
+            query += " AND uid = ?"
+            params.append(uid)
+        return bool(self.query(query, tuple(params)))
+
+    def rotate_session(self, session_id, old_refresh_token, new_refresh_token, now, expires_at):
+        old_hash = self.hash_refresh_token(old_refresh_token)
+        new_hash = self.hash_refresh_token(new_refresh_token)
+        try:
+            self.execute(
+                "UPDATE auth_sessions SET refresh_hash = ?, last_seen_at = ?, expires_at = ?, session_version = session_version + 1 WHERE session_id = ? AND refresh_hash = ? AND revoked_at IS NULL AND expires_at > ?",
+                (new_hash, now, expires_at, session_id, old_hash, now),
+            )
+            return self.cursor.rowcount == 1
+        except Exception as e:
+            print(e)
+            return False
+
+    def revoke_session(self, session_id, uid=None, now=None):
+        now = time.time() if now is None else now
+        try:
+            query = "UPDATE auth_sessions SET revoked_at = ? WHERE session_id = ? AND revoked_at IS NULL"
+            params = [now, session_id]
+            if uid is not None:
+                query += " AND uid = ?"
+                params.append(uid)
+            self.execute(query, tuple(params))
+            return True
+        except Exception as e:
+            print(e)
+            return False
+
+    def revoke_sessions(self, uid, now=None):
+        now = time.time() if now is None else now
+        try:
+            self.execute("UPDATE auth_sessions SET revoked_at = ? WHERE uid = ? AND revoked_at IS NULL", (now, uid))
+            return True
+        except Exception as e:
+            print(e)
+            return False
+
+    def list_sessions(self, uid, now=None):
+        """列出某用户的全部未撤销、未过期的会话（会话管理粒度）。"""
+        now = time.time() if now is None else now
+        return self.query(
+            "SELECT session_id, created_at, last_seen_at, expires_at, session_version, ip, ua FROM auth_sessions WHERE uid = ? AND revoked_at IS NULL AND expires_at > ? ORDER BY last_seen_at DESC",
+            (uid, now),
+        )
+
+    def count_active_sessions(self, uid, now=None):
+        """统计某用户未撤销、未过期的会话数（会话配额）。"""
+        now = time.time() if now is None else now
+        ret = self.query(
+            "SELECT COUNT(*) FROM auth_sessions WHERE uid = ? AND revoked_at IS NULL AND expires_at > ?",
+            (uid, now),
+        )
+        if not ret:
+            return 0
+        return ret[0][0]
+
+    def get_oldest_session(self, uid, now=None):
+        """获取某用户最老的未撤销、未过期会话的 session_id。"""
+        now = time.time() if now is None else now
+        ret = self.query(
+            "SELECT session_id FROM auth_sessions WHERE uid = ? AND revoked_at IS NULL AND expires_at > ? ORDER BY last_seen_at ASC LIMIT 1",
+            (uid, now),
+        )
+        return ret[0][0] if ret else None
+
+    def touch_session(self, session_id, now=None):
+        """更新会话最近活跃时间（可选）。"""
+        now = time.time() if now is None else now
+        try:
+            self.execute(
+                "UPDATE auth_sessions SET last_seen_at = ? WHERE session_id = ? AND revoked_at IS NULL",
+                (now, session_id),
+            )
+            return True
+        except Exception as e:
+            print(e)
+            return False
+
     def _migrate_token_columns(self):
         """为旧数据库补充 tokens（是词元吗） 表的 ip/ua 列"""
         try:
@@ -360,6 +494,7 @@ class UserDb(Db):
                 (uid,),
             )
             self.delete_tokens(uid)
+            self.revoke_sessions(uid)
             return True
         except Exception as e:
             print(e)
