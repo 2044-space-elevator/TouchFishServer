@@ -62,6 +62,7 @@
 | `VALIDATION_INVALID_CALL_ID` | Call ID is invalid | 400 |
 | `VALIDATION_MESSAGE_TOO_LONG` | Message is too long | 400 |
 | `VALIDATION_MISSING_PARAMETER` | A required parameter is missing | 400 |
+| `CAPTCHA_INVALID` | Captcha is invalid or expired, please refresh | 400 |
 
 ### 文件
 

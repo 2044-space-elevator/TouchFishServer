@@ -11,6 +11,8 @@
 ```
 {
     "captcha" : <is_captcha>,
+    "captcha_provider" : <captcha_provider>,
+    "captcha_site_key" : <captcha_site_key>,
     "default_asset_urls" : {
         "logo" : "/avatar/get_logo",
         "forum" : "/avatar/get_default/forum",
@@ -39,8 +41,10 @@
 Example:
 
 ```
-{"captcha":false,"default_asset_urls":{"logo":"/avatar/get_logo","forum":"/avatar/get_default/forum","user":"/avatar/get_default/user","group":"/avatar/get_default/group"},"email_activate":false,"file_last_time":72,"groups_limit":30,"max_file_size":-1,"max_avatar_size":-1,"user_storage_quota":-1,"max_message_length":10000,"min_group_name_length":1,"max_group_name_length":50,"port_api":7001,"port_tcp":1145,"ice_servers":[{"urls":["stun:stun.epygi.com","stun:stun.fitauto.ru"]}],"server_name":"TouchFish","single_group_max_people":200}
+{"captcha":false,"captcha_provider":"image","captcha_site_key":"","default_asset_urls":{"logo":"/avatar/get_logo","forum":"/avatar/get_default/forum","user":"/avatar/get_default/user","group":"/avatar/get_default/group"},"email_activate":false,"file_last_time":72,"groups_limit":30,"max_file_size":-1,"max_avatar_size":-1,"user_storage_quota":-1,"max_message_length":10000,"min_group_name_length":1,"max_group_name_length":50,"port_api":7001,"port_tcp":1145,"ice_servers":[{"urls":["stun:stun.epygi.com","stun:stun.fitauto.ru"]}],"server_name":"TouchFish","single_group_max_people":200}
 ```
+
+`captcha_provider` 为验证码类型：`image` 表示内置图片验证码，其余（`turnstile` / `hcaptcha` / `recaptcha`）为第三方验证码，此时 `captcha_site_key` 供客户端渲染 `GET /auth/captcha/page` 页面使用；服务端私钥 `captcha_secret` 不会下发。详见[账号文档](auth.md)。
 
 `ice_servers` is used by the client for WebRTC ICE negotiation. Set
 `rtc.turn_enabled` to `true` and configure `rtc.ice_servers` in the instance

@@ -329,6 +329,8 @@
     "port_api" : <port_api>,
     "port_tcp" : <port_tcp>,
     "captcha" : <captcha>,
+    "captcha_provider" : <captcha_provider>,
+    "captcha_site_key" : <captcha_site_key>,
     "file_last_time" : <file_last_time>,
     "groups_limit" : <groups_limit>,
     "single_group_max_people" : <single_group_max_people>,
@@ -392,21 +394,47 @@
 
 该接口要求操作者至少拥有 `admin` 权限。
 
-- `^ POST /auth/change_captcha` 改变是否要开启图片验证码注册
+- `^ POST /auth/change_captcha` 改变是否要开启验证码注册，以及验证码的提供方
 
 请求体：
 
 ```
 {
-    "change_to" : <new_stat>
+    "uid" : <root_uid>,
+    "password" : <root_password>,
+    "change_to" : <new_stat>,
+    "captcha_provider" : <captcha_provider>,
+    "captcha_site_key" : <captcha_site_key>,
+    "captcha_secret" : <captcha_secret>
 }
 ```
 
-`<new_stat>` 为布尔对象，如果为 `true` 表示启用图片验证码注册，如果为 `false` 表示不启用图片验证码注册。
+`<new_stat>` 为布尔对象，如果为 `true` 表示启用验证码注册，如果为 `false` 表示不启用验证码注册。
 
 需注意只有 `root` 用户有修改这个的权限。
 
+`captcha_provider`、`captcha_site_key`、`captcha_secret` 均为可选，只有显式传入的字段才会更新：
+
+| 字段 | 说明 |
+| --- | --- |
+| `captcha_provider` | 验证码类型：`image`（内置图片验证码，默认）、`turnstile`（Cloudflare Turnstile）、`hcaptcha`、`recaptcha`（Google reCAPTCHA） |
+| `captcha_site_key` | 第三方验证码的 site key（公钥），会随 `/info` 下发用于客户端渲染 |
+| `captcha_secret` | 第三方验证码的 secret（私钥），仅供服务端调用供应商校验接口使用，**不会下发** |
+
+`captcha_provider` 传入未知取值时返回 `{"error": "invalid_request"}`。
+
 返回体：修改成功为时间戳加 `True`，修改失败为时间戳加 `False`。
+
+#### 第三方验证码流程
+
+当 `captcha_provider` 不是 `image` 时，验证码不在客户端本地渲染，流程如下：
+
+1. 客户端从 `/info` 读取 `captcha`、`captcha_provider`、`captcha_site_key`；
+2. 打开 `/auth/captcha/page` 渲染第三方验证码组件；
+3. 用户在组件中完成人机校验，页面回调把 token 交回客户端；
+4. 客户端在 `/auth/register` 的 `captcha_token` 字段中提交该 token，由服务端调用供应商的 `siteverify` 接口完成最终校验（校验结果不做缓存，注册接口每次调用都会实时校验）。
+
+`captcha_secret` 必须与 `captcha_site_key` 取自同一个供应商的同一组密钥，否则校验必然失败。
 
 - `^ POST /auth/change_email_verify` 改变是否要开启邮箱验证
 
@@ -448,7 +476,7 @@
 
 需要注意的是：这只有部分服务器会要求，具体是否要求请询问服主或者查询服务器信息。
 
-返回体：若未启用验证码，返回体为空，若启用了验证码，返回体为：
+返回体：若未启用验证码，返回体为空。若启用了验证码且 `captcha_provider` 为 `image`，返回体为：
 
 ```
 {
@@ -458,6 +486,25 @@
 ```
 
 `<pic>` 是 `png` 格式图片的 Base64 编码用 `utf-8` 解码后的格式，`<stamp>` 是验证码标识码（时间戳，为整数）。
+
+若服务器启用了第三方验证码（`captcha_provider` 非 `image`），本接口同样返回空对象，客户端应改用 `/auth/captcha/page`。
+
+- `* GET /auth/captcha/page` 获取第三方验证码渲染页
+
+请求体：无
+
+仅当服务器启用了第三方验证码时才有意义：
+
+- 验证码未启用时返回 `404`，响应体为纯文本 `Captcha is disabled.`；
+- `captcha_provider` 为 `image` 或未配置 `captcha_site_key` 时返回 `400`，响应体为纯文本 `Captcha provider not configured.`；
+- 否则返回 `text/html`，页面会加载对应供应商的脚本并渲染验证码组件。
+
+校验成功（用户完成人机验证）后，页面按运行环境择一回调：
+
+- 在 Flutter WebView 中：调用 `flutter_inappwebview.callHandler('captchaDone', token)`；
+- 页面被嵌入 iframe 时：向父窗口 `postMessage` 字符串 `captcha_tk=<token>`。
+
+客户端拿到 token 后，在 `/auth/register` 中以 `captcha_token` 字段提交。
 
 
 - `* GET /auth/uid/<uid>` 查询用户（以 `uid` 为键）相关信息
@@ -531,13 +578,21 @@
     "password" : <password>,
     "captcha_stamp" : <captcha_stamp>,
     "captcha_code" : <captcha_code>,
+    "captcha_token" : <captcha_token>,
     "email" : <email>
 }
 ```
 
-如果服务器不启用图形验证码， `<captcha_stamp>` 和 `<captcha_code>` 是可以省略的。
+如果服务器不启用验证码，验证码相关字段是可以省略的。
 
-`captcha_stamp` 请填写 `/auth/captcha` 返回体中的 `stamp`。该值实际返回为整数时间戳；服务端校验时会将其转为整数处理。
+验证码字段的选用取决于服务器的 `captcha_provider`（可从 `/info` 获取）：
+
+- `image`（默认）：传入 `captcha_stamp` 和 `captcha_code`。`captcha_stamp` 请填写 `/auth/captcha` 返回体中的 `stamp`；该值实际返回为整数时间戳，服务端校验时会将其转为整数处理。图片验证码**一次性有效**：无论校验是否通过，该 `stamp` 都会立即作废，客户端必须重新调用 `/auth/captcha` 获取新验证码后才能重试。
+- 第三方（`turnstile` / `hcaptcha` / `recaptcha`）：传入 `captcha_token`，即 `/auth/captcha/page` 渲染页回调返回的 token。
+
+验证码校验失败（错误、过期或已使用）返回 `{"error": "captcha_invalid"}`（详细模式下为 `CAPTCHA_INVALID`，HTTP 400），客户端应重新获取验证码后重试。
+
+> **注意**：验证码校验失败**不再**返回旧版的 `时间戳 + False`，而是返回上述错误对象，客户端需要按新格式处理。
 
 如果服务器不启用邮箱激活，`<email>` 是可以省略的。
 

@@ -61,6 +61,7 @@ ERRORS = {
     "rate_limited": ("RATE_LIMITED", "Too many requests", 429),
     "conflict": ("CONFLICT", "Resource conflict", 409),
     "Password incorrect": ("AUTH_INVALID_PASSWORD", "Password is incorrect", 401),
+    "captcha_invalid": ("CAPTCHA_INVALID", "Captcha is invalid or expired, please refresh", 400),
     "Server error": ("SERVER_ERROR", "Internal server error", 500),
 }
 

@@ -1,7 +1,9 @@
 from flask import Flask, send_file, redirect, request as flask_request, g as flask_g
+from flask import render_template_string, Response
 from werkzeug.middleware.proxy_fix import ProxyFix
 import json
 import register_tool
+import captcha_service
 import base64
 import binascii
 import os
@@ -313,6 +315,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             "port_tcp" : port_tcp,
             "ice_servers" : _build_ice_servers(cfg.get("rtc", {})),
             "captcha" : bool(cfg.get("captcha", False)),
+            "captcha_provider" : cfg.get("captcha_provider", "image"),
+            "captcha_site_key" : cfg.get("captcha_site_key", ""),
             "file_last_time" : cfg.get("file_last_time", 72),
             "media_features" : bool(cfg.get("media_features", True)),
             "groups_limit" : cfg.get("groups_limit", 30),
@@ -1139,8 +1143,12 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     @app.route('/auth/captcha')
     def get_captcha():
-        captcha = read_config().get("captcha", False)
+        cfg = read_config()
+        captcha = cfg.get("captcha", False)
         if not captcha:
+            return {}
+        # 第三方验证码走 /auth/captcha/page，此端点仅服务图片验证码
+        if captcha_service.is_third_party(cfg.get("captcha_provider", "image")):
             return {}
         token = register_tool.generate_captcha(port_api, ImgCaptcha, locks['captcha'])
         file_path = 'res/{}/captcha/{}.png'.format(port_api, token)
@@ -1148,7 +1156,22 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             ret_b64 = file.read()
         ret_b64 = base64.b64encode(ret_b64).decode("utf-8")
         return {"pic" : ret_b64, "stamp" : token}
-    
+
+    @app.route('/auth/captcha/page')
+    def get_captcha_page():
+        """
+        验证码 HTML
+       """ 
+        cfg = read_config()
+        if not cfg.get("captcha", False):
+            return Response("Captcha is disabled.", status=404, mimetype="text/plain")
+        provider = cfg.get("captcha_provider", "image")
+        site_key = cfg.get("captcha_site_key", "")
+        html, _, _ = captcha_service.render_page(provider, site_key)
+        if html is None:
+            return Response("Captcha provider not configured.", status=400, mimetype="text/plain")
+        return Response(html, mimetype="text/html")
+
     @api("/auth/change_email_verify", methods=['POST'])
     def change_email_verify(req):
         uid = req["uid"]
@@ -1228,10 +1251,18 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return bool_res()[False]
         
         if is_captcha:
-            captcha_stamp = req["captcha_stamp"]
-            captcha_code = req["captcha_code"]
-            if not register_tool.verify_captcha(port_api, captcha_stamp, captcha_code, locks['captcha']):
-                return bool_res()[False]
+            provider = cfg.get("captcha_provider", "image")
+            if captcha_service.is_third_party(provider):
+                token = req.get("captcha_token", "")
+                if not captcha_service.verify_token(provider, cfg.get("captcha_secret", ""), token):
+                    return {"error": "captcha_invalid"}
+            else:
+                captcha_stamp = req["captcha_stamp"]
+                captcha_code = req["captcha_code"]
+                captcha_ok, _ = register_tool.verify_captcha(port_api, captcha_stamp, captcha_code, locks['captcha'])
+                if not captcha_ok:
+                    # 验证码错误/过期/已消费：该 stamp 已被作废，客户端需刷新后重试
+                    return {"error": "captcha_invalid"}
         
         email = None
         if "email" in req.keys():
@@ -1561,7 +1592,26 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         user_row = get_user_row(uid)
         if user_row is None or user_row[4] != 'root':
             return bool_res()[False]
-        update_config(lambda cfg: cfg.__setitem__("captcha", final_stat))
+        provider = req.get("captcha_provider")
+        if isinstance(provider, str) and provider:
+            provider = provider.strip().lower()
+            if provider != captcha_service.IMAGE_PROVIDER and not captcha_service.is_third_party(provider):
+                return {"error": "invalid_request"}
+        else:
+            provider = None
+
+        def apply(cfg):
+            cfg["captcha"] = final_stat
+            if provider is not None:
+                cfg["captcha_provider"] = provider
+            site_key = req.get("captcha_site_key")
+            if isinstance(site_key, str) and site_key:
+                cfg["captcha_site_key"] = site_key
+            secret = req.get("captcha_secret")
+            if isinstance(secret, str) and secret:
+                cfg["captcha_secret"] = secret
+
+        update_config(apply)
         return bool_res()[True]
 
     @api("/auth/change_rate_limits", methods=['POST'])

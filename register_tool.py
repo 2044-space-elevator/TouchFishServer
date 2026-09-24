@@ -3,7 +3,7 @@
 """
 
 import os
-from json_store import read_json, update_json
+from json_store import read_json, update_json, write_json
 from random import choices, randint
 import smtplib
 from string import ascii_letters, digits
@@ -85,14 +85,30 @@ def generate_captcha(port_api : int, Imgcaptcha, lock):
     return time_now
 
 def verify_captcha(port_api : int, time_stamp : int, verify_text : str, lock):
-    if time() - int(time_stamp) > MAX_DELAY:
-        return False
+    """
+    校验验证码（校验一次之后就报废啦）
+    """
+    try:
+        stamp = int(time_stamp)
+    except (TypeError, ValueError):
+        return False, False
+    if time() - stamp > MAX_DELAY:
+        return False, False
     folder_path = "res/{}/captcha".format(port_api)
-    if "{}.png".format(time_stamp) not in os.listdir(folder_path):
-        return False
+    png_name = "{}.png".format(stamp)
+    if png_name not in os.listdir(folder_path):
+        return False, False
     with lock:
         lst = read_json(folder_path + '/captcha.json')
-        return lst.get(str(time_stamp), "").lower() == verify_text.lower()
+        answer = lst.pop(str(stamp), None)
+        if answer is None:
+            return False, False
+        write_json("res/{}/captcha/captcha.json".format(port_api), lst)
+        try:
+            os.remove(os.path.join(folder_path, png_name))
+        except OSError:
+            pass
+        return answer.lower() == str(verify_text).lower(), True
 
 def email_code(sender_email : str, port_api : int, email : str, password : str, config_lock, activate_lock):
     folder_path = "res/{}".format(port_api)
