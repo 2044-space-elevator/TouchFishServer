@@ -818,7 +818,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             uid = req["uid"]
             pwd = req["password"]
             if req.get("jwt"):
-                return login_with_jwt(uid, pwd)
+                device_id = req.get("device_id")
+                device_name = req.get("device_name")
+                platform = req.get("platform", 0)
+                return login_with_jwt(uid, pwd, device_id, device_name, platform)
             cfg = read_config()
             if not cfg.get("legacy_auth_enabled", True):
                 return bool_res()[False]
@@ -839,7 +842,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         except Exception:
             return {"error": "auth_failed"}
 
-    def login_with_jwt(uid, pwd):
+    def login_with_jwt(uid, pwd, device_id=None, device_name=None, platform=0):
         """
         JWT 登录：校验凭据后签发 access token 并建立可刷新 Session。
         超限（jwt_max_per_user）时吊销最老的会话。
@@ -856,6 +859,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         user_agent = flask_request.user_agent.string or ""
         if len(user_agent) > 256:
             user_agent = user_agent[:256]
+
+        # 设备信息记录
+        if device_id and device_name:
+            now = time.time()
+            user_cursor.upsert_device(uid, device_id, device_name, platform, now)
 
         # 达到会话上限时吊销最老的 session
         revoked_oldest = False
@@ -878,7 +886,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         now = time.time()
         session_expires = now + refresh_expires
         session_id = user_cursor.create_session(
-            uid, refresh_token, now, session_expires, ip=client_ip, ua=user_agent
+            uid, refresh_token, now, session_expires, ip=client_ip, ua=user_agent,
+            device_id=device_id, location=None
         )
         if not session_id:
             return {"error": "auth_failed"}
@@ -969,7 +978,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if uid is None:
             return {"error": "forbidden"}
         sessions = []
-        for session_id, created_at, last_seen_at, expires_at, _version, ip, ua in user_cursor.list_sessions(uid):
+        for row in user_cursor.list_sessions(uid):
+            session_id, created_at, last_seen_at, expires_at, _version, ip, ua, device_id, device_name, label, platform, location = row
             sessions.append({
                 "session_id": session_id,
                 "created_at": int(created_at),
@@ -977,6 +987,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 "expires_at": int(expires_at),
                 "ip": ip or "",
                 "ua": ua or "",
+                "device_id": device_id or "",
+                "device_name": device_name or "",
+                "label": label or "",
+                "platform": platform or 0,
+                "location": location or "",
                 "is_current": session_id == current_sid,
             })
         return {
@@ -1038,6 +1053,36 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 "disconnect_session_owner",
                 lambda sid=session_id: instant_contact.disconnect_session(sid)
             )
+        return {"success": True}
+
+    @api("/auth/sessions/rename", methods=["POST"])
+    def rename_auth_session(req):
+        """
+        为指定会话的设备设置自定义标签（实则就是 rename）
+        """
+        identity = flask_g.get("auth_identity")
+        if identity is None:
+            return {"error": "not_authenticated"}
+        uid, current_sid = _resolve_session_target(req, identity)
+        if uid is None:
+            return {"error": "forbidden"}
+        session_id = req.get("session_id")
+        label = req.get("label")
+        if not isinstance(session_id, str) or not session_id:
+            return {"error": "invalid_request"}
+        if not isinstance(label, str):
+            return {"error": "invalid_request"}
+        # 验证会话所有权
+        owner = user_cursor.session_owner(session_id)
+        if not owner or owner[0] != uid:
+            return {"error": "not_found"}
+        device_id = owner[1]
+        if not device_id:
+            return {"error": "no_device_id"}
+        # 更新设备标签
+        success = user_cursor.rename_device(uid, device_id, label)
+        if not success:
+            return {"error": "update_failed"}
         return {"success": True}
 
     # d e p r e c a t e d ! ! pls !
@@ -1113,6 +1158,75 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 lambda: instant_contact.disconnect_session(sid)
             )
         return {"success": True}
+
+    @api("/auth/devices/list", methods=["POST"])
+    def list_devices(req):
+        """
+        列出用户的所有设备记录
+        """
+        identity = flask_g.get("auth_identity")
+        if identity is None:
+            return {"error": "not_authenticated"}
+        uid, _current_sid = _resolve_session_target(req, identity)
+        if uid is None:
+            return {"error": "forbidden"}
+        devices = []
+        for device_id, device_name, platform, last_seen, label in user_cursor.list_devices(uid):
+            devices.append({
+                "device_id": device_id,
+                "device_name": device_name,
+                "platform": platform,
+                "last_seen": int(last_seen),
+                "label": label or "",
+            })
+        return {"devices": devices}
+
+    @api("/auth/devices/update_label", methods=["POST"])
+    def update_device_label(req):
+        """
+        更新设备的用户自定义标签
+        """
+        identity = flask_g.get("auth_identity")
+        if identity is None:
+            return {"error": "not_authenticated"}
+        uid = identity["uid"]
+        device_id = req.get("device_id")
+        label = req.get("label", "")
+        if not isinstance(device_id, str) or not device_id:
+            return {"error": "invalid_request"}
+        if not isinstance(label, str):
+            return {"error": "invalid_request"}
+        if len(label) > 64:
+            label = label[:64]
+        user_cursor.update_device_label(uid, device_id, label)
+        return {"success": True}
+
+    @api("/auth/devices/revoke", methods=["POST"])
+    def revoke_device(req):
+        """
+        吊销指定设备的所有会话
+        """
+        identity = flask_g.get("auth_identity")
+        if identity is None:
+            return {"error": "not_authenticated"}
+        uid, _current_sid = _resolve_session_target(req, identity)
+        if uid is None:
+            return {"error": "forbidden"}
+        device_id = req.get("device_id")
+        if not isinstance(device_id, str) or not device_id:
+            return {"error": "invalid_request"}
+        sessions_revoked = 0
+        for row in user_cursor.list_sessions(uid):
+            session_id = row[0]
+            sess_device_id = row[7]
+            if sess_device_id == device_id:
+                user_cursor.revoke_session(session_id, uid)
+                run_side_effect(
+                    "disconnect_session_owner",
+                    lambda sid=session_id: instant_contact.disconnect_session(sid)
+                )
+                sessions_revoked += 1
+        return {"success": True, "sessions_revoked": sessions_revoked}
 
     @api("/auth/validate", methods=["POST"])
     def validate_token(req):

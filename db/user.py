@@ -284,17 +284,36 @@ class UserDb(Db):
             self.execute("CREATE INDEX IF NOT EXISTS idx_auth_sessions_uid ON auth_sessions(uid)")
         except Exception:
             pass
+        
+        self.execute("""
+    CREATE TABLE IF NOT EXISTS auth_devices (
+        uid INTEGER NOT NULL,
+        device_id TEXT NOT NULL,
+        device_name TEXT,
+        platform INTEGER NOT NULL DEFAULT 0,
+        label TEXT,
+        created_at REAL NOT NULL,
+        last_seen_at REAL NOT NULL,
+        PRIMARY KEY (uid, device_id)
+    )
+    """)
+        try:
+            self.execute("CREATE INDEX IF NOT EXISTS idx_auth_devices_uid ON auth_devices(uid)")
+        except Exception:
+            pass
+        
+        self._migrate_session_columns()
 
     @staticmethod
     def hash_refresh_token(refresh_token):
         return hashlib.sha256(refresh_token.encode("utf-8")).hexdigest()
 
-    def create_session(self, uid, refresh_token, created_at, expires_at, ip=None, ua=None):
+    def create_session(self, uid, refresh_token, created_at, expires_at, ip=None, ua=None, device_id=None, location=None):
         session_id = secrets.token_hex(16)
         try:
             self.execute(
-                "INSERT INTO auth_sessions (session_id, uid, created_at, last_seen_at, expires_at, refresh_hash, ip, ua) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (session_id, uid, created_at, created_at, expires_at, self.hash_refresh_token(refresh_token), ip, ua),
+                "INSERT INTO auth_sessions (session_id, uid, created_at, last_seen_at, expires_at, refresh_hash, ip, ua, device_id, location) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (session_id, uid, created_at, created_at, expires_at, self.hash_refresh_token(refresh_token), ip, ua, device_id, location),
             )
             return session_id
         except Exception as e:
@@ -304,7 +323,7 @@ class UserDb(Db):
     def get_session_by_refresh(self, refresh_token):
         refresh_hash = self.hash_refresh_token(refresh_token)
         rows = self.query(
-            "SELECT session_id, uid, created_at, last_seen_at, expires_at, session_version, revoked_at, ip, ua FROM auth_sessions WHERE refresh_hash = ?",
+            "SELECT session_id, uid, created_at, last_seen_at, expires_at, session_version, revoked_at, ip, ua, device_id, location FROM auth_sessions WHERE refresh_hash = ?",
             (refresh_hash,),
         )
         return rows[0] if rows else None
@@ -358,7 +377,12 @@ class UserDb(Db):
         """列出某用户的全部未撤销、未过期的会话（会话管理粒度）。"""
         now = time.time() if now is None else now
         return self.query(
-            "SELECT session_id, created_at, last_seen_at, expires_at, session_version, ip, ua FROM auth_sessions WHERE uid = ? AND revoked_at IS NULL AND expires_at > ? ORDER BY last_seen_at DESC",
+            """SELECT s.session_id, s.created_at, s.last_seen_at, s.expires_at, s.session_version, s.ip, s.ua, 
+                      s.device_id, d.device_name, d.label, d.platform, s.location
+               FROM auth_sessions s
+               LEFT JOIN auth_devices d ON s.uid = d.uid AND s.device_id = d.device_id
+               WHERE s.uid = ? AND s.revoked_at IS NULL AND s.expires_at > ?
+               ORDER BY s.last_seen_at DESC""",
             (uid, now),
         )
 
@@ -394,6 +418,105 @@ class UserDb(Db):
         except Exception as e:
             print(e)
             return False
+
+    def session_owner(self, session_id):
+        """获取会话所属 uid 和 device_id（用于权限校验）。"""
+        rows = self.query(
+            "SELECT uid, device_id FROM auth_sessions WHERE session_id = ?",
+            (session_id,),
+        )
+        return rows[0] if rows else None
+
+    def upsert_device(self, uid, device_id, device_name, platform, now):
+        """创建或更新设备记录（保留已有 label）。"""
+        try:
+            self.execute(
+                """INSERT INTO auth_devices (uid, device_id, device_name, platform, created_at, last_seen_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(uid, device_id) DO UPDATE SET
+                       device_name = EXCLUDED.device_name,
+                       platform = EXCLUDED.platform,
+                       last_seen_at = EXCLUDED.last_seen_at""",
+                (uid, device_id, device_name, platform, now, now),
+            )
+            return True
+        except Exception as e:
+            print(e)
+            return False
+
+    def get_device(self, uid, device_id):
+        """获取设备详情。"""
+        rows = self.query(
+            "SELECT device_id, device_name, platform, label, created_at, last_seen_at FROM auth_devices WHERE uid = ? AND device_id = ?",
+            (uid, device_id),
+        )
+        return rows[0] if rows else None
+
+    def list_devices(self, uid, now=None):
+        """列出某用户的全部设备。"""
+        now = time.time() if now is None else now
+        return self.query(
+            """SELECT d.device_id, d.device_name, d.platform, d.last_seen_at, d.label
+               FROM auth_devices d
+               WHERE d.uid = ?
+               ORDER BY d.last_seen_at DESC""",
+            (uid,),
+        )
+
+    def rename_device(self, uid, device_id, label):
+        """更新设备的用户自定义标签（保留 device_name）。"""
+        try:
+            self.execute(
+                "UPDATE auth_devices SET label = ? WHERE uid = ? AND device_id = ?",
+                (label, uid, device_id),
+            )
+            return self.cursor.rowcount > 0
+        except Exception as e:
+            print(e)
+            return False
+    
+    def update_device_label(self, uid, device_id, label):
+        """更新设备的用户自定义标签（别名方法）。"""
+        return self.rename_device(uid, device_id, label)
+
+    def revoke_device_sessions(self, uid, device_id, now=None):
+        """撤销某设备的全部会话。"""
+        now = time.time() if now is None else now
+        try:
+            self.execute(
+                "UPDATE auth_sessions SET revoked_at = ? WHERE uid = ? AND device_id = ? AND revoked_at IS NULL",
+                (now, uid, device_id),
+            )
+            return True
+        except Exception as e:
+            print(e)
+            return False
+
+    def touch_device(self, uid, device_id, now=None):
+        """更新设备最近活跃时间。"""
+        now = time.time() if now is None else now
+        try:
+            self.execute(
+                "UPDATE auth_devices SET last_seen_at = ? WHERE uid = ? AND device_id = ?",
+                (now, uid, device_id),
+            )
+            return True
+        except Exception as e:
+            print(e)
+            return False
+
+    def _migrate_session_columns(self):
+        """为旧数据库的 auth_sessions 表补充 device_id 和 location 列"""
+        try:
+            columns = [row[1] for row in self.query("PRAGMA table_info(auth_sessions)")]
+        except Exception:
+            return
+        for column, definition in (("device_id", "TEXT"), ("location", "TEXT")):
+            if column not in columns:
+                try:
+                    self.execute("ALTER TABLE auth_sessions ADD COLUMN {} {}".format(column, definition))
+                except Exception:
+                    pass
 
     def _migrate_token_columns(self):
         """为旧数据库补充 tokens（是词元吗） 表的 ip/ua 列"""
