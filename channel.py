@@ -779,6 +779,11 @@ class InstantConnect():
                     except (TypeError, ValueError):
                         self._queue_ack(websocket, message.get('client_mid'), status="failed", error="invalid_quote")
                         continue
+                    duration = content.get('duration_ms')
+                    try:
+                        duration = int(duration) if duration is not None else None
+                    except (TypeError, ValueError):
+                        duration = None
                     client_mid = message.get('client_mid')
                     if quote < -1:
                         self._queue_ack(websocket, client_mid, status="failed", error="invalid_quote")
@@ -814,7 +819,8 @@ class InstantConnect():
                                 self.messages_cursor.add_message,
                                 sender_uid, send_to, file_hashes,
                                 content_type='file', file_hash=file_hashes, quote=quote,
-                                client_mid=client_mid, file_name=metadata["file_name"]
+                                client_mid=client_mid, file_name=metadata["file_name"],
+                                duration=duration
                             )
                         except Exception:
                             self.file_cursor.decrement_ref(file_hashes)
@@ -822,7 +828,7 @@ class InstantConnect():
                         if msg_record.get("duplicate"):
                             if not self.messages_cursor.request_matches(
                                     msg_record["mid"], sender_uid, send_to, file_hashes, "file",
-                                    file_hash=file_hashes, quote=quote):
+                                    file_hash=file_hashes, quote=quote, duration=duration):
                                 self._queue_ack(
                                     websocket, client_mid, status="failed",
                                     error="client_mid_conflict",
@@ -854,6 +860,8 @@ class InstantConnect():
                         recv_notif["quote_preview"] = (
                             self.messages_cursor.get_quote_preview(quote, msg_record) if quote >= 0 else None
                         )
+                        if duration is not None:
+                            recv_notif["duration"] = duration
                         if self.file_cursor is not None:
                             recv_notif["file"] = _metadata_with_name(
                                 self.file_cursor.get_metadata(file_hashes, owner_uid=sender_uid),
@@ -896,7 +904,8 @@ class InstantConnect():
                                 self.messages_cursor.add_message,
                                 sender_uid, 0, file_hashes,
                                 content_type='file', file_hash=file_hashes, quote=quote, group_id=gid,
-                                client_mid=client_mid, file_name=metadata["file_name"]
+                                client_mid=client_mid, file_name=metadata["file_name"],
+                                duration=duration
                             )
                         except Exception:
                             self.file_cursor.decrement_ref(file_hashes)
@@ -904,7 +913,7 @@ class InstantConnect():
                         if msg_record.get("duplicate"):
                             if not self.messages_cursor.request_matches(
                                     msg_record["mid"], sender_uid, 0, file_hashes, "file",
-                                    file_hash=file_hashes, quote=quote, group_id=gid):
+                                    file_hash=file_hashes, quote=quote, group_id=gid, duration=duration):
                                 self._queue_ack(
                                     websocket, client_mid, status="failed",
                                     error="client_mid_conflict",
@@ -936,6 +945,8 @@ class InstantConnect():
                         notif_dict["quote_preview"] = (
                             self.messages_cursor.get_quote_preview(quote, msg_record) if quote >= 0 else None
                         )
+                        if duration is not None:
+                            notif_dict["duration"] = duration
                         if self.file_cursor is not None:
                             notif_dict["file"] = _metadata_with_name(
                                 self.file_cursor.get_metadata(

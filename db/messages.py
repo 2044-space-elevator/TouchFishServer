@@ -36,6 +36,7 @@ class MessagesDb(Db):
                 deleted_by INTEGER,
                 file_name TEXT,
                 forwarded INTEGER NOT NULL DEFAULT -1,
+                duration INTEGER,
                 room_key TEXT,
                 room_seq INTEGER
             )
@@ -83,6 +84,7 @@ class MessagesDb(Db):
                          ("deleted_at", "REAL"), ("deleted_by", "INTEGER"),
                            ("file_name", "TEXT"),
                            ("forwarded", "INTEGER NOT NULL DEFAULT -1"),
+                           ("duration", "INTEGER"),
                            ("room_key", "TEXT"), ("room_seq", "INTEGER")]:
             try:
                 self.execute("ALTER TABLE messages ADD COLUMN {} {}".format(col, typ))
@@ -145,7 +147,7 @@ class MessagesDb(Db):
                      content_type: str = 'plain', file_hash: str = None,
                       quote: int = -1, group_id: int = None,
                        client_mid: str = None, file_name: str = None,
-                        forwarded: int = -1) -> dict:
+                        forwarded: int = -1, duration: int = None) -> dict:
         send_time = time.time()
         _IntegrityError = self.dialect.IntegrityError
         with self.lock:
@@ -160,10 +162,10 @@ class MessagesDb(Db):
                     self.cursor.execute(
                         """INSERT INTO messages
                            (client_mid, sender_uid, receiver_uid, group_id, content, content_type,
-                             file_hash, send_time, quote, file_name, forwarded, room_key, room_seq)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                             file_hash, send_time, quote, file_name, forwarded, duration, room_key, room_seq)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (client_mid, sender_uid, receiver_uid, group_id, content, content_type,
-                          file_hash, send_time, quote, file_name, forwarded, room_key, room_seq),
+                          file_hash, send_time, quote, file_name, forwarded, duration, room_key, room_seq),
                     )
                     mid = self.cursor.lastrowid
                     self.conn.commit()
@@ -200,6 +202,7 @@ class MessagesDb(Db):
             "deleted_by": None,
             "file_name": file_name,
             "forwarded": forwarded,
+            "duration": duration,
             "room_key": self.room_key_of(sender_uid, receiver_uid, group_id),
             "room_seq": room_seq,
         }
@@ -223,7 +226,7 @@ class MessagesDb(Db):
 
         sql = """SELECT mid, client_mid, sender_uid, receiver_uid, group_id,
                          content, content_type, file_hash, send_time, quote, deleted,
-                          deleted_at, deleted_by, file_name, forwarded, room_key, room_seq
+                          deleted_at, deleted_by, file_name, forwarded, duration, room_key, room_seq
                   FROM messages WHERE {} ORDER BY mid DESC LIMIT ?""".format(where)
         params.append(limit)
         return self.query(sql, tuple(params))
@@ -295,12 +298,13 @@ class MessagesDb(Db):
 
     _COLUMNS = ["mid", "client_mid", "sender_uid", "receiver_uid", "group_id",
                   "content", "content_type", "file_hash", "send_time", "quote", "deleted",
-                  "deleted_at", "deleted_by", "file_name", "forwarded",
+                  "deleted_at", "deleted_by", "file_name", "forwarded", "duration",
                   "room_key", "room_seq"]
 
     _SELECT_ALL = ("SELECT mid, client_mid, sender_uid, receiver_uid, group_id,"
                    " content, content_type, file_hash, send_time, quote, deleted,"
-                   " deleted_at, deleted_by, file_name, forwarded, room_key, room_seq"
+                   " deleted_at, deleted_by, file_name, forwarded, duration,"
+                   " room_key, room_seq"
                    " FROM messages")
 
     @staticmethod
@@ -319,10 +323,60 @@ class MessagesDb(Db):
             "content": record["content"][:240] if record["content"] is not None else None,
             "file_hash": record["file_hash"],
             "file_name": record.get("file_name"),
+            "duration": record.get("duration"),
             "deleted": bool(record["deleted"]),
             "deleted_at": record["deleted_at"],
         }
         return MessagesDb._redact_recalled(preview)
+
+    @staticmethod
+    def _redirect_entry(record: dict) -> dict:
+        """构建单条消息的转发快照"""
+        return {
+            "mid": record["mid"],
+            "sender_uid": record["sender_uid"],
+            "content": record["content"],
+            "content_type": record["content_type"],
+            "file_hash": record["file_hash"],
+            "file_name": record.get("file_name"),
+            "duration": record.get("duration"),
+            "send_time": record["send_time"],
+        }
+
+    @staticmethod
+    def _redirect_room_snapshot(room_key: str, group_name: str) -> dict:
+        if room_key.startswith("G"):
+            return {"type": "group", "id": room_key, "name": group_name}
+        return {"type": "private", "id": room_key, "name": ""}
+
+    def build_redirect_snapshot(self, sender_uid: int, mids: list,
+                                group_name: str = "") -> dict:
+        """按时间序冻结所选消息为合并转发。
+        """
+        records = self.get_messages_by_mids(mids)
+        ordered = sorted(
+            (records[int(m)] for m in mids if int(m) in records),
+            key=lambda r: (r["send_time"], r["mid"]),
+        )
+        room_key = ordered[0]["room_key"] if ordered else ""
+        entries = [self._redirect_entry(r) for r in ordered]
+        return {
+            "version": 2 if len(entries) > 1 else 1,
+            "kind": "history_segment" if len(entries) > 1 else "single",
+            "source_room": self._redirect_room_snapshot(room_key, group_name),
+            "source_room_id": room_key,
+            "message_count": len(entries),
+            "redirected_by": sender_uid,
+            "messages": entries,
+        }
+
+    @staticmethod
+    def parse_redirect(content: str):
+        import json as _json
+        try:
+            return _json.loads(content) if content else None
+        except Exception:
+            return None
 
     @staticmethod
     def _same_conversation(message: dict, quoted: dict) -> bool:
@@ -358,7 +412,7 @@ class MessagesDb(Db):
             quote_rows = self.query(
                 """SELECT mid, client_mid, sender_uid, receiver_uid, group_id,
                           content, content_type, file_hash, send_time, quote, deleted,
-                           deleted_at, deleted_by, file_name, forwarded, room_key, room_seq
+                           deleted_at, deleted_by, file_name, forwarded, duration, room_key, room_seq
                    FROM messages WHERE mid IN ({})""".format(placeholders),
                 tuple(quote_mids),
             )
@@ -383,7 +437,7 @@ class MessagesDb(Db):
         rows = self.query(
             """SELECT mid, client_mid, sender_uid, receiver_uid, group_id,
                       content, content_type, file_hash, send_time, quote, deleted,
-                        deleted_at, deleted_by, file_name, forwarded, room_key, room_seq
+                        deleted_at, deleted_by, file_name, forwarded, duration, room_key, room_seq
                       FROM messages WHERE mid = ?""",
             (mid,),
         )
@@ -503,11 +557,26 @@ class MessagesDb(Db):
         return (r[0] == sender_uid and r[1] == target_uid) or \
                (r[0] == target_uid and r[1] == sender_uid)
 
+    def get_messages_by_mids(self, mids: list) -> dict:
+        """按 mid 批量取消息"""
+        mids = [int(m) for m in mids]
+        if not mids:
+            return {}
+        placeholders = ",".join("?" * len(mids))
+        rows = self.query(
+            """SELECT mid, client_mid, sender_uid, receiver_uid, group_id,
+                       content, content_type, file_hash, send_time, quote, deleted,
+                        deleted_at, deleted_by, file_name, forwarded, duration, room_key, room_seq
+                      FROM messages WHERE mid IN ({})""".format(placeholders),
+            tuple(mids),
+        )
+        return {row[0]: dict(zip(self._COLUMNS, row)) for row in rows}
+
     def get_message(self, mid: int, include_recalled_original=False):
         rows = self.query(
             """SELECT mid, client_mid, sender_uid, receiver_uid, group_id,
                        content, content_type, file_hash, send_time, quote, deleted,
-                        deleted_at, deleted_by, file_name, forwarded, room_key, room_seq
+                        deleted_at, deleted_by, file_name, forwarded, duration, room_key, room_seq
                       FROM messages WHERE mid = ?""",
             (mid,),
         )
@@ -520,7 +589,8 @@ class MessagesDb(Db):
 
     def request_matches(self, mid : int, sender_uid : int, receiver_uid : int,
                         content : str, content_type : str, file_hash=None,
-                         quote : int = -1, group_id=None, forwarded : int = -1) -> bool:
+                         quote : int = -1, group_id=None, forwarded : int = -1,
+                         duration=None) -> bool:
         message = self.get_message(mid, include_recalled_original=True)
         if message is None:
             return False
@@ -533,6 +603,7 @@ class MessagesDb(Db):
             and message["file_hash"] == file_hash
             and message["quote"] == quote
             and message["forwarded"] == forwarded
+            and (duration is None or message.get("duration") == duration)
         )
 
     def get_by_client_mid(self, sender_uid : int, client_mid : str):

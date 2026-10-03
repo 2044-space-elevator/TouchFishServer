@@ -847,3 +847,55 @@ class UserDb(Db):
 
     def change_introduction(self, oped : int, new_intro : str):
         self.execute('UPDATE users SET introduction = ? where uid = ?', (new_intro, oped))
+
+    def get_session_stats(self):
+        """
+        获取会话统计信息
+        """
+        with self.lock:
+            try:
+                # 总会话数
+                total = self._fetchone_locked(
+                    "SELECT COUNT(*) FROM auth_sessions"
+                )
+                total_sessions = total[0] if total else 0
+                
+                # 活跃会话数（未撤销且未过期）
+                now = int(time.time())
+                active = self._fetchone_locked(
+                    "SELECT COUNT(*) FROM auth_sessions "
+                    "WHERE revoked_at IS NULL AND expires_at > ?",
+                    (now,)
+                )
+                active_sessions = active[0] if active else 0
+                
+                # 每用户活跃会话数统计
+                user_sessions = self._fetchall_locked(
+                    "SELECT uid, COUNT(*) as count FROM auth_sessions "
+                    "WHERE revoked_at IS NULL AND expires_at > ? "
+                    "GROUP BY uid",
+                    (now,)
+                )
+                
+                # 假设配额为5（从配置读取更好，这里简化）
+                max_sessions = 5
+                users_at_limit = sum(1 for _, count in user_sessions if count >= max_sessions)
+                
+                # 平均每用户会话数
+                total_users = len(user_sessions)
+                avg_sessions = (sum(count for _, count in user_sessions) / total_users) if total_users > 0 else 0.0
+                
+                return {
+                    'total_sessions': total_sessions,
+                    'active_sessions': active_sessions,
+                    'users_at_limit': users_at_limit,
+                    'avg_sessions_per_user': round(avg_sessions, 2),
+                }
+            except Exception as e:
+                print(f"get_session_stats error: {e}")
+                return {
+                    'total_sessions': 0,
+                    'active_sessions': 0,
+                    'users_at_limit': 0,
+                    'avg_sessions_per_user': 0.0,
+                }

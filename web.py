@@ -37,6 +37,8 @@ FILE_MIMETYPES = {
     ".gif": "image/gif", ".bmp": "image/bmp", ".svg": "image/svg+xml",
     ".mp4": "video/mp4", ".webm": "video/webm", ".mkv": "video/x-matroska",
     ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg",
+    ".m4a": "audio/mp4", ".aac": "audio/aac", ".flac": "audio/flac",
+    ".opus": "audio/opus", ".weba": "audio/webm",
     ".pdf": "application/pdf", ".zip": "application/zip",
     ".tgs": "application/octet-stream",
 }
@@ -4298,6 +4300,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             client_mid = req.get("client_mid")
             quote = int(req.get("quote", -1))
             forwarded = int(req.get("forwarded", -1))
+            duration = req.get("duration_ms")
+            try:
+                duration = int(duration) if duration is not None else None
+            except (TypeError, ValueError):
+                duration = None
             if quote < -1 or forwarded < -1 or (quote >= 0 and forwarded >= 0):
                 return bool_res()[False]
             if content_type not in ("plain", "file"):
@@ -4340,13 +4347,15 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 content_type = source_message["content_type"]
                 content = source_message["content"]
                 file_hash = source_message["file_hash"]
+                if source_message.get("duration") is not None:
+                    duration = source_message["duration"]
 
             existing = messages_cursor.get_by_client_mid(uid, client_mid)
             if existing is not None:
                 if not messages_cursor.request_matches(
                         existing["mid"], uid, target_uid, content, content_type,
                         file_hash=file_hash, quote=quote, group_id=group_id,
-                        forwarded=forwarded):
+                        forwarded=forwarded, duration=duration):
                     return json.dumps({
                         "success": False, "error": "client_mid_conflict"
                     })
@@ -4396,7 +4405,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                     content_type=content_type, file_hash=file_hash,
                     quote=quote, group_id=group_id, client_mid=client_mid,
                     file_name=file_record["file_name"] if file_record else None,
-                    forwarded=forwarded,
+                    forwarded=forwarded, duration=duration,
                 )
             except Exception:
                 if file_hash:
@@ -4409,7 +4418,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 if not messages_cursor.request_matches(
                         msg_record["mid"], uid, target_uid, content, content_type,
                         file_hash=file_hash, quote=quote, group_id=group_id,
-                        forwarded=forwarded):
+                        forwarded=forwarded, duration=duration):
                     return json.dumps({
                         "success": False, "error": "client_mid_conflict"
                     })
@@ -4467,6 +4476,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             if file_hash:
                 notif["file_hash"] = file_hash
                 notif["file"] = file_metadata(file_hash, uid)
+            if duration is not None:
+                notif["duration"] = duration
 
             if group_id:
                 room_id = "G{}".format(group_id)
@@ -4499,6 +4510,158 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             response_message["quote_preview"] = notif["quote_preview"]
             response_message["forward_preview"] = notif["forward_preview"]
             enrich_message_files([response_message])
+            return json.dumps({
+                "mid": msg_record["mid"], "client_mid": client_mid,
+                "status": "sent", "message": response_message,
+            }, ensure_ascii=False)
+        except Exception:
+            return bool_res()[False]
+
+    @api("/message/redirect", methods=['POST'])
+    def redirect_messages(req):
+        """合并转发：把同一房间内最多 100 条文本消息结为一条
+        """
+        try:
+            uid = req["uid"]
+            password = req["password"]
+            recipient = str(req["recipient"])
+            mids = req.get("mids") or []
+            client_mid = req.get("client_mid")
+
+            if not isinstance(mids, list):
+                return bool_res()[False]
+            mids = sorted({int(m) for m in mids if str(m).isdigit()})
+            if not mids:
+                return bool_res()[False]
+            if len(mids) > 100:
+                return bool_res()[False]
+
+            if not verify_user(uid, password):
+                return bool_res()[False]
+            user_row = get_user_row(uid)
+            if user_row is None or user_row[4] == 'banned':
+                return bool_res()[False]
+
+            if recipient.startswith('U'):
+                target_uid = int(recipient[1:])
+                group_id = None
+            elif recipient.startswith('G'):
+                target_uid = 0
+                group_id = int(recipient[1:])
+            else:
+                return bool_res()[False]
+
+            records = messages_cursor.get_messages_by_mids(mids)
+            selected = [records[m] for m in mids if m in records]
+            if len(selected) != len(mids):
+                return bool_res()[False]
+
+            room_keys = {r["room_key"] for r in selected}
+            if len(room_keys) != 1:
+                return bool_res()[False]
+            if any(r["deleted"] for r in selected):
+                return bool_res()[False]
+            if any(r["content_type"] != "plain" for r in selected):
+                return bool_res()[False]
+
+            source = selected[0]
+            src_group = source["group_id"]
+            # 校验调用者可读源房间
+            if src_group is not None:
+                if not group_cursor.is_member(src_group, uid):
+                    return bool_res()[False]
+            else:
+                src_pair = {source["sender_uid"], source["receiver_uid"]}
+                if uid not in src_pair:
+                    return bool_res()[False]
+
+            # 校验调用者可写目标房间
+            if group_id is not None:
+                if not group_cursor.is_member(group_id, uid):
+                    return bool_res()[False]
+            else:
+                if not user_cursor.is_friend(uid, target_uid):
+                    return bool_res()[False]
+
+            group_name = ""
+            if src_group is not None:
+                settings = group_cursor.get_group_settings(src_group)
+                group_name = settings.get("groupname", "") or ""
+
+            snapshot = messages_cursor.build_redirect_snapshot(
+                uid, mids, group_name=group_name
+            )
+            _name_cache = {}
+            for entry in snapshot.get("messages", []):
+                entry_uid = entry.get("sender_uid")
+                if entry_uid is None:
+                    continue
+                if entry_uid not in _name_cache:
+                    _name_cache[entry_uid] = get_username(entry_uid)
+                sender_name = _name_cache[entry_uid]
+                if sender_name:
+                    entry["sender_name"] = sender_name
+            snapshot_content = json.dumps(snapshot, ensure_ascii=False)
+
+            existing = messages_cursor.get_by_client_mid(uid, client_mid) \
+                if client_mid else None
+            if existing is not None:
+                return json.dumps({
+                    "mid": existing["mid"], "client_mid": client_mid,
+                    "status": "sent", "message": existing,
+                }, ensure_ascii=False)
+
+            msg_record = messages_cursor.add_message(
+                uid, target_uid, snapshot_content,
+                content_type='redirect', group_id=group_id,
+                client_mid=client_mid,
+                forwarded=selected[-1]["mid"] if selected else -1,
+            )
+            if msg_record.get("duplicate"):
+                existing = messages_cursor.get_message(msg_record["mid"])
+                return json.dumps({
+                    "mid": msg_record["mid"], "client_mid": client_mid,
+                    "status": "sent", "message": existing,
+                }, ensure_ascii=False)
+
+            # 推送
+            notif = build_notification(
+                "message.redirect", str(msg_record["send_time"]),
+                snapshot_content,
+                sender="G{}U{}".format(group_id, uid) if group_id else "U{}".format(uid),
+                meta={"quote": -1},
+            )
+            notif["mid"] = msg_record["mid"]
+            notif["client_mid"] = client_mid
+            notif["content_type"] = "redirect"
+            notif["quote"] = -1
+            notif["forwarded"] = msg_record["forwarded"]
+            notif["mentioned_uids"] = []
+
+            if group_id:
+                room_id = "G{}".format(group_id)
+                for user in group_cursor.get_member_uids(group_id):
+                    user_notif = dict(notif)
+                    user_notif["room_seq"] = msg_record.get("room_seq")
+                    user_notif["mentions_me"] = False
+                    user_notif["should_alert"] = user != uid
+                    instant_contact.push_message(user, user_notif)
+            else:
+                recv_notif = dict(notif)
+                recv_notif["room_id"] = "U{}".format(uid)
+                recv_notif["room_seq"] = msg_record.get("room_seq")
+                recv_notif["mentions_me"] = False
+                recv_notif["should_alert"] = True
+                sender_notif = dict(notif)
+                sender_notif["room_id"] = "U{}".format(target_uid)
+                sender_notif["room_seq"] = msg_record.get("room_seq")
+                sender_notif["mentions_me"] = False
+                sender_notif["should_alert"] = False
+                instant_contact.push_message(target_uid, recv_notif)
+                instant_contact.push_message(uid, sender_notif)
+
+            response_message = dict(msg_record)
+            response_message["content_type"] = "redirect"
             return json.dumps({
                 "mid": msg_record["mid"], "client_mid": client_mid,
                 "status": "sent", "message": response_message,
