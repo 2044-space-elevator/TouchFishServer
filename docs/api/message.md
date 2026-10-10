@@ -23,7 +23,7 @@ TFV5 的消息系统由两部分组成：
     "receiver_uid" : <receiver_uid>,
     "group_id" : <group_id>,
     "content" : <content>,
-    "content_type" : "plain" | "file",
+    "content_type" : "plain" | "file" | "redirect" | "event",
     "file_hash" : <file_hash>,
     "file_name" : <file_name_or_null>,
     "send_time" : <send_time>,
@@ -43,7 +43,7 @@ TFV5 的消息系统由两部分组成：
 
 - `<mid>`：服务端分配的消息唯一ID，自增。
 - `<client_mid>`：客户端生成的去重标识（可选）。同一 `client_mid` 的消息不会重复存储。
-- `<content_type>`：`"plain"` 表示文本消息，`"file"` 表示文件消息。
+- `<content_type>`：`"plain"` 表示文本消息，`"file"` 表示文件消息，`"redirect"` 表示合并转发快照，`"event"` 表示事件行（见下文"事件行"）。
 - `<file_hash>`：文件消息的取件码（参见[文件文档](file.md)）。
 - `<file_name>`：文件消息发送时固化的展示名称，用于发送者后来删除个人文件所有权后仍能正确展示历史消息。
 - `<quote>`：回复（引用）的消息 `mid`，`-1` 表示不回复其他消息。被回复消息必须属于同一私聊或群聊，且不能已经被撤回。
@@ -56,7 +56,25 @@ TFV5 的消息系统由两部分组成：
 - `<mentioned_uids>`：消息正文中通过 `@用户名` 提及的用户 uid 列表。仅在 `content_type` 为 `"plain"` 时有值。
 - `<room_id>`：聊天室标识，格式为 `"U<uid>"` 或 `"G<gid>"`。
 - `<room_key>`：房间规范化 key（私聊为排序后的 `U<min>U<max>`，群聊为 `G<gid>`），用于增量同步。
-- `<room_seq>`：房间内单调递增的消息序号（撤回也会递增），用于缺口检测与 `/message/sync` 增量同步。
+- `<room_seq>`：房间内单调递增的消息序号（撤回与事件行也会递增），用于缺口检测与 `/message/sync` 增量同步。
+
+#### 事件行
+
+事件行（`content_type = "event"`）是房间内的**变更通知**，随消息流一起分配 `room_seq` 并只经由 `/message/sync` 下发（声明 `event_stream_v1` 能力的客户端才会收到）。它们不是用户内容，历史消息、聊天列表、引用/转发来源、@提及解析均不会出现事件行。
+
+`content` 为版本化 JSON 信封：
+
+```json
+{
+    "v" : 1,
+    "kind" : "message.recalled",
+    "target_mid" : <被变更消息的 mid>
+}
+```
+
+- 当前唯一的 `kind` 是 `message.recalled`：目标消息已被撤回。客户端应把本地对应消息改为撤回占位（幂等）；对本地不存在的 `target_mid` 直接忽略（重新拉取的永远是物化后的状态）。
+- 服务端保留物化状态：被撤回消息本身仍按原规则脱敏与返回。事件行只是让离线客户端**无需重拉目标消息**就能获知变更。
+- 未来的变更类型（编辑、置顶、成员变动）通过新增 `kind` 扩展，客户端应忽略无法识别的 `kind`。
 
 ### 聊天室对象
 
@@ -72,6 +90,7 @@ TFV5 的消息系统由两部分组成：
     "last_time" : <last_time>,
     "last_sender_uid" : <last_sender_uid>,
     "last_mid" : <last_mid>,
+    "last_seq" : <last_seq>,
     "last_deleted" : <true_or_false>,
     "last_deleted_at" : <deleted_at>,
     "last_file" : <file_metadata_or_null>,
@@ -89,6 +108,7 @@ TFV5 的消息系统由两部分组成：
 - `alias` / `description`：当前用户对聊天室设置的备注名/描述（私有，仅自己可见）。首次访问或未设置时返回 `null`。
 - `last_deleted`：最后一条消息是否已撤回。为 `true` 时 `last_content` 为 `null`。
 - `last_file`：最后一条未撤回消息为文件消息时的文件元数据，否则为 `null`。
+- `last_seq`：该房间当前序号（含墓碑与事件行，与 `/message/sync` 的 `current_seq` 同语义）；聊天室尚无消息时为 `null`。本地没有任何同步游标时，客户端可直接用它在本地建立基线，免去一次 `/message/sync` 往返。
 
 ---
 
@@ -241,9 +261,13 @@ TFV5 的消息系统由两部分组成：
 
 ```json
 {
-
+    "limit" : <limit>,
+    "offset" : <offset>
 }
 ```
+
+`limit` / `offset`（可选，均需 ≥0）：对按最后消息时间降序排列的结果做分页；
+`limit = 0`（默认）表示不限制。老客户端不传时返回全量，行为不变。
 
 返回体：
 
@@ -260,12 +284,14 @@ TFV5 的消息系统由两部分组成：
         "last_time" : <last_time>,
         "last_sender_uid" : <last_sender_uid>,
         "last_mid" : <last_mid>,
+        "last_seq" : <last_seq_or_null>,
         "last_deleted" : <true_or_false>,
         "last_deleted_at" : <deleted_at>,
         "last_file" : <file_metadata_or_null>,
         "is_friend" : <true_or_false>,
         "is_pinned" : <true_or_false>,
-        "notify_level" : <0_or_1_or_2>
+        "notify_level" : <0_or_1_or_2>,
+        "unread_count" : <unread_count>
     }
 ]
 ```
@@ -274,6 +300,9 @@ TFV5 的消息系统由两部分组成：
 - 包含所有私聊和群聊会话，按最后消息时间降序排列。
 - 尚无消息的好友也会出现在列表中（`last_mid` 为 `null`）。
 - `room_type = "direct"` 时 `is_friend` 表示当前是否仍为好友关系。
+- `last_seq` 语义见「聊天室对象」；`last_mid` 与 `last_seq` 均来自最后一条**非事件行**消息所在房间的当前状态。
+- `unread_count`：该房间的服务端未读条数。统计口径为 `room_seq` 高于本用户已读水位、非本人发送、非事件行、且未删除的消息数。`notify_level = 2`（免打扰）恒为 `0`；`notify_level = 1`（仅 @）只统计 @ 了本用户的消息。
+- **水位初始化语义**：首次拉取会话列表时，若某房间尚无已读水位，服务端会以该房间当前最大 `room_seq` 建立基线（视为历史已读）。因此新设备首次 `/chat/list` 不会把房间历史整体算作未读。此后未读随对方消息（WS 实时或离线补拉）增长，进入房间上报 `message.read` 后归零。
 
 ---
 
@@ -330,6 +359,12 @@ TFV5 的消息系统由两部分组成：
 
 消息按 `mid` 降序排列（最新在前）。已撤回消息不会被过滤，而是按照“消息对象”一节中的脱敏规则返回占位。`quote_preview` 和 `forward_preview` 分别给出回复目标与转发来源摘要。
 
+权限：
+
+- 私聊需要双方为好友。
+- 群聊需要操作者为群成员。
+- **例外**：若群开启了 `public_messages`（见 [group.md](group.md) 的群设置/群组预览），非成员也可只读拉取该群历史消息，此时 `limit` 强制不超过 50。此只读预览**不推进未读水位**；发送消息、增量同步、实时推送对非成员仍一律拒绝。
+
 ---
 
 ### 增量同步
@@ -349,6 +384,7 @@ TFV5 的消息系统由两部分组成：
     "last_mid" : <last_mid>,
     "missing_sequences" : [<seq>, ...],
     "missing_sequence_ranges" : [{"start_seq": <s>, "end_seq": <e>}, ...],
+    "capabilities" : ["event_stream_v1"],
     "limit" : <limit>
 }
 ```
@@ -359,6 +395,7 @@ TFV5 的消息系统由两部分组成：
 - `<last_seq>`（可选）上次同步到的房间序号；与 `last_mid` 同时提供时优先按 `last_seq`。
 - `<last_mid>`（可选）旧客户端迁移期使用：服务端先校验该 `mid` 属于目标房间，再转换为房间序号；已撤回的旧消息会按其新的墓碑序号返回。不存在或跨房间的 `mid` 会拒绝请求。
 - `<missing_sequences>` / `<missing_sequence_ranges>`（可选）精确缺口：客户端检测到序号跳跃后按缺失序号/区间补拉。序号列表最多 200 项，区间最多 50 段，每段最多 200 个序号，展开后的去重总数最多 200；超限或格式无效时请求失败。
+- `<capabilities>`（可选）客户端能力声明。包含 `"event_stream_v1"` 时返回结果中会包含事件行；未声明（旧客户端）时事件行被过滤，被过滤的序号在客户端表现为永久空洞，由既有的墓碑空洞处理逻辑消化。
 - `<limit>`（可选，默认 `100`，上限 `200`）每批条数。
 
 返回体：
@@ -371,7 +408,7 @@ TFV5 的消息系统由两部分组成：
 }
 ```
 
-消息按 `room_seq` 升序排列。`has_more` 只表示增量查询（不含额外缺口补拉）是否还有下一页；为 `true` 时客户端应以增量结果的最大序号作为 `last_seq` 继续翻页，直到 `has_more` 为 `false`。已撤回消息（墓碑）也会返回，客户端按 `mid` 覆盖本地记录即可。
+消息按 `room_seq` 升序排列。`has_more` 只表示增量查询（不含额外缺口补拉）是否还有下一页；为 `true` 时客户端应以增量结果的最大序号作为 `last_seq` 继续翻页，直到 `has_more` 为 `false`。已撤回消息（墓碑）也会返回，客户端按 `mid` 覆盖本地记录即可。声明了 `event_stream_v1` 的客户端还会收到事件行（见"事件行"），处理方式与墓碑一致：按语义应用、忽略未知目标。
 
 #### 房间序号（room_seq）不变式
 
@@ -382,8 +419,7 @@ TFV5 的消息系统由两部分组成：
 1. **只增不减**：新消息在写锁内分配 `MAX(room_seq) + 1`，序号不复用（`add_message`）。
 2. **撤回把行挪到序列末尾**：撤回将该行更新为 `deleted = 1` 并取新的 `MAX(room_seq) + 1` 作为墓碑序号（`recall_message`），原位置成为**空**，不会再有消息占据该序号。
 3. **无物理删除**：所有删除均为软删除，序号空间单调增长。
-
-违背以上不变式的行为可能导致客户端行为异常。
+4. **撤回双写事件行**：撤回在墓碑之后追加一条 `message.recalled` 事件行（再占一个 `MAX(room_seq) + 1`）。这是过渡期兼容设计：墓碑迁移保证旧客户端行为不变，事件行供声明能力的客户端消费；后续版本会改为只写事件行、不再迁移墓碑。
 
 ---
 
@@ -434,6 +470,8 @@ TFV5 的消息系统由两部分组成：
 失败返回 `success = false`，`error` 为 `invalid_request`、`auth_failed`、`not_found`、`forbidden` 或 `already_recalled`。
 
 撤回是软删除：原始正文和文件哈希仍保留在数据库中；普通历史、聊天列表、回复摘要和实时事件只能看到脱敏后的撤回占位。撤回文件消息不会减少文件引用计数。
+
+撤回同时会向房间追加一条 `message.recalled` 事件行（见"事件行"），供离线/声明能力的客户端在增量同步中直接获知变更；事件行与墓碑共用同一套 `room_seq` 序列。撤回一条事件行本身会被拒绝（返回 `already_recalled`）。
 
 ### 查看被撤回消息原文（Root）
 
@@ -690,7 +728,39 @@ TFV5 的消息系统由两部分组成：
 }
 ```
 
-该事件不包含被撤回消息的原始正文或文件哈希。客户端应将对应本地消息改为撤回占位，并清除引用该消息的缓存摘要。撤回同时递增房间 `room_seq`，离线客户端重连后通过 `/message/sync` 收到墓碑记录。被撤回消息的**原位序号**成为永久空洞，客户端应将其从缺口队列移除（见上文"房间序号不变式"）。
+该事件不包含被撤回消息的原始正文或文件哈希。客户端应将对应本地消息改为撤回占位，并清除引用该消息的缓存摘要。撤回同时递增房间 `room_seq`，离线客户端重连后通过 `/message/sync` 收到墓碑记录与 `message.recalled` 事件行（声明能力时）。被撤回消息的**原位序号**成为永久空洞，客户端应将其从缺口队列移除（见上文"房间序号不变式"）。
+
+### 已读回执
+
+客户端进入聊天室并看到新消息后，可上报已读水位，服务端会将该回执转发给同账号的其它在线连接（多端已读同步）：
+
+请求（secret 加密后）：
+
+```json
+{
+    "type" : "message.read",
+    "room_id" : "<room_id>",
+    "last_mid" : <last_mid>
+}
+```
+
+- `<room_id>`：客户端视角的聊天室标识；服务端会校验发送者对该房间的访问权限。
+- `<last_mid>`：已读到的最后一条消息 `mid`（必须是该房间内的消息，否则静默忽略）。
+
+服务端不回 ACK，也**不会**把回执发给聊天对方（无对方已读功能）。同账号其它连接会收到：
+
+```json
+{
+    "type" : "message.read",
+    "room_id" : "<room_id>",
+    "uid" : <uid>,
+    "last_mid" : <last_mid>,
+    "last_seq" : <对应房间序号>,
+    "ts" : <服务器毫秒时间戳>
+}
+```
+
+多端已读水位单调不回退；发送消息时服务端会自动把发送者自己的水位推进到该消息。该请求限流为每秒 5 次，超限静默丢弃。
 
 ### 消息置顶推送
 

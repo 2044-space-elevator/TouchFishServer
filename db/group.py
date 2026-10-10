@@ -31,7 +31,8 @@ class GroupDb(Db):
                 introduction TEXT,
                 allow_direct_join INTEGER NOT NULL DEFAULT 0,
                 require_review INTEGER NOT NULL DEFAULT 1,
-                essence TEXT
+                essence TEXT,
+                public_messages INTEGER NOT NULL DEFAULT 0
             )
         """)
         self.execute("""
@@ -41,7 +42,8 @@ class GroupDb(Db):
                 uid INTEGER NOT NULL,
                 inviter_uid INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'pending',
-                request_time REAL NOT NULL
+                request_time REAL NOT NULL,
+                message TEXT NOT NULL DEFAULT ''
             )
         """)
         self.execute("""
@@ -120,6 +122,14 @@ class GroupDb(Db):
             pass
         try:
             self.execute("ALTER TABLE groups ADD COLUMN essence_enabled INTEGER NOT NULL DEFAULT 1")
+        except Exception:
+            pass
+        try:
+            self.execute("ALTER TABLE groups ADD COLUMN public_messages INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            self.execute("ALTER TABLE join_requests ADD COLUMN message TEXT NOT NULL DEFAULT ''")
         except Exception:
             pass
         self.execute("""
@@ -220,11 +230,61 @@ class GroupDb(Db):
         return self._hydrate_group_rows(rows)
 
     def groupname_search(self, groupname: str):
-        rows = self.query(
-            "SELECT * FROM groups WHERE groupname LIKE ?",
-            ('%' + groupname + '%',),
+        """[deprecated] 群名搜索。
+        """
+        if not isinstance(groupname, str):
+            return []
+        escaped = (
+            groupname.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         )
-        return self._hydrate_group_rows(rows)
+        rows = self.query(
+            "SELECT * FROM groups WHERE groupname LIKE ? ESCAPE '\\' "
+            "ORDER BY gid ASC LIMIT 50",
+            ('%' + escaped + '%',),
+        )
+        results = []
+        for row in rows:
+            r = list(row)
+            r[3] = "[]"
+            r[4] = "[]"
+            results.append(r)
+        return results
+
+    def search_public(self, keyword: str, limit: int = 20, offset: int = 0):
+        """按群名搜索，仅返回公开字段
+
+        返回 (groups, has_more)，groups 为 dict 列表。
+        """
+        escaped = (
+            keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        prefix = escaped + "%"
+        contains = "%" + escaped + "%"
+        rows = self.query(
+            """SELECT g.gid, g.groupname, g.introduction,
+                      (SELECT COUNT(*) FROM group_members gm WHERE gm.gid = g.gid) AS member_count,
+                      g.allow_direct_join, g.require_review, g.public_messages
+               FROM groups g
+               WHERE g.groupname LIKE ? ESCAPE '\\'
+               ORDER BY CASE WHEN g.groupname LIKE ? ESCAPE '\\' THEN 0 ELSE 1 END,
+                        g.gid ASC
+               LIMIT ? OFFSET ?""",
+            (contains, prefix, limit + 1, offset),
+        )
+        has_more = len(rows) > limit
+        groups = [
+            {
+                "gid": r[0],
+                "groupname": r[1],
+                "introduction": r[2] or "",
+                "member_count": r[3],
+                "allow_direct_join": bool(r[4]),
+                "require_review": bool(r[5]),
+                "public_messages": bool(r[6]),
+            }
+            for r in rows[:limit]
+        ]
+        return groups, has_more
 
     def get_member_uids(self, gid: int) -> list:
         rows = self.query(
@@ -239,6 +299,24 @@ class GroupDb(Db):
             (gid,),
         )
         return [row[0] for row in rows]
+
+    def get_preview_members(self, gid: int, limit: int = 10) -> list:
+        """预展示成员：所有者/管理员优先，返回 [(uid, role)]，最多 limit"""
+        rows = self.query(
+            """SELECT uid, role FROM group_members WHERE gid = ?
+               ORDER BY (CASE role WHEN 2 THEN 0 WHEN 1 THEN 1 ELSE 2 END),
+                        join_time ASC, uid ASC
+               LIMIT ?""",
+            (gid, limit),
+        )
+        return [(row[0], row[1]) for row in rows]
+
+    def count_members(self, gid: int) -> int:
+        rows = self.query(
+            "SELECT COUNT(*) FROM group_members WHERE gid = ?",
+            (gid,),
+        )
+        return rows[0][0] if rows else 0
 
     def is_admin(self, gid: int, uid: int) -> int:
         """0=member or non-member, 1=admin, 2=owner."""
@@ -258,7 +336,7 @@ class GroupDb(Db):
     def get_group_settings(self, gid: int) -> dict:
         row = self.query(
             """SELECT gid, creater, groupname, enter_hint, introduction,
-                      allow_direct_join, require_review, essence_enabled
+                      allow_direct_join, require_review, essence_enabled, public_messages
                FROM groups WHERE gid = ?""",
             (gid,),
         )
@@ -270,6 +348,7 @@ class GroupDb(Db):
             "enter_hint": r[3], "introduction": r[4],
             "allow_direct_join": bool(r[5]), "require_review": bool(r[6]),
             "essence_enabled": bool(r[7]) if r[7] is not None else True,
+            "public_messages": bool(r[8]) if r[8] is not None else False,
         }
 
     def get_essence_enabled(self, gid: int) -> bool:
@@ -429,7 +508,8 @@ class GroupDb(Db):
 
     def update_settings(self, gid: int, **kwargs) -> bool:
         allowed = {"groupname", "enter_hint", "introduction",
-                   "allow_direct_join", "require_review", "essence_enabled"}
+                   "allow_direct_join", "require_review", "essence_enabled",
+                   "public_messages"}
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         if not updates:
             return False
@@ -439,6 +519,8 @@ class GroupDb(Db):
             updates["require_review"] = int(updates["require_review"])
         if "essence_enabled" in updates:
             updates["essence_enabled"] = int(updates["essence_enabled"])
+        if "public_messages" in updates:
+            updates["public_messages"] = int(updates["public_messages"])
         set_clause = ", ".join("{} = ?".format(k) for k in updates)
         self.execute(
             "UPDATE groups SET {} WHERE gid = ?".format(set_clause),
@@ -446,7 +528,9 @@ class GroupDb(Db):
         )
         return True
 
-    def request_join(self, gid: int, uid: int, inviter_uid: int = 0) -> int:
+    def request_join(self, gid: int, uid: int, inviter_uid: int = 0,
+                     message: str = '') -> int:
+        """创建入群申请；已有 pending 时只更新最新留言与时间（保留原 rid，不新增行）。"""
         with self.lock:
             def operation():
                 self.cursor.execute(
@@ -455,11 +539,16 @@ class GroupDb(Db):
                 )
                 existing = self.cursor.fetchone()
                 if existing:
+                    self.cursor.execute(
+                        "UPDATE join_requests SET message = ?, request_time = ? WHERE rid = ?",
+                        (message, time.time(), existing[0]),
+                    )
+                    self.conn.commit()
                     return existing[0]
                 self.cursor.execute(
-                    """INSERT INTO join_requests (gid, uid, inviter_uid, status, request_time)
-                       VALUES (?, ?, ?, 'pending', ?)""",
-                    (gid, uid, inviter_uid, time.time()),
+                    """INSERT INTO join_requests (gid, uid, inviter_uid, status, request_time, message)
+                       VALUES (?, ?, ?, 'pending', ?, ?)""",
+                    (gid, uid, inviter_uid, time.time(), message),
                 )
                 rid = self.cursor.lastrowid
                 self.conn.commit()
@@ -469,13 +558,13 @@ class GroupDb(Db):
 
     def get_join_requests(self, gid: int, status: str = 'pending') -> list:
         rows = self.query(
-            """SELECT rid, gid, uid, inviter_uid, status, request_time
+            """SELECT rid, gid, uid, inviter_uid, status, request_time, message
                FROM join_requests WHERE gid = ? AND status = ? ORDER BY request_time DESC""",
             (gid, status),
         )
         return [
             {"rid": r[0], "gid": r[1], "uid": r[2], "inviter_uid": r[3],
-             "status": r[4], "request_time": r[5]}
+             "status": r[4], "request_time": r[5], "message": r[6] or ""}
             for r in rows
         ]
 

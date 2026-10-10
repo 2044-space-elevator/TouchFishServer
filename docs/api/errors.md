@@ -37,9 +37,20 @@
 | `AUTH_NOT_AUTHENTICATED` | Authentication required | 401 |
 | `AUTH_TOKEN_EXPIRED` | Token has expired | 401 |
 | `AUTH_TOKEN_LIMIT_REACHED` | Maximum number of active sessions reached | 403 |
+| `EXTERNAL_TOKEN_INVALID` | External token is invalid | 401 |
+| `EXTERNAL_NOT_LINKED` | External identity is not linked to a local account | 403 |
+| `EXTERNAL_ALREADY_LINKED` | External identity is already linked | 409 |
 | `PERMISSION_DENIED` | You do not have permission to perform this action | 403 |
 | `PERMISSION_NOT_FRIENDS` | Users are not friends | 403 |
+| `FRIEND_BLOCKED` | This user is not accepting friend requests | 403 |
 | `PERMISSION_NOT_GROUP_MEMBER` | User is not a member of this group | 403 |
+| `FEATURE_DISABLED_PRIVATE_CHAT` | Private chat is disabled on this server | 403 |
+| `FEATURE_DISABLED_GROUP_CHAT` | Group chat is disabled on this server | 403 |
+| `FEATURE_DISABLED_GROUP_CREATE` | Creating groups is disabled on this server | 403 |
+| `FEATURE_DISABLED_FRIEND_REQUEST` | Friend requests are disabled on this server | 403 |
+| `FEATURE_DISABLED_FORUM` | The forum is disabled on this server | 403 |
+| `FEATURE_DISABLED_STICKER` | Stickers are disabled on this server | 403 |
+| `FEATURE_DISABLED_ANNOUNCEMENT` | Announcements are disabled on this server | 403 |
 | `RESOURCE_NOT_FOUND` | Requested resource was not found | 404 |
 | `RESOURCE_USER_NOT_FOUND` | User does not exist | 404 |
 | `RESOURCE_GROUP_NOT_FOUND` | Group does not exist | 404 |
@@ -51,6 +62,7 @@
 | 错误码 | `error_message` | HTTP |
 | --- | --- | ---: |
 | `VALIDATION_INVALID_REQUEST` | Request parameters are invalid | 400 |
+| `VALIDATION_SEARCH_KEYWORD_TOO_SHORT` | Search keyword is too short | 400 |
 | `VALIDATION_INVALID_UID` | User ID is invalid | 400 |
 | `VALIDATION_INVALID_FILENAME` | Filename is invalid | 400 |
 | `VALIDATION_EXTENSION_NOT_ALLOWED` | File extension is not allowed | 400 |
@@ -61,6 +73,7 @@
 | `VALIDATION_INVALID_QUOTE` | Quoted message is invalid | 400 |
 | `VALIDATION_INVALID_CALL_ID` | Call ID is invalid | 400 |
 | `VALIDATION_MESSAGE_TOO_LONG` | Message is too long | 400 |
+| `VALIDATION_REQUEST_MESSAGE_TOO_LONG` | Request message is too long | 400 |
 | `VALIDATION_MISSING_PARAMETER` | A required parameter is missing | 400 |
 | `CAPTCHA_INVALID` | Captcha is invalid or expired, please refresh | 400 |
 

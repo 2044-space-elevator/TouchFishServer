@@ -63,7 +63,46 @@ TFV5 群聊系统支持创建群组、成员管理、管理员管理、入群审
 
 请求体：无（public 接口）。
 
-返回：一个数组，分别为 `[gid, creater, groupname, members, admins, enter_hint, introduction, allow_direct_join, require_review]`。若群不存在返回 `{}`。
+返回：一个数组，前 5 项为 `[gid, creater, groupname, members, admins]`，其后依次为 `enter_hint, introduction, allow_direct_join, require_review, essence, ...`。若群不存在返回 `{}`。
+
+> `members`/`admins` 恒为 `"[]"`（不返回成员 uid 列表）。需要成员信息请使用 `POST /group/members`（仅成员）或 `POST /group/preview`（任意登录用户）。
+
+---
+
+### 群组预览
+
+- `^ POST /group/preview` 群组预览，任意登录用户可查看（加入前预览用）。
+
+请求体：
+
+```json
+{
+    "gid" : <gid>
+}
+```
+
+返回体：
+
+```json
+{
+    "gid" : <gid>,
+    "groupname" : <groupname>,
+    "introduction" : <introduction>,
+    "member_count" : <int>,
+    "is_member" : <true_or_false>,
+    "allow_direct_join" : <true_or_false>,
+    "require_review" : <true_or_false>,
+    "public_messages" : <true_or_false>,
+    "essence_enabled" : <true_or_false>,
+    "members" : [
+        { "uid" : <uid>, "username" : <username>, "role" : "owner" | "admin" | "member" }
+    ]
+}
+```
+
+- `members` 最多返回 10 个，群主/管理员优先。
+- `enter_hint` 仅当操作者本身是群成员时才包含（非成员预览不返回入群提示）。
+- `public_messages` 为 `true` 时，非成员可通过 `POST /message/history` 只读拉取该群历史消息（见 [message.md](message.md)）。
 
 ---
 
@@ -71,9 +110,12 @@ TFV5 群聊系统支持创建群组、成员管理、管理员管理、入群审
 
 - `* GET /group/groupname_search/<groupname>` 按群名模糊搜索。
 
+> **已废弃**：仅为兼容老客户端保留。返回结构不变，但成员/管理员列表已清空为 `"[]"`，结果上限 50。
+> 新客户端请使用 [搜索文档](search.md) 中的 `POST /group/search`。
+
 请求体：无（public 接口）。
 
-返回：匹配的群聊列表，每项格式同上。
+返回：匹配的群聊列表，每项格式同上（`members`/`admins` 恒为 `[]`）。
 
 ---
 
@@ -101,7 +143,9 @@ TFV5 群聊系统支持创建群组、成员管理、管理员管理、入群审
     "enter_hint" : <enter_hint>,
     "introduction" : <introduction>,
     "allow_direct_join" : <true_or_false>,
-    "require_review" : <true_or_false>
+    "require_review" : <true_or_false>,
+    "essence_enabled" : <true_or_false>,
+    "public_messages" : <true_or_false>
 }
 ```
 
@@ -120,11 +164,15 @@ TFV5 群聊系统支持创建群组、成员管理、管理员管理、入群审
     "enter_hint" : <new_enter_hint>,
     "introduction" : <new_introduction>,
     "allow_direct_join" : <true_or_false>,
-    "require_review" : <true_or_false>
+    "require_review" : <true_or_false>,
+    "essence_enabled" : <true_or_false>,
+    "public_messages" : <true_or_false>
 }
 ```
 
 以上字段均为可选，只更新传入的字段。仅群主（`is_admin == 2`）可操作。
+
+> `public_messages` 为 `true` 时允许非群成员只读查看该群历史消息。
 
 返回：更新成功返回时间戳加 `True`，失败返回时间戳加 `False`。
 
@@ -177,15 +225,19 @@ TFV5 群聊系统支持创建群组、成员管理、管理员管理、入群审
 
 ```json
 {
-    "gid" : <gid>
+    "gid" : <gid>,
+    "message" : <request_message>
 }
 ```
 
 需要群设置为 `allow_direct_join = true`。
 
+`<request_message>`（可选）为申请留言，长度上限为服务器配置 `max_request_message_length`（默认 200），
+超长返回 `request_message_too_long`。重复申请时只更新最新留言与时间，不新增申请记录。
+
 返回：
 - 若无需审核（`require_review = false`），直接加入成功返回 `{"pending": false}`。
-- 若需审核，创建入群申请，返回 `{"rid": <rid>, "pending": true}`。群主和所有管理员会收到 `group.join.request` 通知。
+- 若需审核，创建入群申请，返回 `{"rid": <rid>, "pending": true}`。群主和所有管理员会收到 `group.join.request` 通知（通知 meta 携带 `message`）。
 - 失败返回时间戳加 `False`。
 
 ---
@@ -199,11 +251,15 @@ TFV5 群聊系统支持创建群组、成员管理、管理员管理、入群审
 ```json
 {
     "gid" : <gid>,
-    "invited_uid" : <invited_uid>
+    "invited_uid" : <invited_uid>,
+    "message" : <invite_message>
 }
 ```
 
 需要操作者为群成员，且被邀请者为操作者的好友。
+
+`<invite_message>`（可选）为走审核流程时的邀请留言（长度约束同 `/group/join` 的 `message`）；
+免审直入路径不使用该字段。重复邀请同样只更新最新留言与时间。
 
 返回：
 - 若群无需审核（`require_review = false`）或邀请者是管理员/群主，被邀请者直接加入，返回 `{"pending": false}`。被邀请者收到 `group.invited` 通知。
@@ -237,12 +293,14 @@ TFV5 群聊系统支持创建群组、成员管理、管理员管理、入群审
         "inviter_uid" : <inviter_uid>,
         "inviter_name" : <inviter_name>,
         "status" : "pending",
-        "request_time" : <timestamp>
+        "request_time" : <timestamp>,
+        "message" : <request_message>
     }
 ]
 ```
 
 其中 `inviter_uid` 为 0 表示申请人自行申请；非 0 表示由某群成员邀请。
+`message` 为申请/邀请留言，可为空字符串。
 
 ---
 

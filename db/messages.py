@@ -1,8 +1,14 @@
 from db.tool import Db
+import json
 import time
 
 
 class MessagesDb(Db):
+    # 事件行：content 为版本化 JSON 信封，随消息流同步（占 room_seq），
+    # 但不是用户可见内容
+    EVENT_CONTENT_TYPE = "event"
+    EVENT_VERSION = 1
+
     def __init__(self, path: str, port_api: int, dialect=None):
         super().__init__(path, port_api, -1, dialect=dialect)
         self._create_table()
@@ -17,6 +23,20 @@ class MessagesDb(Db):
         lo, hi = (sender_uid, receiver_uid) if sender_uid < receiver_uid \
             else (receiver_uid, sender_uid)
         return "U{}U{}".format(lo, hi)
+
+    @classmethod
+    def build_event_content(cls, kind: str, **fields) -> str:
+        payload = {"v": cls.EVENT_VERSION, "kind": kind}
+        payload.update(fields)
+        return json.dumps(payload, ensure_ascii=False)
+
+    @staticmethod
+    def parse_event_content(content: str):
+        try:
+            payload = json.loads(content) if content else None
+        except (TypeError, ValueError):
+            return None
+        return payload if isinstance(payload, dict) else None
 
     def _create_table(self):
         self.execute("""
@@ -75,6 +95,16 @@ class MessagesDb(Db):
                 pinned_by_uid INTEGER NOT NULL,
                 created_at REAL NOT NULL,
                 UNIQUE(message_id, group_id)
+            )
+        """)
+        self.execute("""
+            CREATE TABLE IF NOT EXISTS room_read_state (
+                uid INTEGER NOT NULL,
+                room_key TEXT NOT NULL,
+                last_read_seq INTEGER NOT NULL DEFAULT 0,
+                last_read_mid INTEGER NOT NULL DEFAULT 0,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (uid, room_key)
             )
         """)
 
@@ -136,6 +166,8 @@ class MessagesDb(Db):
                ON messages(sender_uid, client_mid) WHERE client_mid IS NOT NULL""",
             """CREATE INDEX IF NOT EXISTS idx_messages_room_seq
                ON messages(room_key, room_seq)""",
+            """CREATE INDEX IF NOT EXISTS idx_messages_room_mid
+               ON messages(room_key, mid DESC)""",
         ]
         for idx_sql in indexes:
             try:
@@ -168,6 +200,8 @@ class MessagesDb(Db):
                           file_hash, send_time, quote, file_name, forwarded, duration, room_key, room_seq),
                     )
                     mid = self.cursor.lastrowid
+                    # 发送即已读：自己的新消息自动推进自己在房间内的已读水位
+                    self._advance_read_watermark_locked(sender_uid, room_key, room_seq, mid)
                     self.conn.commit()
                     return mid, room_seq, False
                 except _IntegrityError:
@@ -210,15 +244,15 @@ class MessagesDb(Db):
     def query_history(self, uid: int, target_uid: int,
                       before_mid: int = 0, limit: int = 50,
                       group_id: int = None) -> list:
-        """返回历史消息，按 mid 倒序排列。"""
-        if group_id is not None:
-            where = "group_id = ?"
-            params = [group_id]
-        else:
-            where = ("group_id IS NULL AND "
-                     "((sender_uid = ? AND receiver_uid = ?) "
-                     "OR (sender_uid = ? AND receiver_uid = ?))")
-            params = [uid, target_uid, target_uid, uid]
+        """返回历史消息，按 mid 倒序排列。
+
+        按规范 room_key 检索（命中 (room_key, mid) 索引，LIMIT 可提前终止）；
+        不能用 room_seq 排序：撤回会把行搬到序列末尾，room_seq 与 mid 不同序。
+        调用方负责成员/好友资格校验。
+        """
+        room_key = self.room_key_of(uid, target_uid, group_id)
+        where = "room_key = ? AND content_type != 'event'"
+        params = [room_key]
 
         if before_mid > 0:
             where += " AND mid < ?"
@@ -232,31 +266,35 @@ class MessagesDb(Db):
         return self.query(sql, tuple(params))
 
     def query_sync(self, room_key: str, after_seq: int = 0,
-                   after_mid: int = 0, limit: int = 100) -> list:
+                   after_mid: int = 0, limit: int = 100,
+                   include_events: bool = True) -> list:
         """按房间增量同步：优先按 room_seq，其次按 mid，升序返回。
 
         返回 serialized rows（含 room_seq），配合 current_seq 使用。
+        include_events=False 时过滤事件行（旧的、未声明事件流能力的客户端；
+        被过滤的 seq 在客户端表现为永久空洞，由其既有墓碑空洞逻辑消化）。
         """
         if after_seq < 0:
             after_seq = 0
         if after_mid < 0:
             after_mid = 0
+        event_filter = "" if include_events else " AND content_type != 'event'"
         if after_seq > 0:
             rows = self.query(
-                "{} WHERE room_key = ? AND room_seq > ? "
-                "ORDER BY room_seq ASC LIMIT ?".format(self._SELECT_ALL),
+                "{} WHERE room_key = ? AND room_seq > ?{} "
+                "ORDER BY room_seq ASC LIMIT ?".format(self._SELECT_ALL, event_filter),
                 (room_key, after_seq, limit),
             )
         elif after_mid > 0:
             rows = self.query(
-                "{} WHERE room_key = ? AND mid > ? "
-                "ORDER BY mid ASC LIMIT ?".format(self._SELECT_ALL),
+                "{} WHERE room_key = ? AND mid > ?{} "
+                "ORDER BY mid ASC LIMIT ?".format(self._SELECT_ALL, event_filter),
                 (room_key, after_mid, limit),
             )
         else:
             rows = self.query(
-                "{} WHERE room_key = ? "
-                "ORDER BY room_seq ASC LIMIT ?".format(self._SELECT_ALL),
+                "{} WHERE room_key = ?{} "
+                "ORDER BY room_seq ASC LIMIT ?".format(self._SELECT_ALL, event_filter),
                 (room_key, limit),
             )
         return self.serialize_rows(rows)
@@ -277,15 +315,17 @@ class MessagesDb(Db):
         # recall_message moves the old mid to a new sequence; include that tombstone.
         return max(cursor[0] - 1, 0) if cursor[1] else cursor[0]
 
-    def query_missing_sequences(self, room_key: str, sequences: list) -> list:
+    def query_missing_sequences(self, room_key: str, sequences: list,
+                                include_events: bool = True) -> list:
         """按具体房间序号（缺失缺口）取消息，升序返回 serialized rows。"""
         sequences = sorted({int(s) for s in sequences if s is not None})
         if not sequences:
             return []
         placeholders = ",".join("?" * len(sequences))
+        event_filter = "" if include_events else " AND content_type != 'event'"
         rows = self.query(
-            "{} WHERE room_key = ? AND room_seq IN ({}) "
-            "ORDER BY room_seq ASC".format(self._SELECT_ALL, placeholders),
+            "{} WHERE room_key = ? AND room_seq IN ({}){} "
+            "ORDER BY room_seq ASC".format(self._SELECT_ALL, placeholders, event_filter),
             tuple([room_key] + sequences),
         )
         return self.serialize_rows(rows)
@@ -451,26 +491,33 @@ class MessagesDb(Db):
     def get_chat_list(self, uid: int) -> list:
         """返回与每个用户的最新单聊消息。
         群聊由 API 接口单独合并。
+
+        last_seq 为该房间当前序号（含墓碑/事件行，与 /message/sync 的
+        current_seq 同语义），客户端可用它免一次基线往返。
         """
         rows = self.query(
-            """SELECT partner_uid, mid, client_mid, sender_uid, content, content_type, send_time,
-                       deleted, deleted_at, file_name
+            """SELECT
+                 CASE WHEN m.sender_uid = ? THEN m.receiver_uid ELSE m.sender_uid END AS partner_uid,
+                 m.mid, m.client_mid, m.sender_uid, m.content, m.content_type, m.send_time,
+                 m.deleted, m.deleted_at, m.file_name, seqs.room_current_seq
                FROM (
-                 SELECT
-                   CASE WHEN sender_uid = ? THEN receiver_uid ELSE sender_uid END AS partner_uid,
-                    mid, client_mid, sender_uid, content, content_type, send_time,
-                     deleted, deleted_at, file_name,
-                   ROW_NUMBER() OVER (
-                     PARTITION BY CASE WHEN sender_uid = ? THEN receiver_uid ELSE sender_uid END
-                     ORDER BY mid DESC
-                   ) AS rn
+                 SELECT room_key, MAX(mid) AS max_mid
                  FROM messages
                   WHERE group_id IS NULL
                    AND (sender_uid = ? OR receiver_uid = ?)
                    AND sender_uid != receiver_uid
-               ) AS ranked
-               WHERE rn = 1 AND partner_uid != ?
-               ORDER BY mid DESC""",
+                   AND content_type != 'event'
+                  GROUP BY room_key
+               ) AS latest
+               INNER JOIN messages m ON m.mid = latest.max_mid
+               INNER JOIN (
+                 SELECT room_key AS rk, MAX(room_seq) AS room_current_seq
+                 FROM messages
+                  WHERE group_id IS NULL
+                   AND (sender_uid = ? OR receiver_uid = ?)
+                  GROUP BY room_key
+               ) AS seqs ON seqs.rk = latest.room_key
+               ORDER BY m.mid DESC""",
             (uid, uid, uid, uid, uid)
         )
         return [
@@ -486,50 +533,40 @@ class MessagesDb(Db):
                 "last_deleted": bool(r[7]),
                 "last_deleted_at": r[8],
                 "last_file_name": r[9],
+                "last_seq": r[10],
             }
             for r in rows
         ]
 
-    def get_group_last_message(self, group_id: int) -> dict:
-        """返回群聊的最新消息，如果没有则返回 None。"""
-        rows = self.query(
-            """SELECT mid, sender_uid, content, content_type, send_time, deleted, deleted_at,
-                      file_name
-               FROM messages
-               WHERE group_id = ?
-               ORDER BY mid DESC LIMIT 1""",
-            (group_id,)
-        )
-        if not rows:
-            return None
-        return {
-            "mid": rows[0][0],
-            "sender_uid": rows[0][1],
-            "content": None if rows[0][5] else rows[0][2],
-            "content_type": rows[0][3],
-            "send_time": rows[0][4],
-            "deleted": bool(rows[0][5]),
-            "deleted_at": rows[0][6],
-            "file_name": rows[0][7],
-        }
-
     def get_group_last_messages(self, group_ids: list) -> dict:
-        """批量获取多个群聊的最新消息，单次查询。"""
+        """批量获取多个群聊的最新消息，单次查询。
+
+        last_seq 语义同 get_chat_list：房间当前序号（含墓碑/事件行），
+        由一次 GROUP BY 聚合取 MAX(room_seq)，替换逐群相关子查询。
+        """
         if not group_ids:
             return {}
         placeholders = ",".join("?" * len(group_ids))
         rows = self.query(
             """SELECT m.mid, m.sender_uid, m.content, m.content_type, m.send_time, m.group_id,
-                       m.deleted, m.deleted_at, m.file_name
-               FROM messages m
-               INNER JOIN (
+                       m.deleted, m.deleted_at, m.file_name, seqs.room_current_seq
+               FROM (
                    SELECT group_id, MAX(mid) AS max_mid
                    FROM messages
                     WHERE group_id IN ({})
+                      AND content_type != 'event'
                    GROUP BY group_id
-               ) latest ON m.group_id = latest.group_id AND m.mid = latest.max_mid
-            """.format(placeholders),
-            tuple(group_ids)
+               ) AS latest
+               INNER JOIN messages m
+                 ON m.group_id = latest.group_id AND m.mid = latest.max_mid
+               INNER JOIN (
+                   SELECT group_id AS gk, MAX(room_seq) AS room_current_seq
+                   FROM messages
+                    WHERE group_id IN ({})
+                   GROUP BY group_id
+               ) AS seqs ON seqs.gk = latest.group_id
+            """.format(placeholders, placeholders),
+            tuple(group_ids) + tuple(group_ids)
         )
         return {
             r[5]: {
@@ -537,6 +574,7 @@ class MessagesDb(Db):
                 "content_type": r[3], "send_time": r[4], "deleted": bool(r[6]),
                 "deleted_at": r[7],
                 "file_name": r[8],
+                "last_seq": r[9],
             }
             for r in rows
         }
@@ -544,13 +582,16 @@ class MessagesDb(Db):
     def verify_quote(self, quote_mid: int, sender_uid: int = 0,
                      target_uid: int = 0, group_id: int = None) -> bool:
         rows = self.query(
-            "SELECT sender_uid, receiver_uid, group_id, deleted FROM messages WHERE mid = ?",
+            "SELECT sender_uid, receiver_uid, group_id, deleted, content_type "
+            "FROM messages WHERE mid = ?",
             (quote_mid,)
         )
         if not rows:
             return False
         r = rows[0]
         if r[3]:  # deleted
+            return False
+        if r[4] == 'event':  # 事件行不是用户内容，不能引用
             return False
         if group_id is not None:
             return r[2] == group_id
@@ -615,21 +656,28 @@ class MessagesDb(Db):
         )
         return self.get_message(rows[0][0]) if rows else None
 
-    def recall_message(self, mid: int, deleted_by: int) -> int:
-        """撤回消息：置 deleted 并递增该房间 room_seq（离线端经 sync 收墓碑）。
+    def recall_message(self, mid: int, deleted_by: int, emit_event: bool = True) -> int:
+        """撤回消息：置 deleted 并把该行搬到序列末尾
 
-        返回新的 room_seq（>0 表示成功），失败返回 0。
+        事件轨道（双写过渡）：同时追加一条 message.recalled 事件行占用新 room_seq，
+        声明了 event_stream_v1 能力的客户端经 sync 消费；未声明能力的客户端
+        在 sync 中被过滤、把被过滤的 seq 当作永久空洞处理。
+
+        emit_event=False 用于内部回滚（文件引用失败时撤销刚建的消息），不需要事件行。
+
+        返回墓碑的新 room_seq（>0 表示成功），失败返回 0。
         """
         with self.lock:
             def operation():
                 row = self.cursor.execute(
-                    "SELECT room_key FROM messages WHERE mid = ? AND deleted = 0",
-                    (mid,),
+                    "SELECT room_key, receiver_uid, group_id FROM messages "
+                    "WHERE mid = ? AND deleted = 0 AND content_type != ?",
+                    (mid, self.EVENT_CONTENT_TYPE),
                 ).fetchone()
                 if not row:
                     self.conn.commit()
                     return 0
-                room_key = row[0]
+                room_key, receiver_uid, group_id = row
                 max_row = self.cursor.execute(
                     "SELECT MAX(room_seq) FROM messages WHERE room_key = ?",
                     (room_key,),
@@ -641,6 +689,19 @@ class MessagesDb(Db):
                     (time.time(), deleted_by, room_seq, mid),
                 )
                 changed = self.cursor.rowcount > 0
+                if changed and emit_event:
+                    self.cursor.execute(
+                        """INSERT INTO messages
+                           (client_mid, sender_uid, receiver_uid, group_id, content, content_type,
+                             file_hash, send_time, quote, file_name, forwarded, duration, room_key, room_seq)
+                            VALUES (NULL, ?, ?, ?, ?, ?, NULL, ?, -1, NULL, -1, NULL, ?, ?)""",
+                        (deleted_by, receiver_uid, group_id,
+                         self.build_event_content("message.recalled", target_mid=mid),
+                         self.EVENT_CONTENT_TYPE, time.time(), room_key, room_seq + 1),
+                    )
+                    event_mid = self.cursor.lastrowid
+                    self._advance_read_watermark_locked(
+                        deleted_by, room_key, room_seq + 1, event_mid)
                 self.conn.commit()
                 return room_seq if changed else 0
             return self._execute_with_retry(operation)
@@ -745,6 +806,135 @@ class MessagesDb(Db):
             (uid, room_id, pinned, level, alias_value, description_value, time.time()),
         )
         return True
+
+    def _advance_read_watermark_locked(self, uid: int, room_key: str,
+                                       seq: int, mid: int) -> bool:
+        """推进已读（单调不回退）。调用方必须已持有 self.lock。"""
+        if not seq or seq <= 0:
+            return False
+        row = self.cursor.execute(
+            "SELECT last_read_seq FROM room_read_state WHERE uid = ? AND room_key = ?",
+            (uid, room_key),
+        ).fetchone()
+        if row and row[0] is not None and row[0] >= seq:
+            return False
+        if row:
+            self.cursor.execute(
+                "UPDATE room_read_state SET last_read_seq = ?, last_read_mid = ?, updated_at = ? "
+                "WHERE uid = ? AND room_key = ?",
+                (seq, mid, time.time(), uid, room_key),
+            )
+        else:
+            self.cursor.execute(
+                "INSERT INTO room_read_state(uid, room_key, last_read_seq, last_read_mid, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (uid, room_key, seq, mid, time.time()),
+            )
+        return True
+
+    def update_read_state(self, uid: int, room_key: str, last_seq: int,
+                          last_mid: int) -> bool:
+        """客户端上报已读（WS message.read）时调用。返回是否前进。"""
+        with self.lock:
+            def operation():
+                advanced = self._advance_read_watermark_locked(
+                    uid, room_key, last_seq, last_mid)
+                self.conn.commit()
+                return advanced
+            return self._execute_with_retry(operation)
+
+    def get_read_state(self, uid: int, room_key: str):
+        rows = self.query(
+            "SELECT last_read_seq, last_read_mid FROM room_read_state "
+            "WHERE uid = ? AND room_key = ?",
+            (uid, room_key),
+        )
+        if not rows:
+            return None
+        return {"last_read_seq": rows[0][0], "last_read_mid": rows[0][1]}
+
+    def init_read_watermarks(self, uid: int, room_keys) -> None:
+        """为尚无已读的房间建立 base（当前 MAX(room_seq)）。。
+        """
+        keys = [k for k in set(room_keys) if k]
+        if not keys:
+            return
+        placeholders = ",".join("?" * len(keys))
+        rows = self.query(
+            "SELECT room_key, MAX(room_seq) FROM messages "
+            "WHERE room_key IN ({}) GROUP BY room_key".format(placeholders),
+            tuple(keys),
+        )
+        existing = self.query(
+            "SELECT room_key FROM room_read_state "
+            "WHERE uid = ? AND room_key IN ({})".format(placeholders),
+            (uid,) + tuple(keys),
+        )
+        have = {r[0] for r in existing}
+        now = time.time()
+        values = [
+            (uid, key, int(seq or 0), 0, now)
+            for key, seq in rows
+            if key not in have
+        ]
+        if values:
+            self.update(
+                "INSERT OR IGNORE INTO room_read_state"
+                "(uid, room_key, last_read_seq, last_read_mid, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                values,
+            )
+
+    def _count_unread(self, uid: int, keys, mentions_only: bool = False) -> dict:
+        """统计未读：room_seq 高于、非自己发送、非事件行、未删除。"""
+        placeholders = ",".join("?" * len(keys))
+        if mentions_only:
+            sql = """SELECT m.room_key, COUNT(DISTINCT m.mid)
+                       FROM messages m
+                       JOIN message_mentions mm ON mm.mid = m.mid AND mm.uid = ?
+                       LEFT JOIN room_read_state r
+                         ON r.uid = ? AND r.room_key = m.room_key
+                      WHERE m.room_key IN ({})
+                        AND m.room_seq > COALESCE(r.last_read_seq, 0)
+                        AND m.sender_uid != ?
+                        AND m.content_type != 'event'
+                        AND m.deleted = 0
+                      GROUP BY m.room_key""".format(placeholders)
+            params = (uid, uid) + tuple(keys) + (uid,)
+        else:
+            sql = """SELECT m.room_key, COUNT(*)
+                       FROM messages m
+                       LEFT JOIN room_read_state r
+                         ON r.uid = ? AND r.room_key = m.room_key
+                      WHERE m.room_key IN ({})
+                        AND m.room_seq > COALESCE(r.last_read_seq, 0)
+                        AND m.sender_uid != ?
+                        AND m.content_type != 'event'
+                        AND m.deleted = 0
+                      GROUP BY m.room_key""".format(placeholders)
+            params = (uid,) + tuple(keys) + (uid,)
+        rows = self.query(sql, params)
+        return {r[0]: int(r[1]) for r in rows}
+
+    def bulk_unread_counts(self, uid: int, room_keys, notify_level_map=None) -> dict:
+        """批量计算各房间未读条数。
+
+        notify_level_map: room_key -> 0/1/2。level 2 恒为 0（免打扰），
+        level 1 只计 @了我 的消息，level 0 计全部（未在 map 中的按 0 处理）。
+        返回 room_key -> count（未读为 0 的房间省略）。
+        """
+        keys = [k for k in set(room_keys) if k]
+        if not keys:
+            return {}
+        notify_level_map = notify_level_map or {}
+        level0 = [k for k in keys if int(notify_level_map.get(k, 0)) == 0]
+        level1 = [k for k in keys if int(notify_level_map.get(k, 0)) == 1]
+        counts = {}
+        if level0:
+            counts.update(self._count_unread(uid, level0))
+        if level1:
+            counts.update(self._count_unread(uid, level1, mentions_only=True))
+        return counts
 
     def set_message_mentions(self, mid: int, mentioned_uids) -> None:
         values = [(mid, int(uid)) for uid in set(mentioned_uids)]

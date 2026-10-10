@@ -40,7 +40,7 @@ def load_pub(path : str):
     
     return public_key
 
-def return_app_route(app,  pri, auth_resolver=None):
+def return_app_route(app,  pri, auth_resolver=None, feature_checker=None):
     """
     app 是一个 flask 对象
     这个装饰器的目的是为了重载 app.route 方法，使其默认支持加密
@@ -49,8 +49,12 @@ def return_app_route(app,  pri, auth_resolver=None):
     auth_resolver: 可选的身份解析回调，签名 resolver(content) -> (ok, result)
         ok=True: result = (identity dict, legacy bool)，identity 至少包含 uid
         ok=False: result = 错误响应（dict 或 str）
+
+    feature_checker: 可选的功能开关回调，签名 checker(path_tuple) -> bool。
+        路由可用 @api(path, feature=("forum",)) 声明所属功能；关闭时直接
+        返回 {"error": "feature_disabled_<path>"}
     """
-    def res(*args, **kwargs):
+    def res(*args, feature=None, **kwargs):
         """
         和 @app.route 一样，传入 path 与 methods
         """
@@ -62,7 +66,10 @@ def return_app_route(app,  pri, auth_resolver=None):
                     aes_key, iv_bytes, content = deal_req_data(req_data, pri)
                     content = json.loads(json.dumps(content))
                     detailed = content.get("detail_error") is True
-                    if auth_resolver is not None:
+                    if (feature is not None and feature_checker is not None
+                            and not feature_checker(feature)):
+                        ret = {"error": "feature_disabled_" + "_".join(feature)}
+                    elif auth_resolver is not None:
                         ok, resolved = auth_resolver(content)
                         if not ok:
                             ret = resolved

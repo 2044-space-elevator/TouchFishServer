@@ -14,6 +14,7 @@ import threading
 import logging
 from collections import defaultdict
 from mention_utils import resolve_mentioned_uids, should_alert
+from config_utils import get_features
 import jwt_tool
 
 async def to_thread(func, *args, **kwargs):
@@ -91,6 +92,7 @@ class InstantConnect():
         self._ws_lock = threading.Lock()
         self._ws_timestamps = defaultdict(list)
         self._ws_typing_timestamps = defaultdict(list)
+        self._ws_read_timestamps = defaultdict(list)
         self._clients_lock = threading.Lock()
         self._auth_lock = threading.Lock()
         self._auth_timestamps = defaultdict(list)
@@ -112,7 +114,8 @@ class InstantConnect():
         now = time.time()
         cutoff = now - 120
         with self._ws_lock:
-            for d in (self._ws_timestamps, self._ws_typing_timestamps):
+            for d in (self._ws_timestamps, self._ws_typing_timestamps,
+                      self._ws_read_timestamps):
                 expired = [k for k, v in d.items() if not v or v[-1] < cutoff]
                 for k in expired:
                     del d[k]
@@ -165,7 +168,10 @@ class InstantConnect():
 
     def _check_ws_rate(self, uid: int, max_per_second: int = 10, bucket: str = "msg") -> bool:
         now = time.time()
-        ts_dict = self._ws_typing_timestamps if bucket == "typing" else self._ws_timestamps
+        ts_dict = {
+            "typing": self._ws_typing_timestamps,
+            "read": self._ws_read_timestamps,
+        }.get(bucket, self._ws_timestamps)
         with self._ws_lock:
             cutoff = now - 1.0
             ts_dict[uid] = [t for t in ts_dict[uid] if t > cutoff]
@@ -184,6 +190,7 @@ class InstantConnect():
                 cfg = {}
         self.max_message_length = cfg.get("max_message_length", 10000)
         self.legacy_auth_enabled = bool(cfg.get("legacy_auth_enabled", True))
+        self.features = get_features(cfg)
         rtc_cfg = cfg.get("rtc", {})
         self.rtc_turn_enabled = bool(rtc_cfg.get("turn_enabled", False)) if isinstance(rtc_cfg, dict) else False
         self.rtc_ice_servers = rtc_cfg.get("ice_servers", []) if isinstance(rtc_cfg, dict) else []
@@ -197,13 +204,16 @@ class InstantConnect():
 
     def _verify_quote(self, quote_mid: int, send_to: str, sender_uid: int) -> bool:
         rows = self.messages_cursor.query(
-            "SELECT sender_uid, receiver_uid, group_id, deleted FROM messages WHERE mid = ?",
+            "SELECT sender_uid, receiver_uid, group_id, deleted, content_type "
+            "FROM messages WHERE mid = ?",
             (quote_mid,)
         )
         if not rows:
             return False
         r = rows[0]
         if r[3]:  # deleted
+            return False
+        if r[4] == 'event':  # 事件行不是用户内容，不能引用
             return False
         if send_to[0] == 'G':
             gid = int(send_to[1:])
@@ -328,13 +338,18 @@ class InstantConnect():
             )
         return message
 
-    def push_raw(self, uid : int, message : dict):
-        """按原样中继一条信令/消息给某用户的所有在线连接（不包 MESSAGE.NEW）"""
+    def push_raw(self, uid : int, message : dict, exclude_websocket=None):
+        """按原样中继一条信令/消息给某用户的所有在线连接（不包 MESSAGE.NEW）
+
+        exclude_websocket: 可选的发起连接，广播（如已读回执）时不给它回声。
+        """
         if self.loop is None:
             return
         with self._clients_lock:
             clients = list(self.connected_clients.get(uid, []))
         for websocket in clients:
+            if websocket is exclude_websocket:
+                continue
             asyncio.run_coroutine_threadsafe(
                 self._queue_message(websocket, message),
                 self.loop
@@ -614,6 +629,17 @@ class InstantConnect():
                     if not self._check_ws_rate(sender_uid):
                         self._queue_ack(websocket, message.get('client_mid'), status="failed", error="rate_limited")
                         continue
+
+                    gate_content = message.get('content')
+                    gate_target = gate_content.get('send_to', '') if isinstance(gate_content, dict) else ''
+                    if isinstance(gate_target, str):
+                        chat_features = self.features.get('chat', {})
+                        if gate_target[:1] == 'G' and not chat_features.get('group_chat', True):
+                            self._queue_ack(websocket, message.get('client_mid'), status="failed", error="feature_disabled_group_chat")
+                            continue
+                        if gate_target[:1] == 'U' and not chat_features.get('private_chat', True):
+                            self._queue_ack(websocket, message.get('client_mid'), status="failed", error="feature_disabled_private_chat")
+                            continue
                 if message['type'] == "message.plain":
                     content = message['content']
                     if not isinstance(content, dict):
@@ -839,7 +865,8 @@ class InstantConnect():
                         if not await to_thread(
                                 self.file_cursor.add_reference,
                                 file_hashes, "message", msg_record["mid"], sender_uid):
-                            self.messages_cursor.recall_message(msg_record["mid"], sender_uid)
+                            self.messages_cursor.recall_message(
+                                msg_record["mid"], sender_uid, emit_event=False)
                             self._queue_ack(websocket, client_mid, status="failed", error="file_reference_failed")
                             continue
                         self._queue_ack(websocket, client_mid, mid=msg_record["mid"], status="sent")
@@ -924,7 +951,8 @@ class InstantConnect():
                         if not await to_thread(
                                 self.file_cursor.add_reference,
                                 file_hashes, "message", msg_record["mid"], sender_uid):
-                            self.messages_cursor.recall_message(msg_record["mid"], sender_uid)
+                            self.messages_cursor.recall_message(
+                                msg_record["mid"], sender_uid, emit_event=False)
                             self._queue_ack(websocket, client_mid, status="failed", error="file_reference_failed")
                             continue
                         self._queue_ack(websocket, client_mid, mid=msg_record["mid"], status="sent")
@@ -1039,6 +1067,40 @@ class InstantConnect():
                                 for ws in clients:
                                     asyncio.run_coroutine_threadsafe(
                                         self._queue_message(ws, broadcast), self.loop)
+
+                elif message["type"] == "message.read":
+                    sender_uid = self.clients_belonged[websocket]
+                    if not self._check_ws_rate(sender_uid, max_per_second=5, bucket="read"):
+                        continue
+                    room_id = message.get("room_id")
+                    last_mid = message.get("last_mid")
+                    if (not isinstance(room_id, str) or isinstance(last_mid, bool)
+                            or not isinstance(last_mid, int) or last_mid <= 0):
+                        continue
+                    if not can_access_room(
+                            self.user_cursor, self.group_cursor, sender_uid, room_id):
+                        continue
+                    if room_id.startswith('U'):
+                        room_key = self.messages_cursor.room_key_of(
+                            sender_uid, int(room_id[1:]))
+                    else:
+                        room_key = self.messages_cursor.room_key_of(
+                            sender_uid, 0, group_id=int(room_id[1:]))
+                    cursor = self.messages_cursor.sync_cursor_for_mid(room_key, last_mid)
+                    if cursor is None or cursor[0] is None:
+                        continue
+                    if not self.messages_cursor.update_read_state(
+                            sender_uid, room_key, cursor[0], last_mid):
+                        continue
+                    # 多端已读同步
+                    self.push_raw(sender_uid, {
+                        "type": "message.read",
+                        "room_id": room_id,
+                        "uid": sender_uid,
+                        "last_mid": last_mid,
+                        "last_seq": cursor[0],
+                        "ts": int(time.time() * 1000),
+                    }, exclude_websocket=websocket)
 
         except Exception as e:
             print("[ERR] WS消息处理异常: {}".format(e))

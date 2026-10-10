@@ -19,7 +19,7 @@ from rate_limiter import RateLimiter
 from mention_utils import resolve_mentioned_uids, should_alert
 import time
 import threading
-from config_utils import normalize_default_join_targets
+from config_utils import get_features, normalize_default_join_targets, feature_gate, merge_features, SETTINGS_SPEC
 from json_store import read_json, update_json
 from datetime import datetime
 from file_types import IMAGE_TYPES, detect_file_type, is_sticker_type
@@ -28,6 +28,42 @@ from sync_limits import SYNC_MAX_LIMIT, parse_sync_missing_sequences
 
 def bool_res() -> tuple:
     return (str(time.time()) + "False", str(time.time()) + "True")
+
+# 搜索端点 不准你乱搜
+_search_rate_lock = threading.Lock()
+_search_rate_hits: dict = {}
+
+def check_search_rate(uid, max_per_window: int = 20, window: float = 10.0) -> bool:
+    now = time.time()
+    with _search_rate_lock:
+        hits = [t for t in _search_rate_hits.get(uid, []) if t > now - window]
+        if len(hits) >= max_per_window:
+            _search_rate_hits[uid] = hits
+            return False
+        hits.append(now)
+        _search_rate_hits[uid] = hits
+        if len(_search_rate_hits) > 4096:
+            for key in [k for k, v in _search_rate_hits.items()
+                        if not v or v[-1] < now - window]:
+                _search_rate_hits.pop(key, None)
+        return True
+
+def normalize_search_request(keyword, min_len, limit, offset=0):
+    """归一化搜索请求"""
+    keyword = str(keyword or "").strip()
+    if min_len > 0 and len(keyword) < min_len:
+        return keyword, 0, 0, "search_keyword_too_short"
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 20
+    limit = max(1, min(limit, 20))
+    try:
+        offset = int(offset)
+    except (TypeError, ValueError):
+        offset = 0
+    offset = max(0, offset)
+    return keyword, limit, offset, None
 
 # 陈年老 bug 没注意到，tf.xin 上早就修了
 FILE_CACHE_MAX_AGE = 365 * 24 * 3600
@@ -57,6 +93,12 @@ def can_recall_message(operator_uid : int, operator_auth : str, message : dict,
     if message["group_id"] is not None:
         return operator_auth in {"admin", "root"} or group_role >= 1
     return operator_auth in {"admin", "root"}
+
+
+def public_email_visible(row) -> bool:
+    """users 表 public_email 列（表尾第 10 列，SELECT * 位序 9），没有就是 public！"""
+    value = row[9] if len(row) > 9 else 1
+    return value is None or bool(value)
 
 def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, forum_cursor, file_cursor, notification_cursor, messages_cursor, group_cursor, instant_contact, sticker_cursor=None, jwt_secret=None):
     """
@@ -162,7 +204,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         )
         return response
 
-    api = return_app_route(app, pri, resolve_auth)
+    api = return_app_route(app, pri, resolve_auth,
+                           feature_checker=lambda path: feature_gate(read_config(), *path))
     limiter = RateLimiter(port_api)
     manager_auths = {"admin", "root"}
     managed_auths = {"user", "banned", "admin", "root"}
@@ -330,6 +373,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             "max_sticker_storage_quota" : cfg.get("max_sticker_storage_quota", 31457280),
             "default_join_targets" : normalize_default_join_targets(cfg.get("default_join_targets", [])),
             "max_message_length" : cfg.get("max_message_length", 10000),
+            "max_request_message_length" : cfg.get("max_request_message_length", 200),
+            "min_search_length" : cfg.get("min_search_length", 2),
+            "features" : get_features(cfg),
             "min_group_name_length" : cfg.get("min_group_name_length", 1),
             "max_group_name_length" : cfg.get("max_group_name_length", 50),
             "max_sign_length" : cfg.get("max_sign_length", 100),
@@ -346,6 +392,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             "jwt_expires_seconds" : int(cfg.get("jwt_expires_seconds", 3600)),
             "jwt_refresh_expires_seconds" : int(cfg.get("jwt_refresh_expires_seconds", 604800)),
             "jwt_max_per_user" : int(cfg.get("jwt_max_per_user", 5)),
+            "external_login_issuers" : [
+                entry.get("iss") for entry in (cfg.get("jwt_external_issuers") or [])
+                if isinstance(entry, dict) and isinstance(entry.get("iss"), str) and entry.get("iss")
+            ],
             "default_asset_urls" : {
                 "logo" : "/avatar/get_logo",
                 "forum" : "/avatar/get_default/forum",
@@ -355,6 +405,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         }
         if include_manage:
             ret["rate_limits"] = cfg.get("rate_limits", {})
+            ret["settings_spec"] = SETTINGS_SPEC
             ret["file_download_mode"] = oss_store.get_download_mode(port_api, cfg)
             if cfg.get("email_activate"):
                 ret["verify_email"] = cfg.get("email_activate")
@@ -501,6 +552,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         }
 
     def extract_mentioned_uids(comment : str):
+
         mentioned_uids = set()
         for block in comment.split():
             if not block.startswith('@') or len(block) < 2:
@@ -847,10 +899,16 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def login_with_jwt(uid, pwd, device_id=None, device_name=None, platform=0):
         """
         JWT 登录：校验凭据后签发 access token 并建立可刷新 Session。
-        超限（jwt_max_per_user）时吊销最老的会话。
         """
         if not verify_user(uid, pwd):
             return {"error": "auth_failed"}
+        return create_session_for_user(uid, device_id, device_name, platform)
+
+    def create_session_for_user(uid, device_id=None, device_name=None, platform=0):
+        """
+        为已通过身份校验的用户签发本地会话（access + refresh）。
+        超限（jwt_max_per_user）时吊销最老的会话。
+        """
         cfg = read_config()
         max_sessions = int(cfg.get("jwt_max_per_user", 5))
         access_expires = int(cfg.get("jwt_expires_seconds", 3600))
@@ -873,12 +931,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             oldest_sid = user_cursor.get_oldest_session(uid)
             if oldest_sid:
                 user_cursor.revoke_session(oldest_sid, uid)
-                flask_current_app.after_response_funcs.setdefault(None, []).append(
+                run_side_effect(
+                    "disconnect_session_owner",
                     lambda: instant_contact.disconnect_session(oldest_sid)
                 )
-                flask_current_app.after_response_funcs.setdefault(None, []).append(
-                    lambda: notify_user(uid, "session_replaced", "会话已被替换", "由于达到登录设备数量上限，您最早的登录会话已被自动吊销。")
-                )
+                notify_user(uid, "session_replaced", "会话已被替换", "由于达到登录设备数量上限，您最早的登录会话已被自动吊销。")
                 revoked_oldest = True
             else:
                 return {"error": "token_limit_reached"}
@@ -924,7 +981,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         row = user_cursor.get_session_by_refresh(refresh_token)
         if not row:
             return {"error": "auth_failed"}
-        session_id, uid, _created, _last_seen, expires_at, _version, revoked_at, _ip, _ua = row
+        (session_id, uid, _created, _last_seen, expires_at, _version,
+         revoked_at, _ip, _ua, _device_id, _location) = row
         if revoked_at is not None or expires_at <= now:
             return {"error": "auth_failed"}
         auth_version = user_cursor.get_auth_version(uid)
@@ -947,6 +1005,159 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             "refresh_expires_in": int(refresh_expires),
             "expires_at": payload["exp"],
         }
+
+    def verify_external_identity(external_token):
+        """
+        验证外部签发的 JWT（jwt_external_issuers 配置）。返回 (payload, issuer_cfg)；失败 (None, None)。
+        """
+        if not isinstance(external_token, str) or not external_token:
+            return None, None
+        external_issuers = read_config().get("jwt_external_issuers")
+        if not isinstance(external_issuers, list) or not external_issuers:
+            return None, None
+        payload = jwt_tool.verify_external_token(external_token, external_issuers)
+        if payload is None:
+            return None, None
+        iss = payload.get("iss")
+        sub = payload.get("sub")
+        if not isinstance(iss, str) or not iss or not isinstance(sub, str) or not sub:
+            return None, None
+        for entry in external_issuers:
+            if isinstance(entry, dict) and entry.get("iss") == iss:
+                return payload, entry
+        return None, None
+
+    def build_external_username(payload, sub):
+        """
+        自动建号用户名：claim username/preferred_username 优先，otherwise ext_<sub>
+        """
+        candidate = None
+        for claim in ("username", "preferred_username"):
+            raw = payload.get(claim)
+            if isinstance(raw, str) and raw.strip():
+                candidate = raw.strip()
+                break
+        if candidate is None:
+            candidate = "ext_" + sub
+        candidate = "".join("_" if ch.isspace() else ch for ch in candidate)[:20]
+        if len(candidate) < 4:
+            candidate = (candidate or "ext") + "_ext"
+        return candidate
+
+    def auto_create_external_user(payload, sub):
+        """
+        外部身份自动建号（随机密码，仅能经外部平台登录）。返回新 uid 或 None。
+        """
+        candidate = build_external_username(payload, sub)
+        email = payload.get("email")
+        if not isinstance(email, str) or not email or not user_cursor.validate_email(email):
+            email = None
+        uid = None
+        for attempt in range(10):
+            if attempt == 0:
+                trial = candidate
+            else:
+                suffix = "_" + str(attempt)
+                trial = candidate[:20 - len(suffix)] + suffix
+            if not user_cursor.validate_username(trial):
+                continue
+            if user_cursor.user_create(trial, secrets.token_hex(32), time.time(), email, stat="user"):
+                uid = user_cursor.username_query(trial)[0][0]
+                break
+        if uid is None:
+            return None
+        if not ensure_notification_table(uid):
+            user_cursor.delete_user(uid)
+            return None
+        apply_default_join_targets(uid)
+        return uid
+
+    @api("/auth/external/login", methods=["POST"])
+    def external_login(req):
+        """
+        用外部平台签发的 JWT 换取本地会话（access + refresh）。
+        默认要求外部身份已绑定本地账号；issuer 配置 allow_auto_create 开启时可自动建号。
+        """
+        payload, issuer_cfg = verify_external_identity(req.get("external_token"))
+        if payload is None:
+            return {"error": "external_token_invalid"}
+        iss = payload["iss"]
+        sub = payload["sub"]
+        uid = user_cursor.get_identity_uid(iss, sub)
+        if uid is None:
+            if not issuer_cfg.get("allow_auto_create", False):
+                return {"error": "external_not_linked"}
+            uid = auto_create_external_user(payload, sub)
+            if uid is None:
+                return {"error": "conflict"}
+            # 建号后绑定；失败说明并发请求刚绑定同一身份，回滚本次建号
+            if not user_cursor.bind_identity(iss, sub, uid):
+                existing_uid = user_cursor.get_identity_uid(iss, sub)
+                user_cursor.delete_user(uid)
+                if existing_uid is None:
+                    return {"error": "conflict"}
+                uid = existing_uid
+        row = user_cursor.uid_query(uid)
+        if not row:
+            return {"error": "external_token_invalid"}
+        if row[0][4] == "banned":
+            return {"error": "user_banned"}
+        return create_session_for_user(
+            uid, req.get("device_id"), req.get("device_name"), req.get("platform", 0)
+        )
+
+    @api("/auth/external/bind", methods=["POST"])
+    def external_bind(req):
+        """
+        将外部平台身份绑定到当前本地账号（需本地会话）。
+        """
+        identity = flask_g.get("auth_identity")
+        if identity is None:
+            return {"error": "not_authenticated"}
+        payload, _issuer_cfg = verify_external_identity(req.get("external_token"))
+        if payload is None:
+            return {"error": "external_token_invalid"}
+        iss = payload["iss"]
+        sub = payload["sub"]
+        uid = identity["uid"]
+        existing = user_cursor.get_identity_uid(iss, sub)
+        if existing == uid:
+            return {"success": True}
+        if existing is not None:
+            return {"error": "external_already_linked"}
+        if not user_cursor.bind_identity(iss, sub, uid):
+            # 身份被抢占，或该 issuer 下已有其他绑定（UNIQUE(uid, iss)）
+            return {"error": "external_already_linked"}
+        return {"success": True}
+
+    @api("/auth/external/unbind", methods=["POST"])
+    def external_unbind(req):
+        """
+        解绑当前账号在指定 issuer 下的外部身份。
+        """
+        identity = flask_g.get("auth_identity")
+        if identity is None:
+            return {"error": "not_authenticated"}
+        iss = req.get("iss")
+        if not isinstance(iss, str) or not iss:
+            return {"error": "invalid_request"}
+        if not user_cursor.unbind_identity(identity["uid"], iss):
+            return {"error": "not_found"}
+        return {"success": True}
+
+    @api("/auth/external/list", methods=["POST"])
+    def external_list(req):
+        """
+        列出当前账号已绑定的外部身份。
+        """
+        identity = flask_g.get("auth_identity")
+        if identity is None:
+            return {"error": "not_authenticated"}
+        identities = [
+            {"iss": row[0], "sub": row[1], "created_at": row[2]}
+            for row in user_cursor.list_identities(identity["uid"])
+        ]
+        return {"identities": identities}
 
     def _resolve_session_target(req, identity):
         """
@@ -1243,6 +1454,29 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return {"error": "token_expired"}
         return {"valid": True, "uid": identity["uid"], "stat": row[4]}
 
+    @api("/auth/query_self", methods=["POST"])
+    def query_self(req):
+        """查自己的完整资料
+        """
+        uid = req["uid"]
+        password = req["password"]
+        if not verify_user(uid, password):
+            return bool_res()[False]
+        info = user_cursor.uid_query(uid)
+        if not info:
+            return bool_res()[False]
+        row = info[0]
+        return json.dumps({
+            "uid": row[0],
+            "username": row[1],
+            "email": row[2],
+            "stat": row[4],
+            "create_time": row[5],
+            "personal_sign": row[6],
+            "introduction": row[7],
+            "public_email": public_email_visible(row),
+        }, ensure_ascii=False)
+
     @api("/auth/change_pwd", methods=["POST"])
     def change_pwd(req):
         try:
@@ -1322,12 +1556,12 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         ret = {
             "uid" : info[0][0],
             "username" : info[0][1],
-            "email" : info[0][2],
+            "email" : info[0][2] if public_email_visible(info[0]) else "",
             "stat" : info[0][4],
             "create_time" : info[0][5],
             "personal_sign" : info[0][6],
             "introduction" : info[0][7]
-        } 
+        }
         return ret
 
     @app.route("/auth/username/<username>")
@@ -1338,7 +1572,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         ret = {
             "uid" : info[0][0],
             "username" : info[0][1],
-            "email" : info[0][2],
+            "email" : info[0][2] if public_email_visible(info[0]) else "",
             "stat" : info[0][4],
             "create_time" : info[0][5],
             "personal_sign" : info[0][6],
@@ -1697,6 +1931,18 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return bool_res()[False]
         user_cursor.change_introduction(uid, new_intro)
         return bool_res()[True]
+
+    @api("/auth/change_public_email", methods=["POST"])
+    def change_public_email(req):
+        uid = req["uid"]
+        password = req["password"]
+        if not verify_user(uid, password):
+            return bool_res()[False]
+        public = req.get("public_email")
+        if not isinstance(public, bool):
+            return bool_res()[False]
+        user_cursor.set_public_email(uid, public)
+        return bool_res()[True]
     
     @api("/auth/change_captcha", methods=['POST'])
     def change_captcha(req):
@@ -1834,6 +2080,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             if "max_message_length" in req:
                 updates["max_message_length"] = parse_int_setting(req["max_message_length"], minimum=1)
 
+            if "max_request_message_length" in req:
+                updates["max_request_message_length"] = parse_int_setting(req["max_request_message_length"], minimum=1)
+
             if "min_group_name_length" in req:
                 updates["min_group_name_length"] = parse_int_setting(req["min_group_name_length"], minimum=1)
 
@@ -1912,6 +2161,14 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                     return bool_res()[False]
                 updates["media_features"] = req["media_features"]
 
+            if "features" in req:
+                try:
+                    updates["features"] = merge_features(
+                        read_config().get("features"), req["features"]
+                    )
+                except ValueError:
+                    return bool_res()[False]
+
             if not updates:
                 return bool_res()[False]
 
@@ -1919,8 +2176,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 current.update(updates)
             cfg = update_config(_apply)
             # 重新加载 ws
-            if "max_message_length" in updates:
-                instant_contact._load_config(cfg)
+            # 无条件刷新，避免只有部分键变更时才生效的遗漏
+            instant_contact._load_config(cfg)
             # 反代配置变更时重新包装 wsgi 中间件
             if "reverse_proxy_enabled" in updates or "proxy_count" in updates:
                 apply_proxy_fix(cfg)
@@ -2154,7 +2411,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         rows, total = sticker_cursor.list_packs(0, 100, creator_uid=uid)
         return json.dumps({"items": [_sticker_pack_dict(row) for row in rows], "total": total}, ensure_ascii=False)
 
-    @api("/sticker/pack/create", methods=["POST"])
+    @api("/sticker/pack/create", methods=["POST"], feature=("sticker",))
     def create_sticker_pack(req):
         uid, password = req.get("uid"), req.get("password")
         name, prefix = req.get("name"), req.get("prefix")
@@ -2167,7 +2424,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return json.dumps({"success": False, "error": error})
         return json.dumps({"success": True, "pack": _sticker_pack_dict(sticker_cursor.get_pack(pack_id))}, ensure_ascii=False)
 
-    @api("/sticker/item/create", methods=["POST"])
+    @api("/sticker/item/create", methods=["POST"], feature=("sticker",))
     def create_sticker_item(req):
         uid, password = req.get("uid"), req.get("password")
         pack_id, slug, file_hash = req.get("pack_id"), req.get("slug"), req.get("file_hash")
@@ -2199,7 +2456,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             file_cursor.add_reference(file_hash, "sticker", sticker_id, uid)
         return json.dumps({"success": True, "sticker": _sticker_item_dict(item)}, ensure_ascii=False)
 
-    @api("/sticker/pack/update", methods=["POST"])
+    @api("/sticker/pack/update", methods=["POST"], feature=("sticker",))
     def update_sticker_pack(req):
         uid, password, pack_id = req.get("uid"), req.get("password"), req.get("pack_id")
         if sticker_cursor is None or not verify_user(uid, password) or not isinstance(pack_id, str) or not sticker_cursor.can_manage_pack(uid, pack_id, _sticker_exempt(uid)):
@@ -2215,7 +2472,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return json.dumps({"success": False, "error": "conflict"})
         return json.dumps({"success": True, "pack": _sticker_pack_dict(sticker_cursor.get_pack(pack_id))}, ensure_ascii=False)
 
-    @api("/sticker/pack/delete", methods=["POST"])
+    @api("/sticker/pack/delete", methods=["POST"], feature=("sticker",))
     def delete_sticker_pack(req):
         uid, password, pack_id = req.get("uid"), req.get("password"), req.get("pack_id")
         if sticker_cursor is None or not verify_user(uid, password) or not isinstance(pack_id, str) or not sticker_cursor.can_manage_pack(uid, pack_id, _sticker_exempt(uid)):
@@ -2229,7 +2486,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 pass
         return json.dumps({"success": True})
 
-    @api("/sticker/item/delete", methods=["POST"])
+    @api("/sticker/item/delete", methods=["POST"], feature=("sticker",))
     def delete_sticker_item(req):
         uid, password, pack_id, sticker_id = req.get("uid"), req.get("password"), req.get("pack_id"), req.get("sticker_id")
         if sticker_cursor is None or not verify_user(uid, password) or not all(isinstance(value, str) for value in (pack_id, sticker_id)) or not sticker_cursor.can_manage_pack(uid, pack_id, _sticker_exempt(uid)):
@@ -2244,14 +2501,14 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             pass
         return json.dumps({"success": True})
 
-    @api("/sticker/item/reorder", methods=["POST"])
+    @api("/sticker/item/reorder", methods=["POST"], feature=("sticker",))
     def reorder_sticker_items(req):
         uid, password, pack_id, ids = req.get("uid"), req.get("password"), req.get("pack_id"), req.get("sticker_ids")
         if sticker_cursor is None or not verify_user(uid, password) or not isinstance(pack_id, str) or not isinstance(ids, list) or not all(isinstance(value, str) for value in ids) or not sticker_cursor.can_manage_pack(uid, pack_id, _sticker_exempt(uid)):
             return json.dumps({"success": False, "error": "forbidden"})
         return json.dumps({"success": sticker_cursor.reorder_stickers(pack_id, ids)})
 
-    @api("/sticker/ownership/reorder", methods=["POST"])
+    @api("/sticker/ownership/reorder", methods=["POST"], feature=("sticker",))
     def reorder_sticker_ownership(req):
         uid, password, ids = req.get("uid"), req.get("password"), req.get("pack_ids")
         if (sticker_cursor is None or not verify_user(uid, password)
@@ -2260,7 +2517,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return json.dumps({"success": False, "error": "invalid_request"})
         return json.dumps({"success": sticker_cursor.reorder_owned(uid, ids)})
 
-    @api("/sticker/ownership", methods=["POST"])
+    @api("/sticker/ownership", methods=["POST"], feature=("sticker",))
     def sticker_ownership(req):
         uid, password, pack_id = req.get("uid"), req.get("password"), req.get("pack_id")
         if sticker_cursor is None or not verify_user(uid, password) or not isinstance(pack_id, str):
@@ -2268,7 +2525,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         owned = bool(req.get("owned", True))
         return json.dumps({"success": sticker_cursor.set_owned(uid, pack_id, owned)})
 
-    @api("/forum/create_forum", methods=["POST"])
+    @api("/forum/create_forum", methods=["POST"], feature=("forum",))
     def create_forum(req):
         uid = req["uid"]
         password = req["password"]
@@ -2333,7 +2590,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         with locks['queue']:
             return json.dumps(read_json("res/{}/forum/queue.json".format(port_api)), ensure_ascii=False)
     
-    @api("/forum/approve_forum", methods=["POST"])
+    @api("/forum/approve_forum", methods=["POST"], feature=("forum",))
     def approve_forum(req):
         uid = req["uid"]
         password = req["password"]
@@ -2391,7 +2648,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         notify_user(fchosen["creater"], "forum.approved", "论坛已通过审核", "你{}的论坛 {} 已通过审核。".format(action_text, fchosen["forumname"]), sender=uid, meta={"fid" : fid, "forum_name" : fchosen["forumname"]})
         return bool_res()[True]
 
-    @api("/forum/reject_forum", methods=["POST"])
+    @api("/forum/reject_forum", methods=["POST"], feature=("forum",))
     def reject_forum(req):
         uid = req["uid"]
         password = req["password"]
@@ -2446,7 +2703,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             "total": total,
         }, ensure_ascii=False)
     
-    @api("/forum/send_post", methods=["POST"])
+    @api("/forum/send_post", methods=["POST"], feature=("forum",))
     def send_post(req):
         uid = req["uid"]
         password = req["password"]
@@ -2555,7 +2812,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return {}
         return json.dumps(serialize_post_rows(rows)[0], ensure_ascii=False)
     
-    @api("/forum/remove_forum", methods=["POST"])
+    @api("/forum/remove_forum", methods=["POST"], feature=("forum",))
     def remove_forum(req):
         uid = req["uid"]
         password = req["password"]
@@ -2582,7 +2839,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             file_cursor.remove_reference(hashes, source_type, source_id)
         return bool_res()[True]
     
-    @api("/forum/edit_forum", methods=["POST"])
+    @api("/forum/edit_forum", methods=["POST"], feature=("forum",))
     def forum_edit_forum(req):
         """修改论坛信息，论坛创建者或管理员"""
         uid = req["uid"]
@@ -2627,7 +2884,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                      meta={"qid": qid, "fid": fid, "forum_name": forum_name})
         return bool_res()[True]
 
-    @api("/forum/remove_post", methods=['POST'])
+    @api("/forum/remove_post", methods=['POST'], feature=("forum",))
     def remove_post(req):
         uid = req["uid"]
         password = req["password"]
@@ -2661,7 +2918,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             )
         return bool_res()[True]
 
-    @api("/forum/pin_post", methods=["POST"])
+    @api("/forum/pin_post", methods=["POST"], feature=("forum",))
     def pin_post(req):
         uid = req["uid"]
         password = req["password"]
@@ -2681,7 +2938,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return bool_res()[False]
         return bool_res()[forum_cursor.pin_post(fid, pid)]
 
-    @api("/forum/unpin_post", methods=["POST"])
+    @api("/forum/unpin_post", methods=["POST"], feature=("forum",))
     def unpin_post(req):
         uid = req["uid"]
         password = req["password"]
@@ -2716,7 +2973,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         rows = forum_cursor.list_members(fid)
         return json.dumps([list(row) for row in rows])
 
-    @api("/forum/add_member", methods=["POST"])
+    @api("/forum/add_member", methods=["POST"], feature=("forum",))
     def forum_add_member(req):
         uid = req["uid"]
         password = req["password"]
@@ -2748,7 +3005,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return bool_res()[forum_cursor.change_member_role(fid, target_uid, role)]
         return bool_res()[forum_cursor.add_member(fid, target_uid, role)]
 
-    @api("/forum/remove_member", methods=["POST"])
+    @api("/forum/remove_member", methods=["POST"], feature=("forum",))
     def forum_remove_member(req):
         uid = req["uid"]
         password = req["password"]
@@ -2766,7 +3023,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return bool_res()[False]
         return bool_res()[forum_cursor.remove_member(fid, target_uid)]
 
-    @api("/forum/change_member_role", methods=["POST"])
+    @api("/forum/change_member_role", methods=["POST"], feature=("forum",))
     def forum_change_member_role(req):
         uid = req["uid"]
         password = req["password"]
@@ -2795,7 +3052,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return bool_res()[False]
         return bool_res()[forum_cursor.change_member_role(fid, target_uid, new_role)]
 
-    @api("/forum/join", methods=["POST"])
+    @api("/forum/join", methods=["POST"], feature=("forum",))
     def forum_join(req):
         uid = req["uid"]
         password = req["password"]
@@ -2814,7 +3071,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return bool_res()[False]
         return bool_res()[forum_cursor.add_member(fid, uid, 0)]
 
-    @api("/forum/leave", methods=["POST"])
+    @api("/forum/leave", methods=["POST"], feature=("forum",))
     def forum_leave(req):
         uid = req["uid"]
         password = req["password"]
@@ -2839,7 +3096,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         )
         return json.dumps([list(row) for row in rows])
 
-    @api("/forum/comment", methods=["POST"])
+    @api("/forum/comment", methods=["POST"], feature=("forum",))
     def comment(req):
         uid = req["uid"]
         if not isinstance(uid, int):
@@ -2904,7 +3161,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return {}
         return thread
     
-    @api("/forum/remove_comment", methods=['POST'])
+    @api("/forum/remove_comment", methods=['POST'], feature=("forum",))
     def remove_comment(req):
         uid = req["uid"]
         if not isinstance(uid, int):
@@ -3598,7 +3855,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             max_age=FILE_CACHE_MAX_AGE,
         )
     
-    @api("/announcement/upload_announcement", methods=['POST'])
+    @api("/announcement/upload_announcement", methods=['POST'], feature=("announcement",))
     def upload_announcement(req):
         uid = req["uid"]
         password = req["password"]
@@ -3615,7 +3872,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         notify_users(all_user_ids(), "announcement.created", "收到新公告", content, sender=uid, meta={"time_stamp" : time_stamp})
         return bool_res()[True]
     
-    @api("/announcement/edit_announcement", methods=['POST'])
+    @api("/announcement/edit_announcement", methods=['POST'], feature=("announcement",))
     def edit_announcement(req):
         uid = req["uid"]
         password = req["password"]
@@ -3634,7 +3891,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             notify_users(all_user_ids(), "announcement.edited", "公告已更新", content, sender=uid, meta={"time_stamp" : time_stamp})
         return bool_res()[succeeded] 
     
-    @api("/announcement/delete_announcement", methods=['POST'])
+    @api("/announcement/delete_announcement", methods=['POST'], feature=("announcement",))
     def delete_announcement(req):
         uid = req["uid"]
         password = req["password"]
@@ -3661,7 +3918,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         return announcements.query_single(port_api, time_stamp, locks['announcement'])
  
 
-    @api("/group/create_group", methods=['POST'])
+    @api("/group/create_group", methods=['POST'], feature=("chat", "group_create"))
     def create_group(req):
         uid = req["uid"]
         password = req["password"]
@@ -3690,17 +3947,111 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         return bool_res()[False]
     
     @app.route("/group/group_info/<gid>")
-    def group_info(gid : str): 
+    def group_info(gid : str):
         if not gid.isdigit():
             return {}
         qry = group_cursor.query_gid(gid)
         if len(qry) < 1:
             return {}
-        return json.dumps(list(qry[0]), ensure_ascii=False)
+        row = list(qry[0])
+        row[3] = "[]"
+        row[4] = "[]"
+        return json.dumps(row, ensure_ascii=False)
 
     @app.route("/group/groupname_search/<groupname>")
     def groupname_search(groupname : str):
+        """[deprecated] 明文群名搜索：保留旧结构以兼容老客户端，成员/管理员已清空。"""
         return json.dumps(group_cursor.groupname_search(groupname), ensure_ascii=False)
+
+    @api("/user/search", methods=['POST'])
+    def user_search(req):
+        """按用户名搜索用户。返回 uid/username/sign"""
+        uid = req["uid"]
+        password = req["password"]
+        if not verify_user(uid, password):
+            return bool_res()[False]
+        if not check_search_rate(uid):
+            return json.dumps({"success": False, "error": "rate_limited"})
+        keyword, limit, _offset, err = normalize_search_request(
+            req.get("keyword"), read_config().get("min_search_length", 2),
+            req.get("limit", 20),
+        )
+        if err:
+            return json.dumps({"success": False, "error": err})
+        results = user_cursor.search_users(keyword, limit=limit, exclude_uid=uid)
+        return json.dumps(results, ensure_ascii=False)
+
+    @api("/group/search", methods=['POST'])
+    def group_search(req):
+        """按群名搜索群组（分页）"""
+        uid = req["uid"]
+        password = req["password"]
+        if not verify_user(uid, password):
+            return bool_res()[False]
+        if not check_search_rate(uid):
+            return json.dumps({"success": False, "error": "rate_limited"})
+        keyword, limit, offset, err = normalize_search_request(
+            req.get("keyword"), read_config().get("min_search_length", 2),
+            req.get("limit", 20), req.get("offset", 0),
+        )
+        if err:
+            return json.dumps({"success": False, "error": err})
+        groups, has_more = group_cursor.search_public(keyword, limit=limit, offset=offset)
+        return json.dumps(
+            {"success": True, "groups": groups, "has_more": has_more},
+            ensure_ascii=False,
+        )
+
+    @api("/group/preview", methods=['POST'])
+    def group_preview(req):
+        """群组预览：任意登录用户可查看（加入前预览）。enter_hint 仅成员可见。"""
+        uid = req["uid"]
+        password = req["password"]
+        gid = req["gid"]
+        if not verify_user(uid, password):
+            return bool_res()[False]
+        user_row = get_user_row(uid)
+        if user_row is None:
+            return bool_res()[False]
+        if user_row[4] == 'banned':
+            return bool_res()[False]
+        settings = group_cursor.get_group_settings(gid)
+        if not settings:
+            return bool_res()[False]
+        member_count = group_cursor.count_members(gid)
+        preview_members = group_cursor.get_preview_members(gid, limit=10)
+        name_map = {}
+        if preview_members:
+            placeholders = ",".join("?" * len(preview_members))
+            rows = user_cursor.query(
+                "SELECT uid, username FROM users WHERE uid IN ({})".format(placeholders),
+                tuple(p[0] for p in preview_members),
+            )
+            name_map = {r[0]: r[1] for r in rows}
+        members = []
+        for muid, role in preview_members:
+            role_name = "owner" if role == 2 else ("admin" if role == 1 else "member")
+            members.append({
+                "uid": muid,
+                "username": name_map.get(muid, "User {}".format(muid)),
+                "role": role_name,
+            })
+        is_member = group_cursor.is_member(gid, uid)
+        result = {
+            "gid": settings["gid"],
+            "groupname": settings["groupname"],
+            "introduction": settings["introduction"],
+            "member_count": member_count,
+            "is_member": is_member,
+            "allow_direct_join": settings["allow_direct_join"],
+            "require_review": settings["require_review"],
+            "public_messages": settings["public_messages"],
+            "essence_enabled": settings["essence_enabled"],
+            "members": members,
+        }
+        if is_member:
+            result["enter_hint"] = settings.get("enter_hint", "")
+        return json.dumps(result, ensure_ascii=False)
 
     @api("/group/add_admin", methods=['POST'])
     def add_admin(req):
@@ -3990,7 +4341,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return bool_res()[False]
         updates = {}
         for key in ("groupname", "enter_hint", "introduction",
-                     "allow_direct_join", "require_review", "essence_enabled"):
+                     "allow_direct_join", "require_review", "essence_enabled",
+                     "public_messages"):
             if key in req:
                 updates[key] = req[key]
         if "groupname" in updates:
@@ -4122,7 +4474,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 })
         return json.dumps({"members": members, "settings": settings}, ensure_ascii=False)
 
-    @api("/group/join", methods=['POST'])
+    @api("/group/join", methods=['POST'], feature=("chat", "group_chat"))
     def join_group(req):
         uid = req["uid"]
         password = req["password"]
@@ -4140,6 +4492,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return bool_res()[False]
         if group_cursor.is_member(gid, uid):
             return bool_res()[False]
+        max_len = read_config().get("max_request_message_length", 200)
+        request_message = str(req.get("message", "") or "").strip()
+        if max_len > 0 and len(request_message) > max_len:
+            return json.dumps({"success": False, "error": "request_message_too_long"})
         if settings["allow_direct_join"]:
             if not settings["require_review"]:
                 succeeded = group_cursor.add_member(gid, uid)
@@ -4152,16 +4508,16 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 limit = cfg.get("single_group_max_people", 200)
                 if limit != -1 and len(members) >= limit:
                     return bool_res()[False]
-                rid = group_cursor.request_join(gid, uid)
+                rid = group_cursor.request_join(gid, uid, message=request_message)
                 reviewers = [settings["creater"]] + group_cursor.get_admin_uids(gid)
                 run_notification_side_effect("group.join.request",
                     lambda: notify_users(reviewers, "group.join.request",
                         "新的入群申请", "{} 申请加入群 {}。".format(format_user_display(uid), settings["groupname"]),
-                        sender=uid, meta={"gid": gid, "rid": rid}))
+                        sender=uid, meta={"gid": gid, "rid": rid, "message": request_message}))
                 return json.dumps({"rid": rid, "pending": True})
         return bool_res()[False]
 
-    @api("/group/invite", methods=['POST'])
+    @api("/group/invite", methods=['POST'], feature=("chat", "group_chat"))
     def invite_to_group(req):
         uid = req["uid"]
         password = req["password"]
@@ -4184,6 +4540,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if group_cursor.is_member(gid, invited_uid):
             return bool_res()[False]
         settings = group_cursor.get_group_settings(gid)
+        max_len = read_config().get("max_request_message_length", 200)
+        invite_message = str(req.get("message", "") or "").strip()
+        if max_len > 0 and len(invite_message) > max_len:
+            return json.dumps({"success": False, "error": "request_message_too_long"})
         is_admin = group_cursor.is_admin(gid, uid) >= 1
         if not settings["require_review"] or is_admin:
             succeeded = group_cursor.add_member(gid, invited_uid)
@@ -4194,12 +4554,13 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                         sender=uid, meta={"gid": gid}))
                 return json.dumps({"pending": False})
             return bool_res()[False]
-        rid = group_cursor.request_join(gid, invited_uid, inviter_uid=uid)
+        rid = group_cursor.request_join(gid, invited_uid, inviter_uid=uid,
+                                        message=invite_message)
         reviewers = [settings["creater"]] + group_cursor.get_admin_uids(gid)
         run_notification_side_effect("group.join.request",
             lambda: notify_users(reviewers, "group.join.request",
                 "新的入群申请", "{} 邀请 {} 加入群 {}，等待审核。".format(format_user_display(uid), format_user_display(invited_uid), settings["groupname"]),
-                sender=uid, meta={"gid": gid, "rid": rid}))
+                sender=uid, meta={"gid": gid, "rid": rid, "message": invite_message}))
         run_notification_side_effect("group.invited.pending",
             lambda: notify_user(invited_uid, "group.invited", "你已被邀请加入群聊",
                 "{} 邀请你加入群 {}（需审核）。".format(format_user_display(uid), settings["groupname"]),
@@ -4335,6 +4696,12 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 group_id = int(recipient[1:])
             else:
                 return bool_res()[False]
+
+            if group_id is not None:
+                if not feature_gate(read_config(), "chat", "group_chat"):
+                    return {"error": "feature_disabled_group_chat"}
+            elif not feature_gate(read_config(), "chat", "private_chat"):
+                return {"error": "feature_disabled_private_chat"}
 
             source_message = None
             if forwarded >= 0:
@@ -4551,6 +4918,12 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             else:
                 return bool_res()[False]
 
+            if group_id is not None:
+                if not feature_gate(read_config(), "chat", "group_chat"):
+                    return {"error": "feature_disabled_group_chat"}
+            elif not feature_gate(read_config(), "chat", "private_chat"):
+                return {"error": "feature_disabled_private_chat"}
+
             records = messages_cursor.get_messages_by_mids(mids)
             selected = [records[m] for m in mids if m in records]
             if len(selected) != len(mids):
@@ -4726,6 +5099,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 "last_content": last["content"] if last else None,
                 "last_content_type": last["content_type"] if last else None,
                 "last_time": last["send_time"] if last else None,
+                "last_seq": last.get("last_seq") if last else None,
                 "last_deleted": bool(last.get("deleted")) if last else False,
                 "last_deleted_at": last.get("deleted_at") if last else None,
                 "last_file_name": last.get("file_name") if last else None,
@@ -4759,6 +5133,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                     "last_time": chat.get("last_time"),
                     "last_sender_uid": chat.get("last_sender_uid"),
                     "last_mid": chat.get("last_mid"),
+                    "last_seq": chat.get("last_seq"),
                     "last_deleted": bool(chat.get("last_deleted", False)),
                     "last_deleted_at": chat.get("last_deleted_at"),
                     "last_file": (
@@ -4789,6 +5164,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                     "last_time": chat.get("last_time"),
                     "last_sender_uid": chat.get("last_sender_uid"),
                     "last_mid": chat.get("last_mid"),
+                    "last_seq": chat.get("last_seq"),
                     "last_deleted": bool(chat.get("last_deleted", False)),
                     "last_deleted_at": chat.get("last_deleted_at"),
                     "last_file": (
@@ -4807,6 +5183,40 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 })
 
         result.sort(key=lambda x: x.get("last_time") or 0, reverse=True)
+
+        # 服务端未读
+        def _room_key_for(item):
+            if item["room_type"] == "group":
+                return messages_cursor.room_key_of(uid, 0, group_id=item["partner_uid"])
+            return messages_cursor.room_key_of(uid, item["partner_uid"])
+
+        room_keys = [_room_key_for(item) for item in result]
+        try:
+            messages_cursor.init_read_watermarks(uid, room_keys)
+            notify_level_map = {
+                _room_key_for(item): int(item.get("notify_level") or 0)
+                for item in result
+            }
+            unread_map = messages_cursor.bulk_unread_counts(
+                uid, room_keys, notify_level_map)
+        except Exception as e:
+            print("[WARN] chat_list: unread count failed for uid={}: {}".format(uid, e))
+            unread_map = {}
+        for item in result:
+            item["unread_count"] = unread_map.get(_room_key_for(item), 0)
+
+        # 可选分页：默认全量
+        try:
+            limit = int(req.get("limit", 0) or 0)
+            offset = int(req.get("offset", 0) or 0)
+        except (TypeError, ValueError):
+            return bool_res()[False]
+        if offset < 0 or limit < 0:
+            return bool_res()[False]
+        if offset > 0:
+            result = result[offset:]
+        if limit > 0:
+            result = result[:limit]
         return json.dumps(result, ensure_ascii=False)
 
     @api("/chat/preferences/update", methods=['POST'])
@@ -4984,7 +5394,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
         if group_id is not None:
             if not group_cursor.is_member(group_id, uid):
-                return bool_res()[False]
+                settings = group_cursor.get_group_settings(group_id)
+                if not settings or not settings.get("public_messages"):
+                    return bool_res()[False]
+                limit = min(limit, 50)
         elif has_target:
             if not user_cursor.is_friend(uid, target_uid):
                 return bool_res()[False]
@@ -5006,6 +5419,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             last_mid: 上次同步到的 mid（旧客户端迁移用，可选）
             missing_sequences: [seq, ...]（可选，精确缺口）
             missing_sequence_ranges: [{"start_seq": s, "end_seq": e}, ...]（可选）
+            capabilities: ["event_stream_v1", ...]（可选；声明后返回事件行，
+                未声明时事件行被过滤，被过滤的 seq 表现为永久空洞）
             limit: 每批上限（默认 100，最大 200）
 
         返回：
@@ -5018,6 +5433,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             last_seq = int(req.get("last_seq", 0))
             last_mid = int(req.get("last_mid", 0))
             limit = max(1, min(int(req.get("limit", 100)), SYNC_MAX_LIMIT))
+            capabilities = req.get("capabilities")
+            include_events = (
+                isinstance(capabilities, list)
+                and "event_stream_v1" in capabilities
+            )
         except (KeyError, TypeError, ValueError):
             return bool_res()[False]
         if not verify_user(uid, password):
@@ -5056,12 +5476,13 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 room_key,
                 after_seq=after_seq,
                 limit=limit + 1,
+                include_events=include_events,
             )
             has_more = len(incremental_records) > limit
             records = incremental_records[:limit]
             if missing_sequences:
                 missing_records = messages_cursor.query_missing_sequences(
-                    room_key, missing_sequences)
+                    room_key, missing_sequences, include_events=include_events)
                 by_mid = {r["mid"]: r for r in records}
                 for r in missing_records:
                     if r["mid"] not in by_mid:
@@ -5079,21 +5500,90 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             print("[WARN] message_sync failed: {}".format(e))
             return bool_res()[False]
 
-    @api("/friend/add_friend", methods=['POST'])
+    @api("/friend/add_friend", methods=['POST'], feature=("chat", "friend_request"))
     def add_friend(req):
         uid = req["uid"]
         password = req["password"]
         added = req["added"]
-        req_word = req["req_word"]
+        req_word = str(req.get("req_word", "") or "").strip()
         if not verify_user(uid, password):
             return bool_res()[False]
         if not user_cursor.uid_query(added):
             return bool_res()[False]
-        succeeded = user_cursor.pending_friend(uid, added, uid)
-        if succeeded:
+        max_len = read_config().get("max_request_message_length", 200)
+        if max_len > 0 and len(req_word) > max_len:
+            return json.dumps({"success": False, "error": "request_message_too_long"})
+        result = user_cursor.pending_friend(uid, added, uid, message=req_word)
+        if result == 'blocked':
+            return json.dumps({"success": False, "error": "friend_blocked"})
+        if result in ('created', 'flipped'):
+            if result == 'flipped':
+                # 对方已有一条旧申请通知，翻转后它不再可处理，先清掉再发新的
+                try:
+                    notification_cursor.delete_events_by_sender(added, "friend.request", uid)
+                except Exception as e:
+                    print("[WARN] add_friend 清理旧申请通知失败: {}".format(e))
             notify_user(added, "friend.request", "新的好友申请",
-                        "{} 请求添加你为好友。".format(format_user_display(uid)), sender=uid)
-        return bool_res()[succeeded]
+                        "{} 请求添加你为好友。".format(format_user_display(uid)),
+                        sender=uid, meta={"message": req_word})
+        # 'updated' 不重发通知；'created'/'flipped' 返回成功；None（已是好友）返回失败
+        return bool_res()[result is not None]
+
+    @api("/friend/requests", methods=['POST'])
+    def friend_requests(req):
+        """查看发给当前用户的待处理好友申请（含最新留言）。"""
+        uid = req["uid"]
+        password = req["password"]
+        if not verify_user(uid, password):
+            return bool_res()[False]
+        requests = user_cursor.list_pending_requests(uid)
+        if requests:
+            uids = [item["uid"] for item in requests]
+            placeholders = ",".join("?" * len(uids))
+            rows = user_cursor.query(
+                "SELECT uid, username, sign FROM users WHERE uid IN ({})".format(placeholders),
+                tuple(uids),
+            )
+            info_map = {r[0]: (r[1], r[2] or "") for r in rows}
+            for item in requests:
+                username, sign = info_map.get(item["uid"], ("User {}".format(item["uid"]), ""))
+                item["username"] = username
+                item["sign"] = sign
+        return json.dumps(requests, ensure_ascii=False)
+
+    @api("/friend/block", methods=['POST'])
+    def block_friend(req):
+        """拉黑用户"""
+        uid = req["uid"]
+        password = req["password"]
+        target = req.get("target")
+        if not verify_user(uid, password):
+            return bool_res()[False]
+        if target is None or not user_cursor.uid_query(target):
+            return bool_res()[False]
+        if not user_cursor.set_blocked(uid, target, uid):
+            return bool_res()[False]
+        # 双方可能残留的好友申请通知都不可再处理，清掉避免误导
+        try:
+            notification_cursor.delete_events_by_sender(uid, "friend.request", target)
+            notification_cursor.delete_events_by_sender(target, "friend.request", uid)
+        except Exception as e:
+            print("[WARN] block 清理申请通知失败: {}".format(e))
+        return bool_res()[True]
+
+    @api("/friend/unblock", methods=['POST'])
+    def unblock_friend(req):
+        """解除拉黑"""
+        uid = req["uid"]
+        password = req["password"]
+        target = req.get("target")
+        if not verify_user(uid, password):
+            return bool_res()[False]
+        if target is None or not user_cursor.uid_query(target):
+            return bool_res()[False]
+        if not user_cursor.unset_blocked(uid, target, uid):
+            return bool_res()[False]
+        return bool_res()[True]
 
     @api("/friend/deal_ship", methods=['POST'])
     def deal_ship(req):

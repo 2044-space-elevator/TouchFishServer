@@ -338,6 +338,7 @@
     "email_activate" : <email_activate>,
     "verify_email" : <verify_email>,
     "rate_limits" : <rate_limits>,
+    "settings_spec" : [ ... ],
     "default_asset_urls" : {
         "logo" : "/avatar/get_logo",
         "forum" : "/avatar/get_default/forum",
@@ -348,6 +349,14 @@
 ```
 
 其中 `verify_email` 仅在已启用邮箱验证时返回。
+
+`settings_spec` 是服务器可配置项的规格列表，客户端据此只展示当前支持的设置项：
+
+```
+[ {"key" : "server_name", "type" : "str", "default" : "TouchFish", "category" : "general"}, ... ]
+```
+
+`type` 为 `str` / `int` / `bool` / `enum` / `object`；`int` 项可带 `min`、`max`、`allow_unlimited`；`enum` 项带 `options`；`category` 用于分组展示。
 
 - `^ POST /auth/server_settings/update`
 
@@ -362,7 +371,8 @@
     "file_last_time" : <file_last_time>,
     "groups_limit" : <groups_limit>,
     "single_group_max_people" : <single_group_max_people>,
-    "max_file_size" : <max_file_size>
+    "max_file_size" : <max_file_size>,
+    "features" : { "forum" : false, "chat" : {"private_chat" : false} }
 }
 ```
 
@@ -373,8 +383,9 @@
 - `server_name` 必须是非空字符串
 - `file_last_time` 必须是大于等于 `0` 的整数
 - `groups_limit`、`single_group_max_people`、`max_file_size` 支持传入 `-1` 表示不限制
+- `features` 只接受已知键（见 `/info` 的 `features` 结构），叶值必须是布尔；未提交的键保持不变（深合并）。关闭后对应写端点返回 `FEATURE_DISABLED_*`（403）
 
-返回体与 `/auth/server_settings/query` 相同。
+返回体与 `/auth/server_settings/query` 相同。更新成功后服务端会立即热重载配置（含 WS 功能开关快照）。
 
 - `^ POST /avatar/upload_default_avatar`
 
@@ -527,9 +538,36 @@
 
 `<create_time>` 是用户创建时间，**为字符串形式的时间戳**。`<personal_sign>` 是个性签名，`<introduction>` 是自我介绍（约束中使用 Markdown 格式）。`<stat>` 是用户权限。
 
+`<email>` 遵守用户的「公开邮箱」开关：关闭后这里返回空字符串（字段保留）。
+本人查看自己的邮箱不受影响（见 `/auth/query_self`）。
+
 - `* GET /auth/username/<username>` 查询用户，以 `username` 查询。
 
 返回体和返回体含义同上。
+
+- `^ POST /auth/query_self` 查询自己的完整资料（鉴权）。
+
+请求体：同其它 secret 接口（无需额外字段）。
+
+返回体与 `/auth/uid/<uid>` 相同，但 `<email>` 恒为真实邮箱，并追加：
+
+```
+{
+    "public_email" : <true_or_false>
+}
+```
+
+- `^ POST /auth/change_public_email` 设置邮箱是否对外公开（鉴权）。
+
+请求体：
+
+```
+{
+    "public_email" : <true_or_false>
+}
+```
+
+`<public_email>` 必须为布尔值。默认公开；关闭后公共查询接口返回空邮箱，管理端查询不受影响。
 
 - `^ POST /auth/mention_candidates` 获取可被 @提及的用户列表。
 
@@ -598,13 +636,20 @@
 
 注册成功返回时间戳加 True，否则返回时间戳加 False。需注意如果要邮箱验证，用户初始状态为 `banned`。
 
-## 第三方签发（OIDC 基础）
+## 第三方签发（外部平台登录）
 
-当前服务端**默认仅自签 HS256 access/refresh token**，准备支持第三方验证服务，接入时修改 `res/<port_api>/config.json` 增加 `jwt_external_issuers` 配置即可。
+服务端支持**外部平台登录（断言模型，非 OAuth）**：外部平台用自己的私钥签发 JWT，本服凭配置的公钥验签，再经 `/auth/external/login` 换取本地 access/refresh 会话。换取之后，刷新、设备（会话）管理、踢出、WebSocket 鉴权全部与密码登录完全一致。
+
+流程总览：
+
+1. 用户在外部平台完成登录，外部平台签发 JWT；
+2. 客户端把该 JWT 作为 `external_token` 调用 `/auth/external/login`；
+3. 服务端验签，按 `(iss, sub)` 查找已绑定的本地账号（或按 issuer 配置自动建号），签发本地会话；
+4. 之后所有请求（HTTP 与 WebSocket）都使用本地 access token，不再需要外部 token。
 
 ### 配置方式
 
-在 `config.json` 中新增 `jwt_external_issuers` 数组，每个元素描述一个可信的外部签发方：
+在 `res/<port_api>/config.json` 中新增 `jwt_external_issuers` 数组，每个元素描述一个可信的外部签发方：
 
 ```json
 {
@@ -613,7 +658,8 @@
       "iss": "https://idp.example.com",
       "algorithms": ["RS256"],
       "audience": "touchfish",
-      "public_key_pem": "res/<port_api>/secret/idp_public.pem"
+      "public_key_pem": "res/<port_api>/secret/idp_public.pem",
+      "allow_auto_create": false
     }
   ]
 }
@@ -627,20 +673,111 @@
 | `algorithms` | 否 | 允许的签名算法，默认 `["RS256"]`（支持 RS256/ES256 等非对称算法） |
 | `audience` | 否 | 期望的 `aud`；不填则不校验 audience |
 | `public_key_pem` | 是 | 签发方的公钥（RSA/EC PEM 字符串，或指向 PEM 文件的路径） |
+| `allow_auto_create` | 否 | 未绑定的外部身份是否自动创建本地账号，默认 `false`（即默认只允许绑定已有账号）。自动建号使用随机密码、状态为 `user`；用户名优先取 token 的 `username`/`preferred_username` claim，缺失或冲突时回退为 `ext_<sub>` 并加数字后缀 |
 
 `public_key_pem` 既可以直接内联 PEM 文本，也可以填文件路径（如 `res/<port_api>/secret/idp_public.pem`）。
 
-### 外部 token
+> 配置在服务端启动时缓存，修改 `config.json` 后需**重启服务端**才能生效。请勿配置重复的 `iss`（重复时条目查找只取第一条）。
 
-由外部服务签发的 token 验签通过后才会被接受：
+### 外部 token 的要求
 
-- `sub`：本地用户 `uid`（整数，或可 `int()` 转换的字符串）
-- `av`：本地用户的 `auth_version`（改密/封禁后递增，外部 token 若 `av` 不匹配同样会被拒绝）
-- `iss`：必须命中 `jwt_external_issuers` 中的某个 `iss`
+- `iss`：必须命中 `jwt_external_issuers` 中某个条目的 `iss`；
+- `sub`：非空字符串，是外部平台内部的用户标识（**不是**本地 uid）；
+- `username` / `preferred_username` / `email`：可选 claim，仅在自动建号时使用（`email` 需通过格式与唯一性校验才会写入）；
+- 映射键为 `(iss, sub)`：一个本地账号在同一 issuer 下最多绑定一个外部身份。
 
-外部 token **不查询**本地 `tokens` / `auth_sessions`。
+### POST /auth/external/login 外部登录
 
-### 校验流程
+用外部 token 换取本地会话，无需预先认证。
+
+请求体：
+
+```
+{
+    "external_token": "<外部签发的 JWT>",
+    "device_id": "<可选，设备标识>",
+    "device_name": "<可选，设备名称>",
+    "platform": "<可选，平台编号>"
+}
+```
+
+`device_id` / `device_name` / `platform` 语义与 `jwt:true` 的 `/auth/login` 相同。
+
+成功返回与 `/auth/login`（`jwt:true`）相同：
+
+```
+{
+    "token": "<access_jwt>",
+    "refresh_token": "<refresh_token>",
+    "expires_in": <access_seconds>,
+    "refresh_expires_in": <refresh_seconds>,
+    "expires_at": <ts>
+}
+```
+
+错误：
+
+| 返回 | 说明 |
+| --- | --- |
+| `{"error": "external_token_invalid"}` | 外部 token 缺失、验签失败、过期，或 `iss` 不在配置中 |
+| `{"error": "external_not_linked"}` | 身份有效但未绑定本地账号，且该 issuer 未开启 `allow_auto_create`（应先用 `/auth/external/bind` 绑定） |
+| `{"error": "user_banned"}` | 所绑定账号已被封禁 |
+| `{"error": "conflict"}` | 自动建号失败（用户名等资源冲突） |
+| `{"error": "token_limit_reached"}` | 达到 `jwt_max_per_user` 上限且无法自动替换旧会话 |
+
+> **注意**：外部 token 必须放在 `external_token` 字段中，**不能放在 `token` 字段**——`token` 字段会被当成本地认证信息处理。
+
+### POST /auth/external/bind 绑定外部身份
+
+把外部身份绑定到当前登录的本地账号，需携带本地会话 `token`。
+
+请求体：
+
+```
+{
+    "token": "<本地 access token>",
+    "external_token": "<外部签发的 JWT>"
+}
+```
+
+返回 `{"success": true}`；重复绑定同一身份到同一账号时为幂等成功。
+
+错误：`{"error": "external_token_invalid"}`；`{"error": "external_already_linked"}`（该身份已绑定其他账号，或当前账号在该 issuer 下已有其他绑定）。
+
+### POST /auth/external/unbind 解绑外部身份
+
+请求体：
+
+```
+{
+    "token": "<本地 access token>",
+    "iss": "<issuer>"
+}
+```
+
+返回 `{"success": true}`；无此绑定返回 `{"error": "not_found"}`。解绑不影响本地账号、既有会话与密码。
+
+### POST /auth/external/list 查询已绑定身份
+
+请求体：
+
+```
+{
+    "token": "<本地 access token>"
+}
+```
+
+返回：
+
+```
+{
+    "identities": [
+        {"iss": <issuer>, "sub": <外部用户标识>, "created_at": <ts>}
+    ]
+}
+```
+
+### 校验流程与旧版路径
 
 `resolve_auth` 的 token 校验顺序：
 
@@ -648,7 +785,17 @@
 2. 本地验签失败时，若配置了 `jwt_external_issuers`，则逐一尝试外部签发方验签；
 3. 都失败返回 `token_expired`。
 
+**旧版直接接受（legacy，不推荐）**：外部 token 也可以直接放在普通请求的 `token` 字段中作为 bearer 使用（不产生本地会话，逐请求验签）。该路径要求 token 携带 `av` claim 且 `sub` 必须是已存在的本地 uid（整数），`av` 外部平台无法自行得知，仅适合能读取本服状态的深度集成场景。新接入请使用 `/auth/external/login`。
+
+### 安全说明
+
+- `sub` 绝不会被自动解释为本地 uid，外部身份必须显式绑定（`/auth/external/bind`）或在 issuer 允许时自动建号；
+- 修改密码会吊销本地会话（`auth_version` 递增），但不会删除绑定关系；封禁账号会拒绝外部登录（`user_banned`）；
+- `/info` 会下发 `external_login_issuers`（仅 `iss` 标识列表，不含任何密钥），供客户端发现可用的外部登录方式；
+- 自动建号的账号初始密码为随机值，本人无法用密码登录；登录后可通过 `/auth/change_pwd` 设置密码。
+
 ### 不支持
 
-- 不拉取远程 JWKS（`jwks_uri` 尚未实现，需静态提供公钥 PEM）。
-- `sub` 账号自动创建未实现（外部 `sub` 必须是已存在的本地 `uid`）。
+- 不拉取远程 JWKS（`jwks_uri` 尚未实现，需静态提供公钥 PEM）；
+- `sub` 必须为字符串（PyJWT 会校验），非字符串 `sub` 的签发方需要调整；
+- 自动建号不支持指定初始权限（固定为 `user`）。

@@ -20,6 +20,7 @@
 - [group.md](group.md) 群聊相关 API
 - [message.md](message.md) 消息与聊天相关 API
 - [notification.md](notification.md) 通知系统与实时推送 API
+- [search.md](search.md) 用户/群组搜索 API
 - [sticker.md](sticker.md) 表情包相关（为什么要单开呢？我也不知道） API
 - [errors.md](errors.md) 错误码、详细错误响应与兼容规则
 

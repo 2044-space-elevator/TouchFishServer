@@ -101,6 +101,32 @@ class UserDb(Db):
         """
         return self.query("SELECT * FROM users WHERE email = ?",  (email,))
 
+    def search_users(self, keyword: str, limit: int = 20, exclude_uid=None):
+        """按用户名搜索（前缀匹配优先，回退模糊），排除封禁用户
+        """
+        if not isinstance(keyword, str) or not keyword:
+            return []
+        escaped = (
+            keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        params = ["%" + escaped + "%"]
+        where = "WHERE stat != 'banned' AND username LIKE ? ESCAPE '\\'"
+        if exclude_uid is not None:
+            where += " AND uid != ?"
+            params.append(int(exclude_uid))
+        params.append(escaped + "%")
+        params.append(int(limit))
+        rows = self.query(
+            "SELECT uid, username, sign FROM users " + where +
+            " ORDER BY CASE WHEN username LIKE ? ESCAPE '\\' THEN 0 ELSE 1 END,"
+            " username ASC LIMIT ?",
+            tuple(params),
+        )
+        return [
+            {"uid": r[0], "username": r[1], "sign": r[2] or ""}
+            for r in rows
+        ]
+
     def _fetchone_locked(self, command : str, parameters : tuple = ()):
         self.cursor.execute(command, parameters)
         return self.cursor.fetchone()
@@ -226,12 +252,15 @@ class UserDb(Db):
         create_time REAL,
         sign TEXT,
         introduction TEXT,
-        auth_version INTEGER DEFAULT 0
+        auth_version INTEGER DEFAULT 0,
+        public_email INTEGER NOT NULL DEFAULT 1
     )
     """
         self.execute(cmd)
         self._migrate_auth_version()
+        self._migrate_public_email()
         self.create_token_table()
+        self.create_identity_table()
 
     def _migrate_auth_version(self):
         """为旧数据库补充 auth_version"""
@@ -242,6 +271,20 @@ class UserDb(Db):
         if "auth_version" not in columns:
             try:
                 self.execute("ALTER TABLE users ADD COLUMN auth_version INTEGER DEFAULT 0")
+            except Exception:
+                pass
+
+    def _migrate_public_email(self):
+        """为旧数据库补充 public_email（新列追加在表尾，不影响 SELECT * 的既有列序）"""
+        try:
+            columns = [row[1] for row in self.query("PRAGMA table_info(users)")]
+        except Exception:
+            return
+        if "public_email" not in columns:
+            try:
+                self.execute(
+                    "ALTER TABLE users ADD COLUMN public_email INTEGER NOT NULL DEFAULT 1"
+                )
             except Exception:
                 pass
 
@@ -303,6 +346,22 @@ class UserDb(Db):
             pass
         
         self._migrate_session_columns()
+
+    def create_identity_table(self):
+        self.execute("""
+    CREATE TABLE IF NOT EXISTS user_identities (
+        iss TEXT NOT NULL,
+        sub TEXT NOT NULL,
+        uid INTEGER NOT NULL,
+        created_at REAL NOT NULL,
+        PRIMARY KEY (iss, sub),
+        UNIQUE (uid, iss)
+    )
+    """)
+        try:
+            self.execute("CREATE INDEX IF NOT EXISTS idx_user_identities_uid ON user_identities(uid)")
+        except Exception:
+            pass
 
     @staticmethod
     def hash_refresh_token(refresh_token):
@@ -505,6 +564,42 @@ class UserDb(Db):
             print(e)
             return False
 
+    def get_identity_uid(self, iss, sub):
+        """按外部身份 (iss, sub) 查询绑定的本地 uid。"""
+        rows = self.query("SELECT uid FROM user_identities WHERE iss = ? AND sub = ?", (iss, sub))
+        return rows[0][0] if rows else None
+
+    def bind_identity(self, iss, sub, uid):
+        """绑定外部身份到本地账号。冲突（身份已被占用或 uid+iss 已有绑定）返回 False。"""
+        try:
+            self.execute(
+                "INSERT INTO user_identities (iss, sub, uid, created_at) VALUES (?, ?, ?, ?)",
+                (iss, sub, uid, time.time()),
+            )
+            return True
+        except Exception as e:
+            print(e)
+            return False
+
+    def list_identities(self, uid):
+        """列出某用户已绑定的外部身份。"""
+        return self.query(
+            "SELECT iss, sub, created_at FROM user_identities WHERE uid = ? ORDER BY created_at",
+            (uid,),
+        )
+
+    def unbind_identity(self, uid, iss):
+        """解绑某用户在某 issuer 下的外部身份。"""
+        existed = self.query("SELECT 1 FROM user_identities WHERE uid = ? AND iss = ?", (uid, iss))
+        if not existed:
+            return False
+        try:
+            self.execute("DELETE FROM user_identities WHERE uid = ? AND iss = ?", (uid, iss))
+            return True
+        except Exception as e:
+            print(e)
+            return False
+
     def _migrate_session_columns(self):
         """为旧数据库的 auth_sessions 表补充 device_id 和 location 列"""
         try:
@@ -632,6 +727,8 @@ class UserDb(Db):
         adder INTEGER NOT NULL,
         blocked_by_user1 BOOLEAN,
         blocked_by_user2 BOOLEAN,
+        request_message TEXT NOT NULL DEFAULT '',
+        request_at REAL NOT NULL DEFAULT 0,
         UNIQUE(user1, user2)
     )
     """
@@ -639,8 +736,23 @@ class UserDb(Db):
         adder 是添加者的 uid
         如果 pending 后另一方拒绝成为好友，默认删除关系
         被拉黑的不再有请求成为好友的权限
+        request_message/request_at 记录最新一次申请的留言与时间（重复申请就地更新）
         """
         self.execute(cmd)
+        # 旧库补列（重复执行安全）
+        try:
+            columns = [row[1] for row in self.query("PRAGMA table_info(friendship)")]
+        except Exception:
+            columns = []
+        for col, ddl in (
+            ("request_message", "TEXT NOT NULL DEFAULT ''"),
+            ("request_at", "REAL NOT NULL DEFAULT 0"),
+        ):
+            if col not in columns:
+                try:
+                    self.execute("ALTER TABLE friendship ADD COLUMN {} {}".format(col, ddl))
+                except Exception:
+                    pass
         # #26: 为已有数据库补建唯一索引，防止并发重复插入
         try:
             self.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_friendship_pair ON friendship(user1, user2)")
@@ -667,20 +779,146 @@ class UserDb(Db):
         self.execute("UPDATE friendship SET relationship = ? WHERE user1 = ? and user2 = ?", (newrelationship, uida, uidb))
         return True
     
-    def pending_friend(self, uida, uidb, adder):
+    def pending_friend(self, uida, uidb, adder, message: str = ''):
+        """好友申请：未拉黑即可申请；始终只保留一条最新 pending。
+
+        返回：
+          'created' —— 首次申请（新行）
+          'updated' —— 同一人重复申请，就地更新留言/时间（不新增行）
+          'flipped' —— 对方反过来申请，申请者翻转（供接收方交给原申请者）
+          'blocked' —— 存在拉黑，拒绝
+          None      —— 已是好友（或参数非法）
+        """
         if adder != uida and adder != uidb:
-            return False
-
+            return None
         if uida == uidb:
-            return False
-        if self.query_relationship(uida, uidb):
-            return False
+            return None
+        lo, hi = (uida, uidb) if uida < uidb else (uidb, uida)
+        with self.lock:
+            def operation():
+                now = time.time()
+                self.cursor.execute(
+                    "SELECT relationship, adder, blocked_by_user1, blocked_by_user2 "
+                    "FROM friendship WHERE user1 = ? AND user2 = ?",
+                    (lo, hi),
+                )
+                current = self.cursor.fetchone()
+                if current is None:
+                    self.cursor.execute(
+                        "INSERT INTO friendship (user1, user2, adder, relationship,"
+                        " blocked_by_user1, blocked_by_user2, request_message, request_at)"
+                        " VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)",
+                        (lo, hi, adder, False, False, message, now),
+                    )
+                    self.conn.commit()
+                    return 'created'
+                relationship, current_adder, blocked1, blocked2 = current
+                if relationship == 'friend':
+                    self.conn.commit()
+                    return None
+                if relationship == 'blocked' or blocked1 or blocked2:
+                    self.conn.commit()
+                    return 'blocked'
+                result = 'updated' if current_adder == adder else 'flipped'
+                self.cursor.execute(
+                    "UPDATE friendship SET adder = ?, request_message = ?, request_at = ? "
+                    "WHERE user1 = ? AND user2 = ?",
+                    (adder, message, now, lo, hi),
+                )
+                self.conn.commit()
+                return result
+            return self._execute_with_retry(operation)
 
-        if uida > uidb:
-            uida, uidb = uidb, uida
+    def list_pending_requests(self, uid: int) -> list:
+        """返回发给该用户的待处理好友申请（对方发起、自己尚未处理），按时间倒序。"""
+        rows = self.query(
+            "SELECT user1, user2, adder, request_message, request_at FROM friendship "
+            "WHERE relationship = 'pending' AND (user1 = ? OR user2 = ?)",
+            (uid, uid),
+        )
+        result = []
+        for user1, user2, adder, message, request_at in rows:
+            if adder == uid:
+                continue  # 自己发出的申请不在收件列表
+            applicant = user1 if adder == user1 else user2
+            result.append({
+                "uid": applicant,
+                "message": message or "",
+                "request_at": request_at or 0,
+            })
+        result.sort(key=lambda item: item["request_at"], reverse=True)
+        return result
 
-        self.execute("INSERT INTO friendship (user1, user2, adder, relationship, blocked_by_user1, blocked_by_user2) VALUES (?, ?, ?, 'pending', ?, ?)", (uida, uidb, adder, False, False))
-        return True
+    def set_blocked(self, uida, uidb, blocker) -> bool:
+        """拉黑：写 blocked 关系并标记拉黑方；已有关系（含 pending/friend）被覆盖。"""
+        if uida == uidb or blocker not in (uida, uidb):
+            return False
+        lo, hi = (uida, uidb) if uida < uidb else (uidb, uida)
+        with self.lock:
+            def operation():
+                self.cursor.execute(
+                    "SELECT 1 FROM friendship WHERE user1 = ? AND user2 = ?", (lo, hi))
+                exists = self.cursor.fetchone() is not None
+                if exists:
+                    column = "blocked_by_user1" if blocker == lo else "blocked_by_user2"
+                    self.cursor.execute(
+                        "UPDATE friendship SET relationship = 'blocked', {} = ? "
+                        "WHERE user1 = ? AND user2 = ?".format(column),
+                        (True, lo, hi),
+                    )
+                else:
+                    self.cursor.execute(
+                        "INSERT INTO friendship (user1, user2, adder, relationship,"
+                        " blocked_by_user1, blocked_by_user2, request_message, request_at)"
+                        " VALUES (?, ?, ?, 'blocked', ?, ?, '', 0)",
+                        (lo, hi, blocker,
+                         blocker == lo, blocker == hi),
+                    )
+                self.conn.commit()
+                return True
+            return self._execute_with_retry(operation)
+
+    def unset_blocked(self, uida, uidb, blocker) -> bool:
+        """解除拉黑：清除自己的拉黑标记；双方均无标记时删除整行（可重新申请）。
+
+        对不存在或非 blocked 的关系是幂等空操作（返回 True）。
+        """
+        if uida == uidb or blocker not in (uida, uidb):
+            return False
+        lo, hi = (uida, uidb) if uida < uidb else (uidb, uida)
+        with self.lock:
+            def operation():
+                self.cursor.execute(
+                    "SELECT relationship, blocked_by_user1, blocked_by_user2 "
+                    "FROM friendship WHERE user1 = ? AND user2 = ?",
+                    (lo, hi),
+                )
+                row = self.cursor.fetchone()
+                if row is None or row[0] != 'blocked':
+                    self.conn.commit()
+                    return True
+                if blocker == lo:
+                    other_flag = row[2]
+                    self.cursor.execute(
+                        "UPDATE friendship SET blocked_by_user1 = ? "
+                        "WHERE user1 = ? AND user2 = ?",
+                        (False, lo, hi),
+                    )
+                else:
+                    other_flag = row[1]
+                    self.cursor.execute(
+                        "UPDATE friendship SET blocked_by_user2 = ? "
+                        "WHERE user1 = ? AND user2 = ?",
+                        (False, lo, hi),
+                    )
+                if not other_flag:
+                    self.cursor.execute(
+                        "DELETE FROM friendship WHERE user1 = ? AND user2 = ?",
+                        (lo, hi),
+                    )
+                self.conn.commit()
+                return True
+            return self._execute_with_retry(operation)
 
     def ensure_friend(self, uida, uidb):
         """Create an accepted friendship, or leave an existing relation intact."""
@@ -809,6 +1047,7 @@ class UserDb(Db):
                 if not current:
                     return False
                 self.cursor.execute("DELETE FROM friendship WHERE user1 = ? OR user2 = ? OR adder = ?", (uid, uid, uid))
+                self.cursor.execute("DELETE FROM user_identities WHERE uid = ?", (uid,))
                 self.cursor.execute("DELETE FROM users WHERE uid = ?", (uid,))
                 self.conn.commit()
                 return True
@@ -832,6 +1071,7 @@ class UserDb(Db):
                         return False
 
                 self.cursor.execute("DELETE FROM friendship WHERE user1 = ? OR user2 = ? OR adder = ?", (uid, uid, uid))
+                self.cursor.execute("DELETE FROM user_identities WHERE uid = ?", (uid,))
                 self.cursor.execute("DELETE FROM users WHERE uid = ?", (uid,))
                 self.conn.commit()
                 return True
@@ -844,6 +1084,14 @@ class UserDb(Db):
     
     def change_sign(self, oped : int, new_sign : str):
         self.execute("UPDATE users SET sign = ? where uid = ?", (new_sign, oped))
+
+    def set_public_email(self, uid : int, public : bool) -> bool:
+        """设置是否对外公开邮箱（默认公开）。"""
+        self.execute(
+            "UPDATE users SET public_email = ? WHERE uid = ?",
+            (1 if public else 0, uid),
+        )
+        return True
 
     def change_introduction(self, oped : int, new_intro : str):
         self.execute('UPDATE users SET introduction = ? where uid = ?', (new_intro, oped))
