@@ -11,6 +11,10 @@ email_regex = r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b'
 ALLOWED_USER_STATS = {"user", "banned", "admin", "root"}
 _UNSET = object()
 
+USERS_COL_PUBLIC_EMAIL = 9
+USERS_COL_SHOW_READ_STATUS = 10
+USERS_COL_SHOW_ONLINE_STATUS = 11
+
 class UserDb(Db):
     def __init__(self, hasher, path : str, port_api : int, port_tcp : int, dialect=None):
         super().__init__(path, port_api, port_tcp, dialect=dialect)
@@ -253,12 +257,15 @@ class UserDb(Db):
         sign TEXT,
         introduction TEXT,
         auth_version INTEGER DEFAULT 0,
-        public_email INTEGER NOT NULL DEFAULT 1
+        public_email INTEGER NOT NULL DEFAULT 1,
+        show_read_status INTEGER NOT NULL DEFAULT 1,
+        show_online_status INTEGER NOT NULL DEFAULT 1
     )
     """
         self.execute(cmd)
         self._migrate_auth_version()
         self._migrate_public_email()
+        self._migrate_show_status_flags()
         self.create_token_table()
         self.create_identity_table()
 
@@ -287,6 +294,25 @@ class UserDb(Db):
                 )
             except Exception:
                 pass
+
+    def _migrate_show_status_flags(self):
+        """为旧数据库补充隐私状态开关列（追加在表尾，不影响 SELECT * 的既有列序）"""
+        column_defs = {
+            "show_read_status": "INTEGER NOT NULL DEFAULT 1",
+            "show_online_status": "INTEGER NOT NULL DEFAULT 1",
+        }
+        try:
+            columns = [row[1] for row in self.query("PRAGMA table_info(users)")]
+        except Exception:
+            return
+        for name, definition in column_defs.items():
+            if name not in columns:
+                try:
+                    self.execute(
+                        "ALTER TABLE users ADD COLUMN {} {}".format(name, definition)
+                    )
+                except Exception:
+                    pass
 
     def create_token_table(self):
         cmd = """
@@ -768,7 +794,33 @@ class UserDb(Db):
     def is_friend(self, uida, uidb):
         relationship = self.query_relationship(uida, uidb)
         return bool(relationship and relationship[0][2] == 'friend')
+
+    def list_friend_uids(self, uid):
+        """返回该用户所有好友的 uid 列表（relationship='friend' 的对端）。"""
+        rows = self.query(
+            "SELECT user1, user2 FROM friendship "
+            "WHERE relationship = 'friend' AND (user1 = ? OR user2 = ?)",
+            (uid, uid),
+        )
+        result = []
+        for user1, user2 in rows:
+            other = user2 if user1 == uid else user1
+            if other != uid:
+                result.append(int(other))
+        return result
     
+    def list_blocked_by(self, uid):
+        """返回该用户拉黑的对端 uid 列表（不含拉黑他的：那部分只有对方能解除）。"""
+        rows = self.query(
+            "SELECT CASE WHEN user1 = ? THEN user2 ELSE user1 END "
+            "FROM friendship "
+            "WHERE relationship = 'blocked' AND (user1 = ? OR user2 = ?) "
+            "AND ((user1 = ? AND blocked_by_user1 = 1) "
+            "     OR (user2 = ? AND blocked_by_user2 = 1))",
+            (uid, uid, uid, uid, uid),
+        )
+        return [int(r[0]) for r in rows]
+
     def change_relationship(self, uida, uidb, newrelationship):
         if newrelationship not in ['pending', 'blocked', 'friend']:
             return False
@@ -1092,6 +1144,47 @@ class UserDb(Db):
             (1 if public else 0, uid),
         )
         return True
+
+    def set_show_read_status(self, uid: int, show: bool) -> bool:
+        """设置是否向他人展示自己的已读状态（默认展示）。"""
+        self.execute(
+            "UPDATE users SET show_read_status = ? WHERE uid = ?",
+            (1 if show else 0, uid),
+        )
+        return True
+
+    def set_show_online_status(self, uid: int, show: bool) -> bool:
+        """设置是否向好友展示自己的在线状态（默认展示）。"""
+        self.execute(
+            "UPDATE users SET show_online_status = ? WHERE uid = ?",
+            (1 if show else 0, uid),
+        )
+        return True
+
+    def get_show_status_flags(self, uids) -> dict:
+        """批量读取用户的隐私状态开关。
+
+        返回 {uid: {"show_read_status": bool, "show_online_status": bool}}；
+        未包含的 uid 视为缺省（展示），可由调用方按需回退。
+        """
+        uid_list = sorted({int(u) for u in uids})
+        if not uid_list:
+            return {}
+        result = {}
+        for i in range(0, len(uid_list), 500):
+            chunk = uid_list[i:i + 500]
+            placeholders = ",".join(["?"] * len(chunk))
+            rows = self.query(
+                "SELECT uid, show_read_status, show_online_status FROM users "
+                "WHERE uid IN ({})".format(placeholders),
+                tuple(chunk),
+            )
+            for row in rows:
+                result[int(row[0])] = {
+                    "show_read_status": bool(row[1]),
+                    "show_online_status": bool(row[2]),
+                }
+        return result
 
     def change_introduction(self, oped : int, new_intro : str):
         self.execute('UPDATE users SET introduction = ? where uid = ?', (new_intro, oped))

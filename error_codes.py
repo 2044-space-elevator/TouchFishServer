@@ -2,6 +2,7 @@
 ERROR！！！！！
 错误都在这了！
 """
+import time
 
 ERRORS = {
     "token_expired": ("AUTH_TOKEN_EXPIRED", "Token has expired", 401),
@@ -22,6 +23,8 @@ ERRORS = {
     "feature_disabled_forum": ("FEATURE_DISABLED_FORUM", "The forum is disabled on this server", 403),
     "feature_disabled_sticker": ("FEATURE_DISABLED_STICKER", "Stickers are disabled on this server", 403),
     "feature_disabled_announcement": ("FEATURE_DISABLED_ANNOUNCEMENT", "Announcements are disabled on this server", 403),
+    "feature_disabled_chat_read_receipt": ("FEATURE_DISABLED_CHAT_READ_RECEIPT", "Read receipts are disabled on this server", 403),
+    "feature_disabled_presence": ("FEATURE_DISABLED_PRESENCE", "Presence is disabled on this server", 403),
     "Invalid uid": ("VALIDATION_INVALID_UID", "User ID is invalid", 400),
     "invalid_uid": ("VALIDATION_INVALID_UID", "User ID is invalid", 400),
     "Invalid filename": ("VALIDATION_INVALID_FILENAME", "Filename is invalid", 400),
@@ -79,6 +82,18 @@ ERRORS = {
 }
 
 
+def legacy_bool_text(success: bool = False) -> str:
+    return "{}{}".format(time.time(), "True" if success else "False")
+
+
+def legacy_failure_body(response):
+    if (isinstance(response, dict)
+            and "error" in response
+            and response.get("success") is not True):
+        return legacy_bool_text(False)
+    return response
+
+
 def normalize_error(response, detailed=False):
     if not isinstance(response, dict) or "error" not in response or not detailed:
         return response, 200
@@ -86,6 +101,14 @@ def normalize_error(response, detailed=False):
     metadata = ERRORS.get(old_code)
     if metadata is None and old_code.startswith("Missing chunk "):
         metadata = ("FILE_MISSING_CHUNK", "One or more file chunks are missing", 400)
+    if metadata is None and old_code.startswith("feature_disabled_"):
+        # @api(feature=(...)) 关掉的开关 403 FEATURE_DISABLED_*
+        feature_name = old_code[len("feature_disabled_"):].upper()
+        metadata = (
+            "FEATURE_DISABLED_" + feature_name,
+            "This feature is disabled on this server",
+            403,
+        )
     code, message, status = metadata or ("SERVER_ERROR", old_code, 500)
     normalized = dict(response)
     normalized["error"] = code

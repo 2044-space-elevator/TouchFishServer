@@ -108,6 +108,17 @@ TFV5 的文件存储系统基于哈希去重和用户配额管理。同一文件
 - 文件名和扩展名是否合法
 - 用户存储配额是否足够（若文件内容已存在且用户已有该文件则不重复计费）
 
+被拒时返回 JSON 错误对象（而不是 bool 接口的纯文本 `"<时间戳>False"`，后者不是合法 JSON）——**仅当请求声明了 `detail_error: true`**，未声明时按[错误文档](errors.md)继续回纯文本：
+
+```json
+{
+    "success" : false,
+    "error" : "auth_failed" | "invalid_request" | "banned" | "Storage quota exceeded" | "upload_failed"
+}
+```
+
+`detail_error` 模式下为规范化错误码（`AUTH_FAILED` / `VALIDATION_INVALID_REQUEST` / `RESOURCE_USER_BANNED` / `FILE_STORAGE_QUOTA_EXCEEDED` / `FILE_UPLOAD_FAILED`）。
+
 ### 秒传
 
 - `^ POST /file/instant_upload` 使用文件的 SHA256 哈希登记用户文件，避免重复上传已经存在于服务器上的文件。

@@ -553,7 +553,9 @@
 
 ```
 {
-    "public_email" : <true_or_false>
+    "public_email" : <true_or_false>,
+    "show_read_status" : <true_or_false>,
+    "show_online_status" : <true_or_false>
 }
 ```
 
@@ -568,6 +570,26 @@
 ```
 
 `<public_email>` 必须为布尔值。默认公开；关闭后公共查询接口返回空邮箱，管理端查询不受影响。
+
+- `^ POST /auth/change_privacy` 设置隐私开关（鉴权）。
+
+请求体（字段可选，缺省表示不改动；至少提供一个）：
+
+```
+{
+    "show_read_status" : <true_or_false>,
+    "show_online_status" : <true_or_false>
+}
+```
+
+- `show_read_status`：是否向他人展示自己的已读状态（默认展示）。关闭后私聊对方不再收到你的已读回执与推送。
+- `show_online_status`：是否向好友展示自己的在线状态（默认展示）。关闭后好友侧立即清除在线指示，且不再收到你的上下线事件。
+
+所有字段必须为布尔值；至少提供一个字段，否则不产生任何改动。
+
+成功按 bool 约定返回时间戳加 `True`（与 `/auth/change_pwd` 等一致）。被拒时返回 JSON 错误对象（**仅当请求声明了 `detail_error: true`**，未声明时按[错误文档](errors.md)回 bool 接口的纯文本）：`auth_failed` / `invalid_request`（字段不是布尔值、或一个字段都没给）。
+
+变更会向该账号所有在线连接推送 `PRIVACY.UPDATED`（附带变更字段），便于多端同步。
 
 - `^ POST /auth/mention_candidates` 获取可被 @提及的用户列表。
 

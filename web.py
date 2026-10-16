@@ -9,6 +9,11 @@ import binascii
 import os
 import secrets
 from db import *
+from db.user import (
+    USERS_COL_PUBLIC_EMAIL,
+    USERS_COL_SHOW_READ_STATUS,
+    USERS_COL_SHOW_ONLINE_STATUS,
+)
 import avatar
 import file
 
@@ -25,28 +30,37 @@ from datetime import datetime
 from file_types import IMAGE_TYPES, detect_file_type, is_sticker_type
 import oss_store
 from sync_limits import SYNC_MAX_LIMIT, parse_sync_missing_sequences
+from error_codes import legacy_bool_text
 
 def bool_res() -> tuple:
-    return (str(time.time()) + "False", str(time.time()) + "True")
+    return (legacy_bool_text(False), legacy_bool_text(True))
 
-# 搜索端点 不准你乱搜
-_search_rate_lock = threading.Lock()
-_search_rate_hits: dict = {}
+# 端点级内存限流：按 (uid, bucket) 计数，各端点各占一个桶
+_rate_limit_lock = threading.Lock()
+_rate_limit_hits: dict = {}
 
-def check_search_rate(uid, max_per_window: int = 20, window: float = 10.0) -> bool:
+def check_rate_limit(uid, bucket: str, max_per_window: int,
+                     window: float = 10.0) -> bool:
+    """按 (uid, bucket) 限流
+    """
     now = time.time()
-    with _search_rate_lock:
-        hits = [t for t in _search_rate_hits.get(uid, []) if t > now - window]
+    key = (uid, bucket)
+    with _rate_limit_lock:
+        hits = [t for t in _rate_limit_hits.get(key, []) if t > now - window]
         if len(hits) >= max_per_window:
-            _search_rate_hits[uid] = hits
+            _rate_limit_hits[key] = hits
             return False
         hits.append(now)
-        _search_rate_hits[uid] = hits
-        if len(_search_rate_hits) > 4096:
-            for key in [k for k, v in _search_rate_hits.items()
-                        if not v or v[-1] < now - window]:
-                _search_rate_hits.pop(key, None)
+        _rate_limit_hits[key] = hits
+        if len(_rate_limit_hits) > 4096:
+            for stale in [k for k, v in _rate_limit_hits.items()
+                          if not v or v[-1] < now - window]:
+                _rate_limit_hits.pop(stale, None)
         return True
+
+def check_search_rate(uid, max_per_window: int = 20, window: float = 10.0) -> bool:
+    """搜索端点 不准你乱搜"""
+    return check_rate_limit(uid, "search", max_per_window, window)
 
 def normalize_search_request(keyword, min_len, limit, offset=0):
     """归一化搜索请求"""
@@ -96,8 +110,23 @@ def can_recall_message(operator_uid : int, operator_auth : str, message : dict,
 
 
 def public_email_visible(row) -> bool:
-    """users 表 public_email 列（表尾第 10 列，SELECT * 位序 9），没有就是 public！"""
-    value = row[9] if len(row) > 9 else 1
+    """users 表 public_email 列（位序见 db.user.USERS_COL_*），没有就是 public！"""
+    index = USERS_COL_PUBLIC_EMAIL
+    value = row[index] if len(row) > index else 1
+    return value is None or bool(value)
+
+
+def show_read_status_visible(row) -> bool:
+    """users 表 show_read_status 列（位序见 db.user.USERS_COL_*），没有就是展示！"""
+    index = USERS_COL_SHOW_READ_STATUS
+    value = row[index] if len(row) > index else 1
+    return value is None or bool(value)
+
+
+def show_online_status_visible(row) -> bool:
+    """users 表 show_online_status 列（位序见 db.user.USERS_COL_*），没有就是展示！"""
+    index = USERS_COL_SHOW_ONLINE_STATUS
+    value = row[index] if len(row) > index else 1
     return value is None or bool(value)
 
 def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, forum_cursor, file_cursor, notification_cursor, messages_cursor, group_cursor, instant_contact, sticker_cursor=None, jwt_secret=None):
@@ -316,6 +345,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 state["cfg"] = dict(cfg)
             update_json("res/{}/config.json".format(port_api), apply)
             _config_cache = state["cfg"]
+            # WS 侧的功能开关与限额是启动时的快照：配置一落地就同步刷新，
+            # 否则管理端关掉 presence/read_receipt 后 HTTP 已经 403，
+            # WS 仍在推 presence.update / message.read_receipt。
+            instant_contact.refresh_config()
             return dict(_config_cache)
 
     def _build_ice_servers(rtc_cfg):
@@ -1461,10 +1494,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         if not verify_user(uid, password):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "auth_failed"})
         info = user_cursor.uid_query(uid)
         if not info:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "not_found"})
         row = info[0]
         return json.dumps({
             "uid": row[0],
@@ -1475,6 +1508,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             "personal_sign": row[6],
             "introduction": row[7],
             "public_email": public_email_visible(row),
+            "show_read_status": show_read_status_visible(row),
+            "show_online_status": show_online_status_visible(row),
         }, ensure_ascii=False)
 
     @api("/auth/change_pwd", methods=["POST"])
@@ -1864,7 +1899,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             pwd = req["password"]
 
             if verify_manager(uid, pwd) is None:
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "forbidden"})
 
             requested_page_size = req.get("page_size", 50)
             fetch_all = parse_bool_flag(req.get("fetch_all", False)) or str(requested_page_size) == "-1"
@@ -1903,7 +1938,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 "fetch_all" : False
             }, ensure_ascii=False)
         except Exception:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "unavailable"})
     
     @api("/auth/change_sign", methods=['POST'])
     def change_sign(req):
@@ -1942,6 +1977,56 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if not isinstance(public, bool):
             return bool_res()[False]
         user_cursor.set_public_email(uid, public)
+        return bool_res()[True]
+
+    @api("/auth/change_privacy", methods=["POST"])
+    def change_privacy(req):
+        """修改隐私开关（已读状态、在线状态）。
+
+        成功仍按 bool 约定回 `True`（与 change_pwd / change_sign 一致），但
+        拒绝改成 JSON 错误对象：这里是三种完全不同的失败（鉴权、字段类型、
+        一个字段都没给），压成同一个 `False` 会让客户端无法分辨，也只能靠
+        `detail_error` 协商拿到规范化错误码。未声明 detail_error 的老客户端
+        由 crypto.legacy_failure_body 降级回原来的纯文本 `False`，行为不变。
+        """
+        uid = req["uid"]
+        password = req["password"]
+        if not verify_user(uid, password):
+            return json.dumps({"success": False, "error": "auth_failed"})
+        changed = {}
+        if "show_read_status" in req:
+            value = req.get("show_read_status")
+            if not isinstance(value, bool):
+                return json.dumps({"success": False, "error": "invalid_request"})
+            user_cursor.set_show_read_status(uid, value)
+            changed["show_read_status"] = value
+        if "show_online_status" in req:
+            value = req.get("show_online_status")
+            if not isinstance(value, bool):
+                return json.dumps({"success": False, "error": "invalid_request"})
+            user_cursor.set_show_online_status(uid, value)
+            changed["show_online_status"] = value
+        if not changed:
+            return json.dumps({"success": False, "error": "invalid_request"})
+        # 单用户多端同步：隐私开关变更静默推给该用户所有在线端
+        try:
+            payload = {"type": "PRIVACY.UPDATED"}
+            payload.update(changed)
+            instant_contact.push_raw(uid, payload)
+        except Exception:
+            pass
+        # 关闭在线状态
+        if changed.get("show_online_status") is False:
+            try:
+                instant_contact.presence_hidden(uid)
+            except Exception:
+                pass
+        # 重新开启且在线的用户
+        if changed.get("show_online_status") is True:
+            try:
+                instant_contact.presence_shown(uid)
+            except Exception:
+                pass
         return bool_res()[True]
     
     @api("/auth/change_captcha", methods=['POST'])
@@ -2019,10 +2104,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             uid = req["uid"]
             pwd = req["password"]
             if verify_root(uid, pwd) is None:
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "forbidden"})
             return json.dumps(serialize_server_settings(read_config(), include_manage=True), ensure_ascii=False)
         except Exception:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "forbidden"})
 
     @api("/auth/server_settings/update", methods=['POST'])
     def update_server_settings(req):
@@ -2030,22 +2115,22 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             uid = req["uid"]
             pwd = req["password"]
             if verify_root(uid, pwd) is None:
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "forbidden"})
 
             updates = {}
 
             if "server_name" in req:
                 server_name = req["server_name"]
                 if not isinstance(server_name, str):
-                    return bool_res()[False]
+                    return json.dumps({"success": False, "error": "forbidden"})
                 server_name = server_name.strip()
                 if not server_name:
-                    return bool_res()[False]
+                    return json.dumps({"success": False, "error": "invalid_request"})
                 updates["server_name"] = server_name
 
             if "captcha" in req:
                 if not isinstance(req["captcha"], bool):
-                    return bool_res()[False]
+                    return json.dumps({"success": False, "error": "invalid_request"})
                 updates["captcha"] = req["captcha"]
 
             if "file_last_time" in req:
@@ -2118,7 +2203,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
             if "smtp_host" in req:
                 if not isinstance(req["smtp_host"], str):
-                    return bool_res()[False]
+                    return json.dumps({"success": False, "error": "invalid_request"})
                 updates["smtp_host"] = req["smtp_host"].strip()
 
             if "smtp_port" in req:
@@ -2126,12 +2211,12 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
             if "smtp_use_ssl" in req:
                 if not isinstance(req["smtp_use_ssl"], bool):
-                    return bool_res()[False]
+                    return json.dumps({"success": False, "error": "invalid_request"})
                 updates["smtp_use_ssl"] = req["smtp_use_ssl"]
 
             if "reverse_proxy_enabled" in req:
                 if not isinstance(req["reverse_proxy_enabled"], bool):
-                    return bool_res()[False]
+                    return json.dumps({"success": False, "error": "invalid_request"})
                 updates["reverse_proxy_enabled"] = req["reverse_proxy_enabled"]
 
             if "proxy_count" in req:
@@ -2139,7 +2224,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
             if "legacy_auth_enabled" in req:
                 if not isinstance(req["legacy_auth_enabled"], bool):
-                    return bool_res()[False]
+                    return json.dumps({"success": False, "error": "invalid_request"})
                 updates["legacy_auth_enabled"] = req["legacy_auth_enabled"]
 
             if "jwt_expires_seconds" in req:
@@ -2153,12 +2238,12 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
             if "file_download_mode" in req:
                 if req["file_download_mode"] not in ("redirect", "proxy"):
-                    return bool_res()[False]
+                    return json.dumps({"success": False, "error": "invalid_request"})
                 updates["file_download_mode"] = req["file_download_mode"]
 
             if "media_features" in req:
                 if not isinstance(req["media_features"], bool):
-                    return bool_res()[False]
+                    return json.dumps({"success": False, "error": "invalid_request"})
                 updates["media_features"] = req["media_features"]
 
             if "features" in req:
@@ -2167,10 +2252,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                         read_config().get("features"), req["features"]
                     )
                 except ValueError:
-                    return bool_res()[False]
+                    return json.dumps({"success": False, "error": "invalid_request"})
 
             if not updates:
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "invalid_request"})
 
             def _apply(current):
                 current.update(updates)
@@ -2183,7 +2268,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 apply_proxy_fix(cfg)
             return json.dumps(serialize_server_settings(cfg, include_manage=True), ensure_ascii=False)
         except Exception:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "unavailable"})
 
     @api("/notification/query_all", methods=['POST'])
     def query_all_notifications(req):
@@ -2230,7 +2315,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         if not verify_user(uid, password):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "auth_failed"})
         return json.dumps({"count": notification_cursor.unread_count(uid)}, ensure_ascii=False)
 
     @api("/notification/mark_read", methods=['POST'])
@@ -2238,7 +2323,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         if not verify_user(uid, password):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "auth_failed"})
         try:
             time_stamp = req.get("time_stamp")
             ids = req.get("ids")
@@ -2248,9 +2333,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             elif ids is not None:
                 changed = notification_cursor.mark_read_ids(uid, ids)
             else:
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "invalid_request"})
         except (TypeError, ValueError):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "invalid_request"})
         return json.dumps({"success": True, "changed": changed}, ensure_ascii=False)
 
     @api("/notification/mark_all_read", methods=['POST'])
@@ -2258,7 +2343,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         if not verify_user(uid, password):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "auth_failed"})
         changed = notification_cursor.mark_all_read(uid)
         return json.dumps({"success": True, "changed": changed}, ensure_ascii=False)
 
@@ -2267,12 +2352,12 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         if not verify_user(uid, password):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "auth_failed"})
         try:
             offset = max(int(req.get("offset", 0)), 0)
             take = min(max(int(req.get("take", 50)), 1), 100)
         except (TypeError, ValueError):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "invalid_request"})
         rows, total = notification_cursor.list_events_page(uid, offset, take)
         return json.dumps({
             "items": notification_cursor.serialize_rows(rows),
@@ -2285,7 +2370,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         if not verify_user(uid, password):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "auth_failed"})
         rows = user_cursor.query(
             "SELECT uid, username FROM users WHERE stat != 'banned' ORDER BY username"
         )
@@ -2580,13 +2665,13 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         if not verify_user(uid, password):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "auth_failed"})
         user_row = get_user_row(uid)
         if user_row is None:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "invalid_request"})
         user_stat = user_row[4]
         if not user_stat in ["admin", "root"]:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "forbidden"})
         with locks['queue']:
             return json.dumps(read_json("res/{}/forum/queue.json".format(port_api)), ensure_ascii=False)
     
@@ -2963,13 +3048,13 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         password = req["password"]
         fid = req["fid"]
         if not verify_user(uid, password):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "auth_failed"})
         forum_info = query_forum(fid)
         if not forum_info:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "not_found"})
         operator_role = forum_cursor.get_member_role(fid, uid)
         if operator_role is None or operator_role < 50:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "forbidden"})
         rows = forum_cursor.list_members(fid)
         return json.dumps([list(row) for row in rows])
 
@@ -3090,7 +3175,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         if not verify_user(uid, password):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "auth_failed"})
         rows = forum_cursor.query(
             "SELECT fid, role FROM forum_members WHERE uid = ?", (uid,)
         )
@@ -3316,17 +3401,17 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         filename = req["filename"]
         file_b64 = req["file_b64"]
         if not verify_user(uid, password):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "auth_failed"})
         user_row = get_user_row(uid)
         if user_row is None:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "invalid_request"})
         user_stat = user_row[4]
         if user_stat == 'banned':
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "banned"})
         cfg = read_config()
         normalized_name, payload = validate_file_upload(filename, file_b64, cfg)
         if normalized_name is None:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "invalid_request"})
         quota = cfg.get("user_storage_quota", -1)
         max_quota = cfg.get("max_user_storage_quota", 73400320)  # 默认 70MB
         new_hashes = file.sha256(payload)
@@ -3335,15 +3420,15 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 new_size = len(payload)
                 current_usage = file_cursor.get_user_storage_used(uid)
                 if quota != -1 and current_usage + new_size > quota:
-                    return bool_res()[False]
+                    return json.dumps({"success": False, "error": "Storage quota exceeded"})
                 # 瞬时单用户文件总大小不得超过 max_user_storage_quota（默认 70MB）
                 if max_quota != -1 and current_usage + new_size > max_quota:
-                    return bool_res()[False]
+                    return json.dumps({"success": False, "error": "Storage quota exceeded"})
         try:
             hashes = file.upload_file(port_api, uid, payload, normalized_name, file_cursor,
                                       cfg.get("file_last_time", 72), known_hash=new_hashes)
         except Exception:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "upload_failed"})
         return json.dumps({
             "success" : True,
             "result" : bool_res()[True],
@@ -3533,7 +3618,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         if not verify_user(uid, password):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "auth_failed"})
         rows = file_cursor.get_user_files(uid)
         result = []
         for row in rows:
@@ -3563,7 +3648,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         if not verify_user(uid, password):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "auth_failed"})
         cfg = read_config()
         quota = cfg.get("user_storage_quota", -1)
         used = file_cursor.get_user_storage_used(uid)
@@ -3588,13 +3673,13 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         if not verify_user(uid, password):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "auth_failed"})
         user_row = get_user_row(uid)
         if user_row is None:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "invalid_request"})
         user_stat = user_row[4]
         if user_stat not in ['admin', 'root']:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "forbidden"})
         target_uid = req.get("target_uid")
         rows = file_cursor.get_all_user_files(target_uid)
         result = []
@@ -3928,23 +4013,23 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         allow_direct_join = bool(req.get("allow_direct_join", False))
         require_review = bool(req.get("require_review", True))
         if not verify_user(uid, password):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "auth_failed"})
         user_row = get_user_row(uid)
         if user_row is None:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "invalid_request"})
         user_stat = user_row[4]
         if user_stat == 'banned':
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "banned"})
         cfg = read_config()
         min_len = cfg.get("min_group_name_length", 1)
         max_len = cfg.get("max_group_name_length", 50)
         if not isinstance(groupname, str) or not (min_len <= len(groupname.strip()) <= max_len):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "invalid_request"})
         gid = group_cursor.create_group(uid, groupname, enter_hint, introduction,
                                         allow_direct_join, require_review)
         if gid:
             return json.dumps({"gid": gid})
-        return bool_res()[False]
+        return json.dumps({"success": False, "error": "unavailable"})
     
     @app.route("/group/group_info/<gid>")
     def group_info(gid : str):
@@ -3969,7 +4054,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         if not verify_user(uid, password):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "auth_failed"})
         if not check_search_rate(uid):
             return json.dumps({"success": False, "error": "rate_limited"})
         keyword, limit, _offset, err = normalize_search_request(
@@ -3987,7 +4072,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         if not verify_user(uid, password):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "auth_failed"})
         if not check_search_rate(uid):
             return json.dumps({"success": False, "error": "rate_limited"})
         keyword, limit, offset, err = normalize_search_request(
@@ -4009,15 +4094,15 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         password = req["password"]
         gid = req["gid"]
         if not verify_user(uid, password):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "auth_failed"})
         user_row = get_user_row(uid)
         if user_row is None:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "invalid_request"})
         if user_row[4] == 'banned':
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "banned"})
         settings = group_cursor.get_group_settings(gid)
         if not settings:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "not_found"})
         member_count = group_cursor.count_members(gid)
         preview_members = group_cursor.get_preview_members(gid, limit=10)
         name_map = {}
@@ -4162,9 +4247,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         password = req["password"]
         gid = req["gid"]
         if not verify_user(uid, password):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "auth_failed"})
         if not group_cursor.is_member(gid, uid):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "not_group_member"})
         return json.dumps({"essence" : group_cursor.query_essence(gid), "essence_enabled": group_cursor.get_essence_enabled(gid)})
 
     @api("/group/remove_member", methods=['POST'])
@@ -4313,15 +4398,15 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         password = req["password"]
         gid = req["gid"]
         if not verify_user(uid, password):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "auth_failed"})
         user_row = get_user_row(uid)
         if user_row is None:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "invalid_request"})
         user_stat = user_row[4]
         if user_stat == 'banned':
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "banned"})
         if not group_cursor.is_member(gid, uid):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "not_group_member"})
         return json.dumps(group_cursor.get_group_settings(gid), ensure_ascii=False)
 
     @api("/group/update_settings", methods=['POST'])
@@ -4415,15 +4500,15 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         if not verify_user(uid, password):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "auth_failed"})
         user_row = get_user_row(uid)
         if user_row is None:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "invalid_request"})
         if user_row[4] == 'banned':
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "banned"})
         gid = req["gid"]
         if not group_cursor.is_member(gid, uid):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "not_group_member"})
         pins = messages_cursor.get_pinned_messages(gid)
         results = []
         for row in pins:
@@ -4445,15 +4530,15 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         password = req["password"]
         gid = req["gid"]
         if not verify_user(uid, password):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "auth_failed"})
         user_row = get_user_row(uid)
         if user_row is None:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "invalid_request"})
         user_stat = user_row[4]
         if user_stat == 'banned':
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "banned"})
         if not group_cursor.is_member(gid, uid):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "not_group_member"})
         member_uids = group_cursor.get_member_uids(gid)
         admin_uids = group_cursor.get_admin_uids(gid)
         settings = group_cursor.get_group_settings(gid)
@@ -4480,18 +4565,18 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         password = req["password"]
         gid = req["gid"]
         if not verify_user(uid, password):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "auth_failed"})
         user_row = get_user_row(uid)
         if user_row is None:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "invalid_request"})
         user_stat = user_row[4]
         if user_stat == 'banned':
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "banned"})
         settings = group_cursor.get_group_settings(gid)
         if not settings:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "not_found"})
         if group_cursor.is_member(gid, uid):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "conflict"})
         max_len = read_config().get("max_request_message_length", 200)
         request_message = str(req.get("message", "") or "").strip()
         if max_len > 0 and len(request_message) > max_len:
@@ -4501,13 +4586,13 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 succeeded = group_cursor.add_member(gid, uid)
                 if succeeded:
                     return json.dumps({"pending": False})
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "unavailable"})
             else:
                 members = group_cursor.get_member_uids(gid)
                 cfg = read_config()
                 limit = cfg.get("single_group_max_people", 200)
                 if limit != -1 and len(members) >= limit:
-                    return bool_res()[False]
+                    return json.dumps({"success": False, "error": "conflict"})
                 rid = group_cursor.request_join(gid, uid, message=request_message)
                 reviewers = [settings["creater"]] + group_cursor.get_admin_uids(gid)
                 run_notification_side_effect("group.join.request",
@@ -4515,7 +4600,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                         "新的入群申请", "{} 申请加入群 {}。".format(format_user_display(uid), settings["groupname"]),
                         sender=uid, meta={"gid": gid, "rid": rid, "message": request_message}))
                 return json.dumps({"rid": rid, "pending": True})
-        return bool_res()[False]
+        return json.dumps({"success": False, "error": "forbidden"})
 
     @api("/group/invite", methods=['POST'], feature=("chat", "group_chat"))
     def invite_to_group(req):
@@ -4524,21 +4609,21 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         gid = req["gid"]
         invited_uid = req["invited_uid"]
         if not verify_user(uid, password):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "auth_failed"})
         user_row = get_user_row(uid)
         if user_row is None:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "invalid_request"})
         user_stat = user_row[4]
         if user_stat == 'banned':
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "banned"})
         if not group_cursor.is_member(gid, uid):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "not_group_member"})
         if not user_cursor.uid_query(invited_uid):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "not_found"})
         if not user_cursor.is_friend(uid, invited_uid):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "not_friends"})
         if group_cursor.is_member(gid, invited_uid):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "conflict"})
         settings = group_cursor.get_group_settings(gid)
         max_len = read_config().get("max_request_message_length", 200)
         invite_message = str(req.get("message", "") or "").strip()
@@ -4553,7 +4638,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                         "{} 邀请你加入群 {}。".format(format_user_display(uid), settings["groupname"]),
                         sender=uid, meta={"gid": gid}))
                 return json.dumps({"pending": False})
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "unavailable"})
         rid = group_cursor.request_join(gid, invited_uid, inviter_uid=uid,
                                         message=invite_message)
         reviewers = [settings["creater"]] + group_cursor.get_admin_uids(gid)
@@ -4573,15 +4658,15 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         password = req["password"]
         gid = req["gid"]
         if not verify_user(uid, password):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "auth_failed"})
         user_row = get_user_row(uid)
         if user_row is None:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "invalid_request"})
         user_stat = user_row[4]
         if user_stat == 'banned':
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "banned"})
         if not group_cursor.is_admin(gid, uid):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "forbidden"})
         requests = group_cursor.get_join_requests(gid)
         if requests:
             uids = list(set(r["uid"] for r in requests) | set(r["inviter_uid"] for r in requests if r["inviter_uid"]))
@@ -4638,7 +4723,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         if not verify_user(uid, password):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "auth_failed"})
         rows = user_cursor.query(
             "SELECT user1, user2, adder FROM friendship WHERE relationship = 'friend' AND (user1 = ? OR user2 = ?)",
             (uid, uid)
@@ -4667,25 +4752,25 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             except (TypeError, ValueError):
                 duration = None
             if quote < -1 or forwarded < -1 or (quote >= 0 and forwarded >= 0):
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "invalid_request"})
             if content_type not in ("plain", "file"):
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "invalid_request"})
             file_hash = None
             if content_type == "file":
                 file_hash = str(req.get("file_hash") or content)
                 if (len(file_hash) != 64
                         or not all(char in "0123456789abcdefABCDEF" for char in file_hash)):
-                    return bool_res()[False]
+                    return json.dumps({"success": False, "error": "invalid_request"})
                 content = file_hash
 
             if not verify_user(uid, password):
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "auth_failed"})
             user_row = get_user_row(uid)
             if user_row is None:
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "invalid_request"})
             user_stat = user_row[4]
             if user_stat == 'banned':
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "banned"})
             file_record = None
 
             target_uid = 0
@@ -4695,7 +4780,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             elif recipient.startswith('G'):
                 group_id = int(recipient[1:])
             else:
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "invalid_request"})
 
             if group_id is not None:
                 if not feature_gate(read_config(), "chat", "group_chat"):
@@ -4707,10 +4792,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             if forwarded >= 0:
                 if not messages_cursor.verify_quote(
                         forwarded, uid, target_uid, group_id):
-                    return bool_res()[False]
+                    return json.dumps({"success": False, "error": "invalid_quote"})
                 source_message = messages_cursor.get_message(forwarded)
                 if source_message is None:
-                    return bool_res()[False]
+                    return json.dumps({"success": False, "error": "not_found"})
                 content_type = source_message["content_type"]
                 content = source_message["content"]
                 file_hash = source_message["file_hash"]
@@ -4741,18 +4826,18 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 }, ensure_ascii=False)
 
             if group_id is not None and not group_cursor.is_member(group_id, uid):
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "not_group_member"})
             if group_id is None and not user_cursor.is_friend(uid, target_uid):
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "not_friends"})
 
             if content_type == "plain" and len(content) > read_config().get("max_message_length", 10000):
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "message_too_long"})
 
             if quote >= 0:
                 if not messages_cursor.verify_quote(quote, uid, target_uid, group_id):
-                    return bool_res()[False]
+                    return json.dumps({"success": False, "error": "invalid_quote"})
                 if group_id is not None and not group_cursor.is_member(group_id, uid):
-                    return bool_res()[False]
+                    return json.dumps({"success": False, "error": "not_group_member"})
 
             if file_hash:
                 if forwarded >= 0:
@@ -4765,7 +4850,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 else:
                     file_record = file_cursor.acquire_reference(uid, file_hash)
                 if file_record is None:
-                    return bool_res()[False]
+                    return json.dumps({"success": False, "error": "file_unavailable"})
             try:
                 msg_record = messages_cursor.add_message(
                     uid, target_uid, content,
@@ -4871,6 +4956,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 sender_notif["should_alert"] = False
                 instant_contact.push_message(target_uid, recv_notif)
                 instant_contact.push_message(uid, sender_notif)
+                # 发送即已读：隐式前进也要告诉对方，否则对方的推送通道会停在旧
+                # 水位（WS 路径同理，见 channel.emit_private_read_receipt）。
+                instant_contact.emit_private_read_receipt(
+                    uid, target_uid, messages_cursor.room_key_of(uid, target_uid),
+                    msg_record["mid"], msg_record.get("room_seq") or 0)
 
             response_message = dict(msg_record)
             response_message["mentioned_uids"] = mentioned_uids
@@ -4882,7 +4972,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 "status": "sent", "message": response_message,
             }, ensure_ascii=False)
         except Exception:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "unavailable"})
 
     @api("/message/redirect", methods=['POST'])
     def redirect_messages(req):
@@ -4896,18 +4986,18 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             client_mid = req.get("client_mid")
 
             if not isinstance(mids, list):
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "invalid_request"})
             mids = sorted({int(m) for m in mids if str(m).isdigit()})
             if not mids:
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "invalid_request"})
             if len(mids) > 100:
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "invalid_request"})
 
             if not verify_user(uid, password):
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "auth_failed"})
             user_row = get_user_row(uid)
             if user_row is None or user_row[4] == 'banned':
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "banned"})
 
             if recipient.startswith('U'):
                 target_uid = int(recipient[1:])
@@ -4916,7 +5006,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 target_uid = 0
                 group_id = int(recipient[1:])
             else:
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "invalid_request"})
 
             if group_id is not None:
                 if not feature_gate(read_config(), "chat", "group_chat"):
@@ -4927,34 +5017,34 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             records = messages_cursor.get_messages_by_mids(mids)
             selected = [records[m] for m in mids if m in records]
             if len(selected) != len(mids):
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "invalid_request"})
 
             room_keys = {r["room_key"] for r in selected}
             if len(room_keys) != 1:
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "invalid_request"})
             if any(r["deleted"] for r in selected):
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "invalid_request"})
             if any(r["content_type"] != "plain" for r in selected):
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "invalid_request"})
 
             source = selected[0]
             src_group = source["group_id"]
             # 校验调用者可读源房间
             if src_group is not None:
                 if not group_cursor.is_member(src_group, uid):
-                    return bool_res()[False]
+                    return json.dumps({"success": False, "error": "not_group_member"})
             else:
                 src_pair = {source["sender_uid"], source["receiver_uid"]}
                 if uid not in src_pair:
-                    return bool_res()[False]
+                    return json.dumps({"success": False, "error": "not_group_member"})
 
             # 校验调用者可写目标房间
             if group_id is not None:
                 if not group_cursor.is_member(group_id, uid):
-                    return bool_res()[False]
+                    return json.dumps({"success": False, "error": "not_group_member"})
             else:
                 if not user_cursor.is_friend(uid, target_uid):
-                    return bool_res()[False]
+                    return json.dumps({"success": False, "error": "not_friends"})
 
             group_name = ""
             if src_group is not None:
@@ -5032,6 +5122,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 sender_notif["should_alert"] = False
                 instant_contact.push_message(target_uid, recv_notif)
                 instant_contact.push_message(uid, sender_notif)
+                instant_contact.emit_private_read_receipt(
+                    uid, target_uid, messages_cursor.room_key_of(uid, target_uid),
+                    msg_record["mid"], msg_record.get("room_seq") or 0)
 
             response_message = dict(msg_record)
             response_message["content_type"] = "redirect"
@@ -5040,7 +5133,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 "status": "sent", "message": response_message,
             }, ensure_ascii=False)
         except Exception:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "unavailable"})
 
     @api("/chat/list", methods=['POST'])
     def chat_list(req):
@@ -5052,10 +5145,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return json.dumps({"error": "auth_failed"}, ensure_ascii=False)
         user_row = get_user_row(uid)
         if user_row is None:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "invalid_request"})
         user_stat = user_row[4]
         if user_stat == 'banned':
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "banned"})
 
         try:
             chat_rows = messages_cursor.get_chat_list(uid)
@@ -5210,9 +5303,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             limit = int(req.get("limit", 0) or 0)
             offset = int(req.get("offset", 0) or 0)
         except (TypeError, ValueError):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "invalid_request"})
         if offset < 0 or limit < 0:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "invalid_request"})
         if offset > 0:
             result = result[offset:]
         if limit > 0:
@@ -5381,28 +5474,28 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             if group_id is not None:
                 group_id = int(group_id)
         except (ValueError, TypeError):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "invalid_request"})
 
         if not verify_user(uid, password):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "auth_failed"})
         user_row = get_user_row(uid)
         if user_row is None:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "invalid_request"})
         user_stat = user_row[4]
         if user_stat == 'banned':
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "banned"})
 
         if group_id is not None:
             if not group_cursor.is_member(group_id, uid):
                 settings = group_cursor.get_group_settings(group_id)
                 if not settings or not settings.get("public_messages"):
-                    return bool_res()[False]
+                    return json.dumps({"success": False, "error": "not_group_member"})
                 limit = min(limit, 50)
         elif has_target:
             if not user_cursor.is_friend(uid, target_uid):
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "not_friends"})
         else:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "not_friends"})
 
         rows = messages_cursor.query_history(uid, target_uid,
             before_mid=before_mid, limit=limit, group_id=group_id)
@@ -5439,38 +5532,38 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 and "event_stream_v1" in capabilities
             )
         except (KeyError, TypeError, ValueError):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "invalid_request"})
         if not verify_user(uid, password):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "auth_failed"})
         user_row = get_user_row(uid)
         if user_row is None or user_row[4] == 'banned':
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "banned"})
 
         if room_id.startswith('G'):
             gid = int(room_id[1:])
             if not group_cursor.is_member(gid, uid):
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "not_group_member"})
             room_key = messages_cursor.room_key_of(uid, 0, group_id=gid)
         elif room_id.startswith('U'):
             target_uid = int(room_id[1:])
             if not user_cursor.is_friend(uid, target_uid):
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "not_friends"})
             room_key = messages_cursor.room_key_of(uid, target_uid)
         else:
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "invalid_request"})
 
         try:
             missing_sequences = parse_sync_missing_sequences(req)
             if missing_sequences is None:
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "invalid_request"})
 
             after_seq = last_seq
             if after_seq < 0 or last_mid < 0:
-                return bool_res()[False]
+                return json.dumps({"success": False, "error": "invalid_request"})
             if after_seq <= 0 and last_mid > 0:
                 after_seq = messages_cursor.sync_after_seq_for_mid(room_key, last_mid)
                 if after_seq is None:
-                    return bool_res()[False]
+                    return json.dumps({"success": False, "error": "not_found"})
 
             incremental_records = messages_cursor.query_sync(
                 room_key,
@@ -5498,7 +5591,128 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             }, ensure_ascii=False)
         except Exception as e:
             print("[WARN] message_sync failed: {}".format(e))
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "unavailable"})
+
+    @api("/message/read_receipt", methods=['POST'], feature=("chat", "read_receipt"))
+    def read_receipt(req):
+        """按需查询某条消息的已读情况（不推送、不持久化）。
+
+        请求体：room_id ("U<uid>" | "G<gid>")、mid。
+        私聊：返回对方是否已读到该消息（对方关闭已读则 hidden=true）。
+        群聊：返回「N 人已读」计数（成员 ∩ 非发送者 ∩ 未关闭已读，不暴露他人水位）。
+        """
+        try:
+            uid = int(req["uid"])
+            password = req["password"]
+            room_id = str(req["room_id"])
+            mid = int(req["mid"])
+        except (KeyError, TypeError, ValueError):
+            return json.dumps({"success": False, "error": "invalid_request"})
+        if not verify_user(uid, password):
+            return json.dumps({"success": False, "error": "auth_failed"})
+        if len(room_id) < 2:
+            return json.dumps({"success": False, "error": "invalid_request"})
+        try:
+            target_id = int(room_id[1:])
+        except (TypeError, ValueError):
+            return json.dumps({"success": False, "error": "invalid_request"})
+
+        if room_id.startswith('U'):
+            if not user_cursor.is_friend(uid, target_id):
+                return json.dumps({"success": False, "error": "forbidden"})
+            room_key = messages_cursor.room_key_of(uid, target_id)
+            cursor = messages_cursor.sync_cursor_for_mid(room_key, mid)
+            if cursor is None or cursor[0] is None:
+                return json.dumps({"success": False, "error": "not_found"})
+            peer_flag = user_cursor.get_show_status_flags([target_id]) \
+                .get(target_id, {}).get("show_read_status", True)
+            if not peer_flag:
+                return json.dumps({
+                    "success": True, "room_id": room_id, "mid": mid, "hidden": True,
+                }, ensure_ascii=False)
+            state = messages_cursor.get_read_state(target_id, room_key)
+            peer_seq = state["last_read_seq"] if state else 0
+            peer_mid = state["last_read_mid"] if state else 0
+            return json.dumps({
+                "success": True,
+                "room_id": room_id,
+                "mid": mid,
+                "hidden": False,
+                "read": peer_seq >= cursor[0],
+                "reader_last_seq": peer_seq,
+                "reader_last_mid": peer_mid,
+            }, ensure_ascii=False)
+
+        if room_id.startswith('G'):
+            gid = target_id
+            if not group_cursor.is_member(gid, uid):
+                return json.dumps({"success": False, "error": "forbidden"})
+            room_key = messages_cursor.room_key_of(0, 0, group_id=gid)
+            cursor = messages_cursor.sync_cursor_for_mid(room_key, mid)
+            if cursor is None or cursor[0] is None:
+                return json.dumps({"success": False, "error": "not_found"})
+            message = messages_cursor.get_message(mid, include_recalled_original=True)
+            sender_uid = message.get("sender_uid") if message else None
+            members = set(group_cursor.get_member_uids(gid))
+            candidates = [
+                s["uid"] for s in messages_cursor.read_states_for_room(room_key, cursor[0])
+                if s["uid"] in members and s["uid"] != sender_uid
+            ]
+            flags = user_cursor.get_show_status_flags(candidates)
+            count = sum(
+                1 for u in candidates
+                if flags.get(u, {}).get("show_read_status", True)
+            )
+            return json.dumps({
+                "success": True,
+                "room_id": room_id,
+                "mid": mid,
+                "hidden": False,
+                "read_count": count,
+            }, ensure_ascii=False)
+
+        return json.dumps({"success": False, "error": "invalid_request"})
+
+    @api("/friend/presence", methods=['POST'], feature=("presence",))
+    def friend_presence(req):
+        """批量查询好友在线状态（不推送、不持久化）。
+
+        请求体：uid、password、可选 uids（缺省=全部好友）。
+        取「请求集合 ∩ 好友」，剔除已关闭在线状态的用户，返回 {"presence": {"<uid>": "online"|"offline"}}。
+        天然防止拿任意 uid 探测：非好友的 uid 不返回任何状态。
+        """
+        try:
+            uid = int(req["uid"])
+            password = req["password"]
+        except (KeyError, TypeError, ValueError):
+            return json.dumps({"success": False, "error": "invalid_request"})
+        if not verify_user(uid, password):
+            return json.dumps({"success": False, "error": "auth_failed"})
+        if not check_rate_limit(uid, "friend_presence", 30):
+            return json.dumps({"success": False, "error": "rate_limited"})
+        try:
+            friends = set(user_cursor.list_friend_uids(uid))
+        except Exception:
+            friends = set()
+        raw = req.get("uids")
+        if raw is None:
+            targets = friends
+        elif isinstance(raw, list):
+            try:
+                targets = {int(u) for u in raw} & friends
+            except (TypeError, ValueError):
+                return json.dumps({"success": False, "error": "invalid_request"})
+        else:
+            return json.dumps({"success": False, "error": "invalid_request"})
+        targets = list(targets)
+        flags = user_cursor.get_show_status_flags(targets)
+        online = set(instant_contact.filter_online(targets))
+        presence = {
+            str(u): ("online" if u in online else "offline")
+            for u in targets
+            if flags.get(u, {}).get("show_online_status", True)
+        }
+        return json.dumps({"success": True, "presence": presence}, ensure_ascii=False)
 
     @api("/friend/add_friend", methods=['POST'], feature=("chat", "friend_request"))
     def add_friend(req):
@@ -5507,9 +5721,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         added = req["added"]
         req_word = str(req.get("req_word", "") or "").strip()
         if not verify_user(uid, password):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "auth_failed"})
         if not user_cursor.uid_query(added):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "not_found"})
         max_len = read_config().get("max_request_message_length", 200)
         if max_len > 0 and len(req_word) > max_len:
             return json.dumps({"success": False, "error": "request_message_too_long"})
@@ -5535,7 +5749,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid = req["uid"]
         password = req["password"]
         if not verify_user(uid, password):
-            return bool_res()[False]
+            return json.dumps({"success": False, "error": "auth_failed"})
         requests = user_cursor.list_pending_requests(uid)
         if requests:
             uids = [item["uid"] for item in requests]
@@ -5584,6 +5798,62 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if not user_cursor.unset_blocked(uid, target, uid):
             return bool_res()[False]
         return bool_res()[True]
+
+    @api("/friend/relationship", methods=['POST'])
+    def friend_relationship(req):
+        """查询「我」与目标的当前关系（含拉黑方向）。
+
+        资料页据此显示「拉黑」还是「解除拉黑」：`friend_blocked` 只在申请时告诉
+        我们「存在拉黑」，分不清是谁拉黑了谁。
+        """
+        try:
+            uid = int(req["uid"])
+            password = req["password"]
+            target = int(req["target"])
+        except (KeyError, TypeError, ValueError):
+            return json.dumps({"success": False, "error": "invalid_request"})
+        if not verify_user(uid, password):
+            return json.dumps({"success": False, "error": "auth_failed"})
+        if uid == target or not user_cursor.uid_query(target):
+            return json.dumps({"success": False, "error": "invalid_request"})
+
+        relationship = 'none'
+        blocked_by_me = False
+        blocked_by_peer = False
+        rows = user_cursor.query_relationship(uid, target)
+        if rows:
+            row = rows[0]
+            # row: (user1, user2, relationship, adder, blocked_by_user1, blocked_by_user2)
+            relationship = row[2]
+            lo = row[0]
+            blocked1 = bool(row[4])
+            blocked2 = bool(row[5])
+            blocked_by_me = blocked1 if uid == lo else blocked2
+            blocked_by_peer = blocked2 if uid == lo else blocked1
+        return json.dumps({
+            "success": True,
+            "relationship": relationship,
+            "is_friend": relationship == "friend",
+            "blocked_by_me": blocked_by_me,
+            "blocked_by_peer": blocked_by_peer,
+        }, ensure_ascii=False)
+
+    @api("/friend/blocked", methods=['POST'])
+    def blocked_list(req):
+        """我拉黑的人（「拉黑列表」用，可逐条解除）。"""
+        try:
+            uid = int(req["uid"])
+            password = req["password"]
+        except (KeyError, TypeError, ValueError):
+            return json.dumps({"success": False, "error": "invalid_request"})
+        if not verify_user(uid, password):
+            return json.dumps({"success": False, "error": "auth_failed"})
+        if not check_rate_limit(uid, "friend_blocked", 30):
+            return json.dumps({"success": False, "error": "rate_limited"})
+        return json.dumps({
+            "success": True,
+            "blocked": user_cursor.list_blocked_by(uid),
+        }, ensure_ascii=False)
 
     @api("/friend/deal_ship", methods=['POST'])
     def deal_ship(req):

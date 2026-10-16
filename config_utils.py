@@ -8,10 +8,12 @@ FEATURE_DEFAULTS = {
         "group_chat": True,
         "group_create": True,
         "friend_request": True,
+        "read_receipt": True,
     },
     "forum": True,
     "sticker": True,
     "announcement": True,
+    "presence": True,
 }
 
 

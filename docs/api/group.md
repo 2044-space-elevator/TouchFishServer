@@ -51,7 +51,9 @@ TFV5 群聊系统支持创建群组、成员管理、管理员管理、入群审
 - `<allow_direct_join>`（可选，默认 `false`）是否允许用户直接申请入群。
 - `<require_review>`（可选，默认 `true`）是否需要对入群申请进行审核。仅在 `allow_direct_join` 为 `true` 时有效。
 
-返回：创建成功返回 `{"gid": <gid>}`，失败返回时间戳加 `False`。
+返回：创建成功返回 `{"gid": <gid>}`；失败返回 JSON 错误对象 `{"success": false, "error": "<错误码>"}`
+（**仅当请求声明了 `detail_error: true`**，未声明时按[错误文档](errors.md)回 bool 接口的纯文本；
+`invalid_request` / `auth_failed` / `banned` / `unavailable`，`detail_error` 模式下为规范化错误码）。
 
 创建者自动成为群主（owner）和第一个成员。群组数量受 `groups_limit` 服务器配置限制。
 
@@ -238,7 +240,9 @@ TFV5 群聊系统支持创建群组、成员管理、管理员管理、入群审
 返回：
 - 若无需审核（`require_review = false`），直接加入成功返回 `{"pending": false}`。
 - 若需审核，创建入群申请，返回 `{"rid": <rid>, "pending": true}`。群主和所有管理员会收到 `group.join.request` 通知（通知 meta 携带 `message`）。
-- 失败返回时间戳加 `False`。
+- 失败返回 JSON 错误对象 `{"success": false, "error": "<错误码>"}`（**仅当请求声明了 `detail_error: true`**，未声明时按[错误文档](errors.md)回 bool 接口的纯文本）：`auth_failed` / `banned` / `not_found`（群不存在）/
+  `conflict`（已在群内、群人数已满）/ `unavailable`（写入失败）/ `forbidden`（该群当前不接受直接加入）/ `request_message_too_long`，
+  `detail_error` 模式下为规范化错误码。
 
 ---
 

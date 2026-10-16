@@ -168,6 +168,9 @@ class MessagesDb(Db):
                ON messages(room_key, room_seq)""",
             """CREATE INDEX IF NOT EXISTS idx_messages_room_mid
                ON messages(room_key, mid DESC)""",
+            """CREATE INDEX IF NOT EXISTS idx_room_read_state_room_seq
+               ON room_read_state(room_key, last_read_seq)""",
+            """DROP INDEX IF EXISTS idx_room_read_state_room""",
         ]
         for idx_sql in indexes:
             try:
@@ -200,8 +203,11 @@ class MessagesDb(Db):
                           file_hash, send_time, quote, file_name, forwarded, duration, room_key, room_seq),
                     )
                     mid = self.cursor.lastrowid
-                    # 发送即已读：自己的新消息自动推进自己在房间内的已读水位
-                    self._advance_read_watermark_locked(sender_uid, room_key, room_seq, mid)
+                    # 发送即已读：自己的新消息自动推进自己在房间内的已读水位。
+                    # genuine=False：这只是「自己的未读不该算自己」，不是「读过
+                    # 别人的消息」，不能写 last_read_mid（否则群已读人数会偏高）。
+                    self._advance_read_watermark_locked(
+                        sender_uid, room_key, room_seq, mid, genuine=False)
                     self.conn.commit()
                     return mid, room_seq, False
                 except _IntegrityError:
@@ -700,8 +706,9 @@ class MessagesDb(Db):
                          self.EVENT_CONTENT_TYPE, time.time(), room_key, room_seq + 1),
                     )
                     event_mid = self.cursor.lastrowid
+                    # 同上：撤回产生的墓碑只是抬水位，不算「读过别人的消息」
                     self._advance_read_watermark_locked(
-                        deleted_by, room_key, room_seq + 1, event_mid)
+                        deleted_by, room_key, room_seq + 1, event_mid, genuine=False)
                 self.conn.commit()
                 return room_seq if changed else 0
             return self._execute_with_retry(operation)
@@ -808,28 +815,48 @@ class MessagesDb(Db):
         return True
 
     def _advance_read_watermark_locked(self, uid: int, room_key: str,
-                                       seq: int, mid: int) -> bool:
-        """推进已读（单调不回退）。调用方必须已持有 self.lock。"""
+                                       seq: int, mid: int,
+                                       genuine: bool = True) -> bool:
+        """推进已读（单调不回退）。调用方必须持有 self.lock!!
+        """
         if not seq or seq <= 0:
             return False
         row = self.cursor.execute(
-            "SELECT last_read_seq FROM room_read_state WHERE uid = ? AND room_key = ?",
+            "SELECT last_read_seq, last_read_mid FROM room_read_state "
+            "WHERE uid = ? AND room_key = ?",
             (uid, room_key),
         ).fetchone()
-        if row and row[0] is not None and row[0] >= seq:
-            return False
-        if row:
-            self.cursor.execute(
-                "UPDATE room_read_state SET last_read_seq = ?, last_read_mid = ?, updated_at = ? "
-                "WHERE uid = ? AND room_key = ?",
-                (seq, mid, time.time(), uid, room_key),
-            )
-        else:
-            self.cursor.execute(
-                "INSERT INTO room_read_state(uid, room_key, last_read_seq, last_read_mid, updated_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (uid, room_key, seq, mid, time.time()),
-            )
+        now = time.time()
+        if row is not None:
+            last_seq, last_mid = row[0], row[1]
+            if last_seq is not None and last_seq >= seq:
+                if not genuine or (last_mid or 0) > 0:
+                    return False
+                self.cursor.execute(
+                    "UPDATE room_read_state SET last_read_mid = ?, updated_at = ? "
+                    "WHERE uid = ? AND room_key = ?",
+                    (mid, now, uid, room_key),
+                )
+                return True
+            if genuine:
+                self.cursor.execute(
+                    "UPDATE room_read_state SET last_read_seq = ?, last_read_mid = ?, updated_at = ? "
+                    "WHERE uid = ? AND room_key = ?",
+                    (seq, mid, now, uid, room_key),
+                )
+            else:
+                self.cursor.execute(
+                    "UPDATE room_read_state SET last_read_seq = ?, updated_at = ? "
+                    "WHERE uid = ? AND room_key = ?",
+                    (seq, now, uid, room_key),
+                )
+            return True
+        # 没有行：显式已读记 mid，隐式推进只抬水位（mid=0 = 尚未真正读过）
+        self.cursor.execute(
+            "INSERT INTO room_read_state(uid, room_key, last_read_seq, last_read_mid, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (uid, room_key, seq, mid if genuine else 0, now),
+        )
         return True
 
     def update_read_state(self, uid: int, room_key: str, last_seq: int,
@@ -852,6 +879,23 @@ class MessagesDb(Db):
         if not rows:
             return None
         return {"last_read_seq": rows[0][0], "last_read_mid": rows[0][1]}
+
+    def read_states_for_room(self, room_key: str, min_seq: int):
+        """房间内读到 >= min_seq的成员列表
+
+        和私聊不一样是刻意的设计
+        """
+        rows = self.query(
+            "SELECT s.uid, m.room_seq, s.last_read_mid "
+            "FROM room_read_state s "
+            "JOIN messages m ON m.mid = s.last_read_mid AND m.room_key = s.room_key "
+            "WHERE s.room_key = ? AND m.room_seq >= ?",
+            (room_key, int(min_seq)),
+        )
+        return [
+            {"uid": int(r[0]), "last_read_seq": int(r[1]), "last_read_mid": int(r[2])}
+            for r in rows
+        ]
 
     def init_read_watermarks(self, uid: int, room_keys) -> None:
         """为尚无已读的房间建立 base（当前 MAX(room_seq)）。。

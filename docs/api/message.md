@@ -250,7 +250,9 @@ TFV5 的消息系统由两部分组成：
 }
 ```
 
-失败返回时间戳加 `False`。
+失败返回 JSON 错误对象 `{"success": false, "error": "<错误码>"}`（**仅当请求声明了 `detail_error: true`**；未声明时按[错误文档](errors.md)继续回 bool 接口的纯文本）：`invalid_request` / `auth_failed` / `banned` /
+`not_friends` / `not_group_member` / `not_found` / `invalid_quote` / `message_too_long` / `file_unavailable` /
+`client_mid_conflict` / `unavailable`，`detail_error` 模式下为规范化错误码。
 
 
 ### 聊天列表
@@ -410,6 +412,15 @@ TFV5 的消息系统由两部分组成：
 
 消息按 `room_seq` 升序排列。`has_more` 只表示增量查询（不含额外缺口补拉）是否还有下一页；为 `true` 时客户端应以增量结果的最大序号作为 `last_seq` 继续翻页，直到 `has_more` 为 `false`。已撤回消息（墓碑）也会返回，客户端按 `mid` 覆盖本地记录即可。声明了 `event_stream_v1` 的客户端还会收到事件行（见"事件行"），处理方式与墓碑一致：按语义应用、忽略未知目标。
 
+请求被拒绝时同样返回 JSON（而不是 bool 接口的纯文本 `"<时间戳>False"`）：
+
+```json
+{
+    "success" : false,
+    "error" : "invalid_request" | "auth_failed" | "banned" | "not_group_member" | "not_friends" | "not_found" | "unavailable"
+}
+```
+
 #### 房间序号（room_seq）不变式
 
 *本段与 API 无关，用于说明 `room_seq` 影响*
@@ -512,6 +523,54 @@ TFV5 的消息系统由两部分组成：
 ```
 
 `quote_preview` 始终存在，无引用时为 `null`；`file` 仅在原消息有 `file_hash` 时存在。该接口不返回 `mentioned_uids`。目标不存在或未被撤回时返回 `not_found`，非 root 返回 `forbidden`。
+
+### 查询已读回执
+
+- `^ POST /message/read_receipt` 按需查询某条消息的已读情况（不推送、不持久化）。需全服 `chat.read_receipt` 开关开启。
+
+请求体：
+
+```json
+{
+    "room_id" : "<room_id>",
+    "mid" : <mid>
+}
+```
+
+- `<room_id>`：`"U<uid>"`（私聊）或 `"G<gid>"`（群聊）。
+- `<mid>`：要查询的消息 `mid`。
+
+**私聊**：需与目标为好友。返回对方对该消息的水位；对方关闭「展示已读状态」时 `hidden` 为 `true`：
+
+```json
+{
+    "success" : true,
+    "room_id" : "<room_id>",
+    "mid" : <mid>,
+    "hidden" : false,
+    "read" : <bool>,
+    "reader_last_seq" : <对方已读水位>,
+    "reader_last_mid" : <对方最后**显式上报**的已读 mid>
+}
+```
+
+**群聊**：需为群成员。返回「N 人已读」计数（当前成员 ∩ 该消息发送者之外 ∩ 未关闭已读 ∩ **真的读到该消息**；**不返回他人具体水位**）：
+
+计数依据是成员**显式上报**的阅读位置（`message.read`），而不是已读水位：发送
+自己的消息也会把水位抬高（见[已读上报](#已读上报)），那是「自己的未读不该算自己」，
+不等于读过别人的消息。只发过言、没读过该消息的成员不计入。
+
+```json
+{
+    "success" : true,
+    "room_id" : "<room_id>",
+    "mid" : <mid>,
+    "hidden" : false,
+    "read_count" : <int>
+}
+```
+
+失败时返回 `{"success": false, "error": "<reason>"}`（如 `auth_failed`、`forbidden`、`not_found`）。
 
 ---
 
@@ -747,7 +806,7 @@ TFV5 的消息系统由两部分组成：
 - `<room_id>`：客户端视角的聊天室标识；服务端会校验发送者对该房间的访问权限。
 - `<last_mid>`：已读到的最后一条消息 `mid`（必须是该房间内的消息，否则静默忽略）。
 
-服务端不回 ACK，也**不会**把回执发给聊天对方（无对方已读功能）。同账号其它连接会收到：
+服务端不回 ACK。同账号其它连接会收到：
 
 ```json
 {
@@ -760,7 +819,27 @@ TFV5 的消息系统由两部分组成：
 }
 ```
 
-多端已读水位单调不回退；发送消息时服务端会自动把发送者自己的水位推进到该消息。该请求限流为每秒 5 次，超限静默丢弃。
+多端已读水位单调不回退；发送或撤回自己的消息时，服务端也会自动把发送者自己的水位推进到该消息
+（「发送即已读」）。这种隐式推进**同样会**向私聊对方扇出回执——否则对方的推送通道会停在旧水位，
+而 `POST /message/read_receipt`（读的是同一个水位）却已经答「已读」，两条路径自相矛盾；
+而且水位被顶高之后，之后任何一次真正的已读都变成「未前进」而被丢弃，对方再也收不到推送。
+该请求限流为每秒 5 次，超限静默丢弃。
+
+**私聊对方回执**：当全服 `chat.read_receipt` 开关开启、且读取者未关闭「展示已读状态」时，服务端还会向私聊对方推送 `message.read_receipt`（按 `(读取者, 房间)` 合并节流，1.5s 窗口内最多推一次、只保留最新水位）：
+
+```json
+{
+    "type" : "message.read_receipt",
+    "room_id" : "U<读取者uid>",
+    "uid" : <读取者uid>,
+    "last_mid" : <已读到的最后一条 mid>,
+    "last_seq" : <对应房间序号>,
+    "ts" : <服务器毫秒时间戳>
+}
+```
+
+- 推送无持久化：读取者随后关闭「展示已读状态」时，对方侧立即不再收到更新。
+- 查询离线期间的对方水位请用 `^ POST /message/read_receipt`（见下文 Secret API）。
 
 ### 消息置顶推送
 

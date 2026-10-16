@@ -93,6 +93,20 @@ class InstantConnect():
         self._ws_timestamps = defaultdict(list)
         self._ws_typing_timestamps = defaultdict(list)
         self._ws_read_timestamps = defaultdict(list)
+        self._read_receipt_window = 1.5
+        self._read_receipt_last = dict()
+        self._read_receipt_pending = dict()
+        self._read_receipt_timers = dict()
+        self._read_receipt_lock = threading.Lock()
+        self._presence_grace = 5.0
+        self._presence_state = dict()
+        self._presence_timers = dict()
+        # 扇出失败（DB 抖动）后的补发：uid -> (on/offline, 已尝试次数)
+        self._presence_retry = dict()
+        self._presence_retry_timers = dict()
+        self._presence_retry_delay = 10.0
+        self._presence_retry_limit = 3
+        self._presence_lock = threading.Lock()
         self._clients_lock = threading.Lock()
         self._auth_lock = threading.Lock()
         self._auth_timestamps = defaultdict(list)
@@ -107,8 +121,28 @@ class InstantConnect():
                     self._cleanup_rate_timestamps()
                 except Exception:
                     pass
+                try:
+                    self._cleanup_read_receipts()
+                except Exception:
+                    pass
         t = threading.Thread(target=_loop, daemon=True, name="tfv5-ws-rate-gc")
         t.start()
+
+    def _cleanup_read_receipts(self):
+        """回收已读回执节流状态：(读取者, 房间) 键随私聊对象/会话数无上限增长。
+
+        时间戳用 time.monotonic()（与 _read_receipt_last 同源），阈值远大于
+        合并窗口，不会误删仍在节流中的键。
+        """
+        cutoff = time.monotonic() - max(self._read_receipt_window * 8, 120.0)
+        with self._read_receipt_lock:
+            for key in [k for k, ts in self._read_receipt_last.items() if ts < cutoff]:
+                del self._read_receipt_last[key]
+            # 定时器仍在的键由 _fire 收尾；没有定时器又没有时间戳的是卡死的残留
+            for key in [k for k in self._read_receipt_pending
+                        if k not in self._read_receipt_timers
+                        and k not in self._read_receipt_last]:
+                del self._read_receipt_pending[key]
 
     def _cleanup_rate_timestamps(self):
         now = time.time()
@@ -194,7 +228,20 @@ class InstantConnect():
         rtc_cfg = cfg.get("rtc", {})
         self.rtc_turn_enabled = bool(rtc_cfg.get("turn_enabled", False)) if isinstance(rtc_cfg, dict) else False
         self.rtc_ice_servers = rtc_cfg.get("ice_servers", []) if isinstance(rtc_cfg, dict) else []
-    
+
+    def refresh_config(self) -> bool:
+        """重新从磁盘加载配置，返回是否成功
+        """
+        cfg_path = os.path.join("res", str(self.port_api), "config.json")
+        try:
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except Exception as e:
+            print("[WARN] 重新加载配置失败，保留原值: {}".format(e))
+            return False
+        self._load_config(cfg)
+        return True
+
     def encrypt_response(self, req : dict, websocket):
         json_req = json.dumps(req)
         iv, content = crypto.aes_encrypt(json_req, self.aes_key[websocket])
@@ -226,6 +273,7 @@ class InstantConnect():
                    (r[0] == target_uid and r[1] == sender_uid)
 
     def _cleanup_client(self, websocket):
+        last_uid = None
         with self._clients_lock:
             uid = self.clients_belonged.pop(websocket, -1)
             self.clients_token.pop(websocket, None)
@@ -234,10 +282,15 @@ class InstantConnect():
                 self.connected_clients[uid].remove(websocket)
                 if uid != -1 and not self.connected_clients[uid]:
                     del self.connected_clients[uid]
+                    last_uid = uid
             elif websocket in self.connected_clients[-1]:
                 self.connected_clients[-1].remove(websocket)
             self.send_queue.pop(websocket, None)
             self.aes_key.pop(websocket, None)
+        # 最后一个连接掉线时启动下线宽限（不在此加锁块内，避免与 filter_online 死锁）
+        if last_uid is not None:
+            self._schedule_offline(last_uid)
+        return last_uid
 
     async def _queue_message(self, websocket, message : dict):
         queue = self.send_queue.get(websocket)
@@ -359,6 +412,254 @@ class InstantConnect():
         """返回给定 uid 集合中当前在线的子集"""
         with self._clients_lock:
             return [int(uid) for uid in set(uids) if self.connected_clients.get(int(uid))]
+
+    def _presence_enabled(self) -> bool:
+        return bool(self.features.get("presence", True))
+
+    def _user_shows_presence(self, uid):
+        """用户是否允许向好友展示在线状态（默认展示）
+        """
+        try:
+            flags = self.user_cursor.get_show_status_flags([uid])
+        except Exception as e:
+            print("[WARN] 读取在线状态开关失败(uid={}): {}".format(uid, e))
+            return None
+        info = flags.get(int(uid))
+        if info is None:
+            return False
+        return bool(info.get("show_online_status", True))
+
+    def _presence_targets(self, uid):
+        """这次上下线事件推给
+        """
+        if self.loop is None or not self._presence_enabled():
+            return []
+        shows = self._user_shows_presence(uid)
+        if shows is None:
+            return None
+        if not shows:
+            return []
+        try:
+            friends = self.user_cursor.list_friend_uids(uid)
+        except Exception as e:
+            print("[WARN] 读取好友列表失败(uid={}): {}".format(uid, e))
+            return None
+        return self.filter_online(friends)
+
+    def _push_presence(self, uid, online, targets):
+        """把上下线事件推给 targets"""
+        if not targets:
+            return
+        payload = {
+            "type": "presence.update",
+            "uid": uid,
+            "status": "online" if online else "offline",
+            "ts": int(time.time() * 1000),
+        }
+        for friend in targets:
+            self.push_raw(friend, dict(payload))
+
+    def _deliver_offline(self, uid, targets):
+        """复查仍在离线并广播 offline（判定与广播原子
+        """
+        with self._presence_lock:
+            with self._clients_lock:
+                still_online = bool(self.connected_clients.get(uid))
+            if still_online:
+                return False
+            self._presence_state.pop(uid, None)
+            self._push_presence(uid, False, targets)
+        return True
+
+    def _queue_presence_retry(self, uid, online):
+        if self.loop is None or not self._presence_enabled():
+            return
+        with self._presence_lock:
+            attempts = self._presence_retry.get(uid, (online, 0))[1] + 1
+            if attempts > self._presence_retry_limit:
+                self._presence_retry.pop(uid, None)
+                print("[WARN] 在线状态扇出重试 {} 次仍失败，放弃(uid={})".format(
+                    self._presence_retry_limit, uid))
+                return
+            self._presence_retry[uid] = (online, attempts)
+            if uid in self._presence_retry_timers:
+                return
+            timer = threading.Timer(
+                self._presence_retry_delay, self._fire_presence_retry, (uid,))
+            timer.daemon = True
+            self._presence_retry_timers[uid] = timer
+            timer.start()
+
+    def _fire_presence_retry(self, uid):
+        with self._presence_lock:
+            self._presence_retry_timers.pop(uid, None)
+            pending = self._presence_retry.get(uid)
+        if pending is None:
+            return
+        online = pending[0]
+        if bool(self.filter_online([uid])) != online:
+            with self._presence_lock:
+                self._presence_retry.pop(uid, None)
+            return
+        if online:
+            if self._fanout_presence(uid, True):
+                with self._presence_lock:
+                    self._presence_retry.pop(uid, None)
+            else:
+                self._queue_presence_retry(uid, True)
+            return
+        targets = self._presence_targets(uid)
+        if targets is None:
+            self._queue_presence_retry(uid, False)
+            return
+        self._deliver_offline(uid, targets)
+        with self._presence_lock:
+            self._presence_retry.pop(uid, None)
+
+    def _fanout_presence(self, uid, online, targets=None):
+        if targets is None:
+            targets = self._presence_targets(uid)
+            if targets is None:
+                return False
+        self._push_presence(uid, online, targets)
+        return True
+
+    def _mark_online(self, uid):
+        if not self._presence_enabled():
+            return
+        with self._presence_lock:
+            timer = self._presence_timers.pop(uid, None)
+            if timer is not None:
+                timer.cancel()
+            if self._presence_state.get(uid):
+                return
+            self._presence_state[uid] = True
+        if not self._fanout_presence(uid, True):
+            self._queue_presence_retry(uid, True)
+
+    def _schedule_offline(self, uid):
+        if not self._presence_enabled():
+            return
+        with self._presence_lock:
+            timer = self._presence_timers.pop(uid, None)
+            if timer is not None:
+                timer.cancel()
+
+            def _fire():
+                targets = self._presence_targets(uid)
+                with self._presence_lock:
+                    self._presence_timers.pop(uid, None)
+                if targets is None:
+                    self._queue_presence_retry(uid, False)
+                    return
+                self._deliver_offline(uid, targets)
+
+            timer = threading.Timer(self._presence_grace, _fire)
+            timer.daemon = True
+            self._presence_timers[uid] = timer
+            timer.start()
+
+    def presence_hidden(self, uid):
+        """用户关闭在线状态时，向好友 hidden 让在线指示器立即消失。"""
+        if self.loop is None or not self._presence_enabled():
+            return
+        try:
+            friends = self.user_cursor.list_friend_uids(uid)
+        except Exception as e:
+            print("[WARN] 读取好友列表失败(uid={}): {}".format(uid, e))
+            return
+        targets = self.filter_online(friends)
+        if not targets:
+            return
+        payload = {
+            "type": "presence.update",
+            "uid": uid,
+            "status": "hidden",
+            "ts": int(time.time() * 1000),
+        }
+        for friend in targets:
+            self.push_raw(friend, dict(payload))
+
+    def presence_shown(self, uid):
+        """用户重新开启在线状态且当前在线时，向好友 online"""
+        if self.loop is None or not self._presence_enabled():
+            return
+        if not self.filter_online([uid]):
+            return
+        if not self._fanout_presence(uid, True):
+            self._queue_presence_retry(uid, True)
+
+    def emit_private_read_receipt(self, reader_uid, peer_uid, room_key,
+                                  last_mid, last_seq):
+        """私聊已读回执
+        """
+        if not self._read_receipt_enabled():
+            return
+        if not self._user_shows_read_status(reader_uid):
+            return
+        if not last_seq or last_seq <= 0:
+            return
+        self._emit_read_receipt(reader_uid, peer_uid, room_key, last_mid, last_seq)
+
+    def _read_receipt_enabled(self) -> bool:
+        return bool(self.features.get('chat', {}).get('read_receipt', True))
+
+    def _user_shows_read_status(self, uid) -> bool:
+        """用户是否允许向他人展示自己已读"""
+        try:
+            flags = self.user_cursor.get_show_status_flags([uid])
+        except Exception as e:
+            print("[WARN] 读取已读展示开关失败(uid={}): {}".format(uid, e))
+            return False
+        return bool(flags.get(int(uid), {}).get('show_read_status', True))
+
+    def _emit_read_receipt(self, reader_uid, peer_uid, room_key, last_mid, last_seq):
+        """向私聊对方推送已读回执
+        """
+        key = (reader_uid, room_key)
+        payload = {
+            "type": "message.read_receipt",
+            "room_id": "U{}".format(reader_uid),
+            "uid": reader_uid,
+            "last_mid": last_mid,
+            "last_seq": last_seq,
+            "ts": int(time.time() * 1000),
+        }
+
+        def _fire():
+            with self._read_receipt_lock:
+                self._read_receipt_timers.pop(key, None)
+                pending = self._read_receipt_pending.pop(key, None)
+                if pending is None:
+                    return
+                target_uid, pending_payload = pending
+                self._read_receipt_last[key] = time.monotonic()
+            self.push_raw(target_uid, pending_payload)
+
+        window = self._read_receipt_window
+        now = time.monotonic()
+        immediate = False
+        cancel_timer = None
+        start_timer = None
+        with self._read_receipt_lock:
+            last = self._read_receipt_last.get(key)
+            if last is None or now - last >= window:
+                immediate = True
+                self._read_receipt_last[key] = now
+                cancel_timer = self._read_receipt_timers.pop(key, None)
+                self._read_receipt_pending.pop(key, None)
+            else:
+                self._read_receipt_pending[key] = (peer_uid, payload)
+                if key not in self._read_receipt_timers:
+                    start_timer = threading.Timer(window, _fire)
+                    start_timer.daemon = True
+                    self._read_receipt_timers[key] = start_timer
+        if start_timer is not None:
+            start_timer.start()
+        if cancel_timer is not None:
+            cancel_timer.cancel()
+        if immediate:
+            self.push_raw(peer_uid, payload)
 
     def _queue_call_ack(self, websocket, call_id, request, status):
         """针对 call.* 信令的回执（相当于 call 专用版 _queue_ack）"""
@@ -594,6 +895,7 @@ class InstantConnect():
                 raise ValueError("UID 验证失败：{}".format(message.get('uid', 'token')))
             with self._clients_lock:
                 self.connected_clients[-1].remove(websocket)
+                became_online = not self.connected_clients.get(verified_uid)
                 if verified_uid not in self.connected_clients.keys():
                     self.connected_clients[verified_uid] = []
                 self.connected_clients[verified_uid].append(websocket)
@@ -602,6 +904,8 @@ class InstantConnect():
                 self.clients_session[websocket] = verified_sid
             self.send_queue[websocket] = asyncio.Queue()
             await websocket.send(self.encrypt_response({"type" : "AUTH.LOGIN_SUCCEEDED"}, websocket))
+            if became_online:
+                await to_thread(self._mark_online, verified_uid)
 
         except Exception as e:
             print("[ERR] 客户端链接 WS 服务器后没有登录")
@@ -718,6 +1022,14 @@ class InstantConnect():
                         sender_notif["should_alert"] = False
                         await to_thread(self.push_message, send_to, recv_notif)
                         await to_thread(self.push_message, sender_uid, sender_notif)
+                        # 发送即已读：这次隐式前进也要告诉对方，否则对方的推送
+                        # 通道会停在旧水位（见 emit_private_read_receipt 的注释）。
+                        await to_thread(
+                            self.emit_private_read_receipt,
+                            sender_uid, send_to,
+                            self.messages_cursor.room_key_of(sender_uid, send_to),
+                            msg_record["mid"], msg_record.get("room_seq") or 0,
+                        )
 
                     elif send_to[0] == 'G':
                         gid = int(send_to[1:])
@@ -904,6 +1216,14 @@ class InstantConnect():
                         sender_notif["should_alert"] = False
                         await to_thread(self.push_message, send_to, recv_notif)
                         await to_thread(self.push_message, sender_uid, sender_notif)
+                        # 发送即已读：这次隐式前进也要告诉对方，否则对方的推送
+                        # 通道会停在旧水位（见 emit_private_read_receipt 的注释）。
+                        await to_thread(
+                            self.emit_private_read_receipt,
+                            sender_uid, send_to,
+                            self.messages_cursor.room_key_of(sender_uid, send_to),
+                            msg_record["mid"], msg_record.get("room_seq") or 0,
+                        )
 
                     elif send_to[0] == 'G':
                         try:
@@ -1101,6 +1421,13 @@ class InstantConnect():
                         "last_seq": cursor[0],
                         "ts": int(time.time() * 1000),
                     }, exclude_websocket=websocket)
+                    # 私聊：把已读水位回执推给对方（内部要读隐私开关 + 推送，
+                    # 与其它调用点一致地挪出事件循环线程）
+                    if room_id.startswith('U'):
+                        await to_thread(
+                            self.emit_private_read_receipt,
+                            sender_uid, int(room_id[1:]), room_key,
+                            last_mid, cursor[0])
 
         except Exception as e:
             print("[ERR] WS消息处理异常: {}".format(e))

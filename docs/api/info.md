@@ -34,11 +34,13 @@
             "private_chat" : <true_or_false>,
             "group_chat" : <true_or_false>,
             "group_create" : <true_or_false>,
-            "friend_request" : <true_or_false>
+            "friend_request" : <true_or_false>,
+            "read_receipt" : <true_or_false>
         },
         "forum" : <true_or_false>,
         "sticker" : <true_or_false>,
-        "announcement" : <true_or_false>
+        "announcement" : <true_or_false>,
+        "presence" : <true_or_false>
     },
     "min_group_name_length" : <min_group_name_length>,
     "max_group_name_length" : <max_group_name_length>,
@@ -70,7 +72,8 @@ configuration to publish TURN servers.
 按设计，细分开关关闭后对应写操作会被服务端拒绝（错误码 `FEATURE_DISABLED_*`），客户端应据此隐藏入口；
 各端点的检查点随版本逐步接入。
 当前可开关项：`chat.private_chat`（私聊消息）、`chat.group_chat`（群消息）、`chat.group_create`（建群）、
-`chat.friend_request`（好友申请）、`forum`（论坛写操作）、`sticker`（贴纸写操作）、`announcement`（公告写操作）。
+`chat.friend_request`（好友申请）、`chat.read_receipt`（已读回执）、`forum`（论坛写操作）、`sticker`（贴纸写操作）、
+`announcement`（公告写操作）、`presence`（好友在线状态）。
 
 `max_request_message_length` 为好友/入群申请留言的最大长度（默认 200）。
 `min_search_length` 为搜索关键词的最小长度（默认 2）。

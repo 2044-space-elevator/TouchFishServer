@@ -22,7 +22,9 @@
 
 错误响应仍会按照 secret API 的 RSA + AES 方式加密。`error_message` 是服务端提供的英文回退文本。
 
-如果请求没有携带 `detail_error`，服务器保持旧行为：错误码使用旧格式，HTTP 状态码保持原有兼容行为。因此旧客户端无需修改即可继续访问 API。
+如果请求没有携带 `detail_error`，服务器保持旧行为：**失败体继续是 bool 接口的纯文本 `<时间戳>False`**（不是 JSON 对象），错误码使用旧格式，HTTP 状态码保持原有兼容行为。因此旧客户端无需修改即可继续访问 API。
+
+虽然新加入的 API 没有必要兼容纯文本失败（因为旧版根本不调用）但为了统一也一并支持。
 
 
 ## 错误码列表
@@ -51,6 +53,8 @@
 | `FEATURE_DISABLED_FORUM` | The forum is disabled on this server | 403 |
 | `FEATURE_DISABLED_STICKER` | Stickers are disabled on this server | 403 |
 | `FEATURE_DISABLED_ANNOUNCEMENT` | Announcements are disabled on this server | 403 |
+| `FEATURE_DISABLED_CHAT_READ_RECEIPT` | Read receipts are disabled on this server | 403 |
+| `FEATURE_DISABLED_PRESENCE` | Presence is disabled on this server | 403 |
 | `RESOURCE_NOT_FOUND` | Requested resource was not found | 404 |
 | `RESOURCE_USER_NOT_FOUND` | User does not exist | 404 |
 | `RESOURCE_GROUP_NOT_FOUND` | Group does not exist | 404 |

@@ -14,7 +14,7 @@ import functools
 
 from flask import request
 from jwt_tool import LEGACY_NOTE
-from error_codes import normalize_error
+from error_codes import legacy_failure_body, normalize_error
 
 def load_pri(path : str):
     """
@@ -97,6 +97,8 @@ def return_app_route(app,  pri, auth_resolver=None, feature_checker=None):
                     ret, normalized_status = normalize_error(ret, detailed)
                     if detailed:
                         ret_status = normalized_status
+                    else:
+                        ret = legacy_failure_body(ret)
                     if not isinstance(ret, str):
                         ret = json.dumps(ret)
                     iv, ret = aes_encrypt(ret, aes_key)
