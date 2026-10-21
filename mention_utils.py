@@ -27,11 +27,18 @@ def resolve_mentioned_uids(content, user_cursor, allowed_uids=None, exclude_uid=
     })
 
 
-def should_alert(messages_cursor, uid, room_id, mentioned_uids):
-    preference = messages_cursor.get_room_preference(uid, room_id)
-    level = int(preference.get("notify_level", 0))
+def alert_from_preference(pref, uid, mentioned_uids) -> bool:
+    """根据已批量取到的房间偏好判断是否需要提醒（缺 = 0 级）"""
+    level = int((pref or {}).get("notify_level", 0))
     if level == 2:
         return False
     if level == 1:
         return uid in mentioned_uids
     return True
+
+
+def should_alert(messages_cursor, uid, room_id, mentioned_uids):
+    """按房间偏好判断是否需要提醒（单房询版"""
+    return alert_from_preference(
+        messages_cursor.get_room_preference(uid, room_id), uid, mentioned_uids
+    )

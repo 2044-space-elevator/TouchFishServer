@@ -70,8 +70,22 @@ class UserDb(Db):
                         return False
                     if email and not self._validate_email_locked(email):
                         return False
-                    self.cursor.execute("SELECT COALESCE(MAX(uid), -1) + 1 FROM users")
-                    uid = self.cursor.fetchone()[0]
+                    self.cursor.execute(
+                        "UPDATE uid_sequence SET next_uid = next_uid + 1 "
+                        "WHERE id = 1"
+                    )
+                    if self.cursor.rowcount == 0:
+                        self.cursor.execute(
+                            "SELECT COALESCE(MAX(uid), -1) + 1 FROM users")
+                        uid = max(int(self.cursor.fetchone()[0]), 0)
+                        self.cursor.execute(
+                            "INSERT INTO uid_sequence (id, next_uid) VALUES (1, ?)",
+                            (uid + 1,),
+                        )
+                    else:
+                        self.cursor.execute(
+                            "SELECT next_uid FROM uid_sequence WHERE id = 1")
+                        uid = int(self.cursor.fetchone()[0]) - 1
                     if email:
                         self.cursor.execute(
                             "INSERT INTO users (uid, username, pwd_hash, create_time, email, stat) VALUES (?, ?, ?, ?, ?, ?)",
@@ -266,8 +280,31 @@ class UserDb(Db):
         self._migrate_auth_version()
         self._migrate_public_email()
         self._migrate_show_status_flags()
+        self._ensure_uid_sequence()
         self.create_token_table()
         self.create_identity_table()
+
+    def _ensure_uid_sequence(self):
+        """自增 uid 序列：删除用户后其 uid 不再被复用
+        """
+        self.execute("""
+    CREATE TABLE IF NOT EXISTS uid_sequence (
+        id INTEGER PRIMARY KEY,
+        next_uid INTEGER NOT NULL
+    )
+    """)
+        if self.query("SELECT next_uid FROM uid_sequence WHERE id = 1"):
+            return
+        next_uid = int(self.query(
+            "SELECT COALESCE(MAX(uid), -1) + 1 FROM users")[0][0])
+        try:
+            self.execute(
+                "INSERT INTO uid_sequence (id, next_uid) VALUES (1, ?)",
+                (max(next_uid, 0),),
+            )
+        except self.dialect.IntegrityError:
+            # 并发启动时另一个线程已经完成播种
+            pass
 
     def _migrate_auth_version(self):
         """为旧数据库补充 auth_version"""
@@ -410,6 +447,22 @@ class UserDb(Db):
         rows = self.query(
             "SELECT session_id, uid, created_at, last_seen_at, expires_at, session_version, revoked_at, ip, ua, device_id, location FROM auth_sessions WHERE refresh_hash = ?",
             (refresh_hash,),
+        )
+        return rows[0] if rows else None
+
+    def resolve_session_identity(self, uid, jti, sid, now=None):
+        """一条查询完成 token 登记 / 会话有效性 / 用户 / auth_version 校验。
+
+        返回 (stat, auth_version) 或 None
+        resolve_session_identity ==  token_exists + session_is_active + uid_query + get_auth_version 四次往返。
+        """
+        now = time.time() if now is None else now
+        rows = self.query(
+            "SELECT u.stat, COALESCE(u.auth_version, 0) FROM users u "
+            "JOIN tokens t ON t.jti = ? AND t.uid = u.uid "
+            "JOIN auth_sessions s ON s.session_id = ? AND s.uid = u.uid "
+            "WHERE u.uid = ? AND s.revoked_at IS NULL AND s.expires_at > ?",
+            (jti, sid, uid, now),
         )
         return rows[0] if rows else None
 

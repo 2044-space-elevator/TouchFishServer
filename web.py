@@ -21,7 +21,7 @@ import announcements
 import jwt_tool
 from crypto import generate_rsa_keys, return_app_route
 from rate_limiter import RateLimiter
-from mention_utils import resolve_mentioned_uids, should_alert
+from mention_utils import resolve_mentioned_uids, should_alert, alert_from_preference
 import time
 import threading
 from config_utils import get_features, normalize_default_join_targets, feature_gate, merge_features, SETTINGS_SPEC
@@ -62,6 +62,44 @@ def check_search_rate(uid, max_per_window: int = 20, window: float = 10.0) -> bo
     """搜索端点 不准你乱搜"""
     return check_rate_limit(uid, "search", max_per_window, window)
 
+# 配额检查 + 写入必须原子：否则两个并发上传都读到旧用量，双双通过。
+# 用按 uid 分条的锁，避免所有用户共用一个全局锁。
+_QUOTA_LOCK_STRIPES = 64
+_quota_locks = [threading.Lock() for _ in range(_QUOTA_LOCK_STRIPES)]
+
+
+def quota_lock(uid):
+    try:
+        index = int(uid) % _QUOTA_LOCK_STRIPES
+    except (TypeError, ValueError):
+        index = 0
+    return _quota_locks[index]
+
+
+# 单条 SQL 的占位符数量有上限（SQLite 默认 32766），公告又是按全量用户扇出的；
+# 不分批的话 `IN (...)` 直接抛错，异常被副作用包装吞掉 —— 一条通知都发不出去。
+NOTIFY_BATCH_SIZE = 500
+
+
+def normalize_notification_targets(target_uids):
+    """去重 + 排序 + 丢掉无法转成 int 的项（bool 不是 uid）。"""
+    unique = set()
+    for value in target_uids:
+        if isinstance(value, bool):
+            continue
+        try:
+            unique.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    return sorted(unique)
+
+
+def notification_batches(uids, size: int = NOTIFY_BATCH_SIZE):
+    """把规范化后的 uid 列表按批切开，每批一条 IN 查询 + 一个事务。"""
+    for start in range(0, len(uids), size):
+        yield uids[start:start + size]
+
+
 def normalize_search_request(keyword, min_len, limit, offset=0):
     """归一化搜索请求"""
     keyword = str(keyword or "").strip()
@@ -81,6 +119,49 @@ def normalize_search_request(keyword, min_len, limit, offset=0):
 
 # 陈年老 bug 没注意到，tf.xin 上早就修了
 FILE_CACHE_MAX_AGE = 365 * 24 * 3600
+
+# max_file_size 未配置（-1）时请求体的兜底上限：大文件请走 /file/chunked_upload
+DEFAULT_MAX_UPLOAD_BYTES = 64 * 1024 * 1024
+
+# secret 接口的请求体是「两层 base64」：正文里的 file_b64 是第一层（4/3），
+# 整个 JSON 又被 AES 加密后再 base64（第二层，再 4/3），合计 16/9。
+# 只按 4/3 估算会在大文件上误判超限（413 Payload Too Large）。
+SECRET_ENVELOPE_RATIO = 16 / 9
+# JSON 信封 / RSA 字段 / PKCS7 填充 / 文件名的余量
+REQUEST_BODY_MARGIN = 2 * 1024 * 1024
+
+
+def _positive_int(value):
+    """把配置值收成正整数；-1（不限制）/ 缺失 / 非法值返回 None。"""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def request_body_limit(cfg):
+    """单个请求的请求体上限。
+
+    由「一次请求最多能带多少原始 payload」反推：单文件上传受 max_file_size、
+    贴纸/头像分别受 max_sticker_size / max_avatar_size 限制，分块上传的每个
+    分块受 file.MAX_CHUNK_SIZE 限制——任意一项大于上限都会变成 413。
+    配置项 max_request_body_size 可显式覆盖。
+    """
+    override = cfg.get("max_request_body_size")
+    if isinstance(override, int) and not isinstance(override, bool) and override > 0:
+        return override
+    # max_file_size 为 -1（不限制）时按兜底值算：大文件请走分块上传
+    payloads = [
+        _positive_int(cfg.get("max_file_size")) or DEFAULT_MAX_UPLOAD_BYTES,
+        file.MAX_CHUNK_SIZE,
+    ]
+    for key in ("max_sticker_size", "max_avatar_size"):
+        value = _positive_int(cfg.get(key))
+        if value is not None:
+            payloads.append(value)
+    return int(max(payloads) * SECRET_ENVELOPE_RATIO) + REQUEST_BODY_MARGIN
+
 
 FILE_MIMETYPES = {
     ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
@@ -158,20 +239,19 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 except (TypeError, ValueError):
                     return False, {"error": "token_expired"}
                 jti = payload.get("jti")
-                if not user_cursor.token_exists(jti):
-                    # token 登记已被移除（设备被用靴子踢屁股了）
-                    return False, {"error": "token_expired"}
                 sid = payload.get("sid")
-                if not sid or not user_cursor.session_is_active(sid, uid):
-                    # 旧版 token（无 sid）或 session 已被吊销（登出/踢出/改密）
+                if not sid:
+                    # 旧版 token（无 sid）
                     return False, {"error": "token_expired"}
-                row = user_cursor.uid_query(uid)
-                if not row:
+                # 一条 JOIN 同时校验 token 登记 / 会话状态 / 用户存在 / auth_version，
+                # 避免每个请求 4 次往返。
+                row = user_cursor.resolve_session_identity(uid, jti, sid)
+                if row is None:
                     return False, {"error": "token_expired"}
-                auth_version = user_cursor.get_auth_version(uid)
+                auth_version = int(row[1])
                 if int(payload.get("av", -1)) != auth_version:
                     return False, {"error": "token_expired"}
-                identity = {"uid": uid, "stat": row[0][4], "auth_version": auth_version, "jti": jti, "sid": sid, "external": False}
+                identity = {"uid": uid, "stat": row[0], "auth_version": auth_version, "jti": jti, "sid": sid, "external": False}
                 flask_g.auth_identity = identity
                 return True, (identity, False)
 
@@ -246,25 +326,58 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         'announcement': threading.Lock(),
     }
 
+    CONFIG_PATH = "res/{}/config.json".format(port_api)
     _config_cache = None
+    _config_stat = None  # (mtime_ns, size) xsfx可以手动改 JSON
+
     def read_config():
-        nonlocal _config_cache
-        if _config_cache is not None:
+        nonlocal _config_cache, _config_stat
+        try:
+            st = os.stat(CONFIG_PATH)
+            stat = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            stat = None
+        if _config_cache is not None and stat is not None and stat == _config_stat:
             return dict(_config_cache)
         with locks['config']:
-            cfg = read_json("res/{}/config.json".format(port_api))
+            try:
+                st = os.stat(CONFIG_PATH)
+                stat = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                stat = None
+            if _config_cache is not None and stat is not None and stat == _config_stat:
+                return dict(_config_cache)
+            cfg = read_json(CONFIG_PATH)
             _config_cache = dict(cfg)
+            _config_stat = stat
             return dict(_config_cache)
+
+    def apply_request_body_limit(cfg):
+        limit = request_body_limit(cfg)
+        if app.config.get("MAX_CONTENT_LENGTH") != limit:
+            app.config["MAX_CONTENT_LENGTH"] = limit
+
+    apply_request_body_limit(read_config())
 
     group_cursor._config_reader = read_config
 
     _base_wsgi_app = app.wsgi_app
+    _proxy_state = {"enabled": None, "count": None}
+
     def apply_proxy_fix(cfg):
-        if cfg.get("reverse_proxy_enabled", False):
-            x_for = int(cfg.get("proxy_count", 1))
-            app.wsgi_app = ProxyFix(_base_wsgi_app, x_for=x_for, x_proto=1)
+        enabled = bool(cfg.get("reverse_proxy_enabled", False))
+        try:
+            count = max(int(cfg.get("proxy_count", 1)), 0)
+        except (TypeError, ValueError):
+            count = 1
+        if _proxy_state["enabled"] == enabled and _proxy_state["count"] == count:
+            return
+        if enabled:
+            app.wsgi_app = ProxyFix(_base_wsgi_app, x_for=count, x_proto=1)
         else:
             app.wsgi_app = _base_wsgi_app
+        _proxy_state["enabled"] = enabled
+        _proxy_state["count"] = count
 
     apply_proxy_fix(read_config())
 
@@ -315,15 +428,24 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     def notify_users(target_uids, event : str, title : str, content : str, sender=None, meta=None):
         def callback():
-            sent = set()
+            unique = normalize_notification_targets(target_uids)
+            if not unique:
+                return []
+            notification = build_notification(event, title, content, sender, meta)
             records = []
-            for target_uid in target_uids:
-                if target_uid in sent or target_uid is None:
-                    continue
-                sent.add(target_uid)
-                record = notify_user(target_uid, event, title, content, sender, meta)
-                if record is not None:
-                    records.append(record)
+            for batch in notification_batches(unique):
+                placeholders = ",".join("?" * len(batch))
+                existing = {
+                    int(row[0]) for row in user_cursor.query(
+                        "SELECT uid FROM users WHERE uid IN ({})".format(placeholders),
+                        tuple(batch),
+                    )
+                }
+                prepared = [
+                    (uid, dict(notification)) for uid in batch if uid in existing
+                ]
+                if prepared:
+                    records.extend(instant_contact.notify_users(prepared))
             return records
         records = run_notification_side_effect("notify_users/{}".format(event), callback)
         if records is None:
@@ -337,14 +459,21 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         return ret
 
     def update_config(mutator):
-        nonlocal _config_cache
+        nonlocal _config_cache, _config_stat
         with locks['config']:
             state = {}
             def apply(cfg):
                 mutator(cfg)
                 state["cfg"] = dict(cfg)
-            update_json("res/{}/config.json".format(port_api), apply)
+            update_json(CONFIG_PATH, apply)
             _config_cache = state["cfg"]
+            try:
+                st = os.stat(CONFIG_PATH)
+                _config_stat = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                _config_stat = None
+            apply_request_body_limit(_config_cache)
+            apply_proxy_fix(_config_cache)
             # WS 侧的功能开关与限额是启动时的快照：配置一落地就同步刷新，
             # 否则管理端关掉 presence/read_receipt 后 HTTP 已经 403，
             # WS 仍在推 presence.update / message.read_receipt。
@@ -498,9 +627,12 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 return False
         return False
 
-    def decode_base64_payload(payload):
+    def decode_base64_payload(payload, max_bytes=None):
         if not isinstance(payload, str) or not payload.strip():
             return None
+        if max_bytes is not None and max_bytes >= 0:
+            if len(payload) > (max_bytes * 4 // 3) + 8:
+                return None
         try:
             return base64.b64decode(payload, validate=True)
         except (binascii.Error, ValueError, TypeError):
@@ -547,10 +679,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         return normalized or None
 
     def validate_avatar_upload(pic_b64, cfg):
-        payload = decode_base64_payload(pic_b64)
+        max_avatar_size = read_upload_limit(cfg, "max_avatar_size")
+        payload = decode_base64_payload(pic_b64, max_avatar_size)
         if payload is None:
             return False
-        max_avatar_size = read_upload_limit(cfg, "max_avatar_size")
         if max_avatar_size != -1 and len(payload) > max_avatar_size:
             return False
         return True
@@ -559,10 +691,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         normalized_name = normalize_upload_filename(filename)
         if normalized_name is None:
             return None, None
-        payload = decode_base64_payload(file_b64)
+        max_file_size = read_upload_limit(cfg, "max_file_size")
+        payload = decode_base64_payload(file_b64, max_file_size)
         if payload is None:
             return None, None
-        max_file_size = read_upload_limit(cfg, "max_file_size")
         if max_file_size != -1 and len(payload) > max_file_size:
             return None, None
         allowed_extensions = read_allowed_file_extensions(cfg)
@@ -609,15 +741,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return forum_cursor.query_post_pid(fid, pid) or []
         except Exception:
             return []
-
-    def get_comment_thread(comments : dict, fid, pid):
-        forum_comments = comments.get(str(fid))
-        if not isinstance(forum_comments, dict):
-            return None
-        post_comments = forum_comments.get(str(pid))
-        if not isinstance(post_comments, dict):
-            return None
-        return post_comments
 
     def serialize_notifications(rows):
         return json.dumps(notification_cursor.serialize_rows(rows), ensure_ascii=False)
@@ -757,12 +880,23 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def serialize_post_rows(rows):
         attachments = forum_cursor.get_post_attachments([row[1] for row in rows])
         metadata_cache = {}
+        summaries = {}
+        if rows:
+            try:
+                summaries = forum_cursor.comment_summaries(
+                    rows[0][0], [row[1] for row in rows])
+            except Exception as e:
+                print("[WARN] 读取评论摘要失败: {}".format(e))
         result = []
         for row in rows:
+            summary = summaries.get(row[1]) or {}
             item = {
                 "fid": row[0], "pid": row[1], "title": row[2],
                 "creater": row[3], "author_uid": row[3],
                 "content": row[4], "send_time": row[5],
+                # 列表卡片直接展示，客户端不必再为每张卡片单独拉评论
+                "comment_count": int(summary.get("count") or 0),
+                "last_comment": summary.get("last"),
             }
             post_attachments = []
             for attachment in attachments.get(row[1], []):
@@ -779,18 +913,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 item["attachments"] = post_attachments
             result.append(item)
         return result
-
-    def retain_cross_db_file_references(uid, only_hash=None):
-        for row in file_cursor.get_user_files(uid):
-            hashes = row[0]
-            if only_hash is not None and hashes != only_hash:
-                continue
-            reference_count = (
-                messages_cursor.count_file_references(hashes)
-                + forum_cursor.count_file_references(hashes)
-            )
-            if reference_count:
-                file_cursor.ensure_content_retained(hashes, reference_count)
 
     def cleanup_forum_queue(target_uid : int):
         target_uid = int(target_uid)
@@ -809,6 +931,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     def clean_deleted_user_state(target_uid : int):
         target_uid = int(target_uid)
+        # 会话状态（已读水位 / 房间偏好 / @ 提及）随账号一起清掉；
+        # 消息行保留，避免破坏对方的聊天历史。
+        messages_cursor.purge_user_state(target_uid)
         user_groups = group_cursor.get_user_group_rows(target_uid)
         owned_gids = [row[0] for row in group_cursor.query_creater(target_uid)]
         deleted_forum_ids = [row[0] for row in forum_cursor.query_forum_creater(target_uid)]
@@ -840,7 +965,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         for fid in deleted_forum_ids:
             avatar.clean_avatar(port_api, fid, "forum")
 
-        retain_cross_db_file_references(target_uid)
         file.clean_user_files(port_api, target_uid, file_cursor)
         if sticker_cursor is not None:
             for row in sticker_cursor.get_user_stickers(target_uid):
@@ -889,7 +1013,14 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         return True
     
     @app.before_request
-    def check_rate_limit():
+    def enforce_request_limits():
+        cfg = read_config()
+        apply_request_body_limit(cfg)
+        apply_proxy_fix(cfg)
+        limit = app.config.get("MAX_CONTENT_LENGTH")
+        content_length = flask_request.content_length
+        if limit and content_length is not None and content_length > limit:
+            return "Payload Too Large", 413
         ip = flask_request.remote_addr
         endpoint = flask_request.path
         if not limiter.is_allowed(ip, endpoint):
@@ -1658,7 +1789,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             if not email:
                 return bool_res()[False]
             email_pwd = cfg["email_password"]
-            if not register_tool.email_code(sender_email, port_api, email, email_pwd, locks['config'], locks['activate']):
+            # 后台发送，避免 SMTP 阻塞 waitress 线程；队列满时才拒绝
+            if not register_tool.email_code_async(
+                    sender_email, port_api, email, email_pwd,
+                    locks['config'], locks['activate']):
                 return bool_res()[False]
 
         succeeded = user_cursor.user_create(username, password, time.time(), email)
@@ -1683,12 +1817,37 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         email = uid_row[2]
         with locks['activate']:
             with open("res/{}/activate.json".format(port_api), "r+") as file:
-                if not email in json.load(file).keys():
-                    return bool_res()[True]
+                pending = email in json.load(file).keys()
+        if not pending:
+            # 没有待验证记录：已激活的账号视为成功,仍被封禁说明流程异常
+            return bool_res()[uid_row[4] != "banned"]
         if register_tool.verify_email(port_api, email, activate_code, locks['activate']):
             user_cursor.change_auth(uid, "user")
             return bool_res()[True]
         return bool_res()[False]
+
+    @api("/auth/resend_activation", methods=["POST"])
+    def resend_activation(req):
+        """重发激活验证码
+        """
+        uid = req["uid"]
+        password = req["password"]
+        if not verify_user(uid, password):
+            return bool_res()[False]
+        uid_row = get_user_row(uid)
+        if uid_row is None:
+            return bool_res()[False]
+        if uid_row[4] != "banned":
+            # 已经激活过：不需要再发，按成功处理（幂等）
+            return bool_res()[True]
+        email = uid_row[2]
+        cfg = read_config()
+        sender_email = cfg.get("email_activate", "")
+        if not email or not sender_email:
+            return bool_res()[False]
+        return bool_res()[register_tool.email_code_async(
+            sender_email, port_api, email, cfg.get("email_password", ""),
+            locks['config'], locks['activate'])]
 
     @api("/auth/forgot_password", methods=["POST"])
     def forgot_password(req):
@@ -1706,7 +1865,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             # 邮箱不存在也统一返回 False，不泄露账号信息
             return bool_res()[False]
         try:
-            if not register_tool.email_code(sender_email, port_api, email, email_pwd, locks['config'], locks['activate']):
+            if not register_tool.email_code_async(
+                    sender_email, port_api, email, email_pwd,
+                    locks['config'], locks['activate']):
                 return bool_res()[False]
         except Exception as e:
             print("[WARN] forgot_password email send failed: {}".format(e))
@@ -2276,7 +2437,16 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         password = req["password"]
         if not verify_user(uid, password):
             return bool_res()[False]
-        return serialize_notifications(notification_cursor.query_all_events(uid))
+        # 默认只返回最近 500 条
+        try:
+            limit = int(req.get("limit", 500))
+            offset = int(req.get("offset", 0))
+        except (TypeError, ValueError):
+            return bool_res()[False]
+        limit = max(1, min(limit, 1000))
+        offset = max(offset, 0)
+        return serialize_notifications(
+            notification_cursor.query_all_events(uid, limit=limit, offset=offset))
 
     @api("/notification/query_after", methods=['POST'])
     def query_notifications_after(req):
@@ -2831,25 +3001,17 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         max_post = read_config().get("max_post_content_length", 20000)
         if max_post > 0 and len(str(content)) > max_post:
             return bool_res()[False]
-        acquired = []
         attachment_records = []
         for hashes in attachment_hashes:
             metadata = file_cursor.acquire_reference(uid, hashes)
             if metadata is None:
-                file.release_references(port_api, acquired, file_cursor)
                 return bool_res()[False]
-            acquired.append(hashes)
             attachment_records.append({
                 "hash": hashes,
                 "display_name": metadata["file_name"],
             })
-        try:
-            pid = forum_cursor.send_post(fid, uid, title, content, attachment_records)
-        except Exception:
-            file.release_references(port_api, acquired, file_cursor)
-            raise
+        pid = forum_cursor.send_post(fid, uid, title, content, attachment_records)
         if pid is False:
-            file.release_references(port_api, acquired, file_cursor)
             return bool_res()[False]
         for hashes in attachment_hashes:
             file_cursor.add_reference(hashes, "forum_post", "{}:{}".format(fid, pid), uid)
@@ -2875,15 +3037,28 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return {}
         try:
             fid_int = int(fid)
-            posts = forum_cursor.query_all_post(fid_int)
+            before_raw = flask_request.args.get("before_pid")
+            limit_raw = flask_request.args.get("limit")
+            before_pid = int(before_raw) if before_raw not in (None, "") else None
+            limit = int(limit_raw) if limit_raw not in (None, "") else None
+        except (TypeError, ValueError):
+            return {}
+        if limit is not None:
+            limit = max(1, min(limit, 100))
+        try:
+            posts, has_more = forum_cursor.query_posts_page(
+                fid_int, before_pid=before_pid, limit=limit)
             try:
                 pinned_pid = forum_cursor.get_pinned_pid(fid_int)
             except forum_cursor.dialect.DatabaseError:
                 pinned_pid = None
             return json.dumps({
-                "posts": posts,
+                # 只返回富化后的结构：此前 posts 与 post_rows 各带一份正文，
+                # 响应体直接翻倍。
                 "post_rows": serialize_post_rows(posts),
                 "pinned_pid": pinned_pid,
+                "has_more": has_more,
+                "next_before_pid": posts[0][1] if posts and has_more else None,
             }, ensure_ascii=False)
         except forum_cursor.dialect.DatabaseError:
             return {}
@@ -3198,15 +3373,15 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         user_stat = user_row[4]
         if user_stat == 'banned':
             return bool_res()[False]
-        comment_time = str(time.time())
-        def add_comment(comments):
-            thread = get_comment_thread(comments, fid, pid)
-            if thread is None:
-                return False
-            thread[comment_time] = [uid, comment]
-            return True
-
-        if not update_comments(port_api, add_comment):
+        try:
+            fid = int(fid)
+            pid = int(pid)
+        except (TypeError, ValueError):
+            return bool_res()[False]
+        if not forum_cursor.query_post_pid(fid, pid):
+            return bool_res()[False]
+        comment_time = forum_cursor.add_comment(fid, pid, uid, comment)
+        if comment_time is None:
             return bool_res()[False]
 
         def send_comment_notifications():
@@ -3238,13 +3413,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     def get_all_comments(fid, pid):
         if not fid.isdigit() or not pid.isdigit():
             return {}
-        fid = int(fid)
-        pid = int(pid)
-        comments = read_comments(port_api)
-        thread = get_comment_thread(comments, fid, pid)
-        if thread is None:
+        rows = forum_cursor.get_comments(int(fid), int(pid))
+        if not rows:
             return {}
-        return thread
+        # 保持旧响应结构：{time_stamp: [uid, content]}
+        return {str(row[0]): [row[1], row[2]] for row in rows}
     
     @api("/forum/remove_comment", methods=['POST'], feature=("forum",))
     def remove_comment(req):
@@ -3261,26 +3434,27 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if user_row is None:
             return bool_res()[False]
         user_stat = user_row[4]
-        forum_role = forum_cursor.get_member_role(fid, uid)
-
-        removed_creator = [None]
-        def remove_comment_entry(comments):
-            thread = get_comment_thread(comments, fid, pid)
-            if thread is None or time_stamp not in thread:
-                return False
-            creater = thread[time_stamp][0]
-            if not (creater == uid or user_stat in ['admin', 'root'] or
-                    (forum_role is not None and forum_role >= 50)):
-                return False
-            removed_creator[0] = creater
-            del thread[time_stamp]
-            return True
-
-        if not update_comments(port_api, remove_comment_entry):
+        try:
+            fid = int(fid)
+            pid = int(pid)
+        except (TypeError, ValueError):
             return bool_res()[False]
-        if removed_creator[0] is not None and removed_creator[0] != uid:
+        forum_role = forum_cursor.get_member_role(fid, uid)
+        # 权限判断放进 delete_comment 的同一事务：先读作者、再单独删除的话，
+        # 中间那个窗口里评论可能已经被换作者/删掉（TOCTOU）。
+        removed_creator = forum_cursor.delete_comment(
+            fid, pid, time_stamp,
+            can_delete=lambda creator: (
+                creator == uid
+                or user_stat in ['admin', 'root']
+                or (forum_role is not None and forum_role >= 50)
+            ),
+        )
+        if removed_creator is None:
+            return bool_res()[False]
+        if removed_creator != uid:
             notify_user(
-                removed_creator[0], "forum.comment.deleted", "你的评论已被删除",
+                removed_creator, "forum.comment.deleted", "你的评论已被删除",
                 "你在帖子中的评论已被其他用户删除。", sender=uid,
                 meta={"fid": fid, "pid": pid, "comment_time": time_stamp}
             )
@@ -3415,20 +3589,21 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         quota = cfg.get("user_storage_quota", -1)
         max_quota = cfg.get("max_user_storage_quota", 73400320)  # 默认 70MB
         new_hashes = file.sha256(payload)
-        if quota != -1 or max_quota != -1:
-            if not file_cursor.has_active_user_file(uid, new_hashes):
-                new_size = len(payload)
-                current_usage = file_cursor.get_user_storage_used(uid)
-                if quota != -1 and current_usage + new_size > quota:
-                    return json.dumps({"success": False, "error": "Storage quota exceeded"})
-                # 瞬时单用户文件总大小不得超过 max_user_storage_quota（默认 70MB）
-                if max_quota != -1 and current_usage + new_size > max_quota:
-                    return json.dumps({"success": False, "error": "Storage quota exceeded"})
-        try:
-            hashes = file.upload_file(port_api, uid, payload, normalized_name, file_cursor,
-                                      cfg.get("file_last_time", 72), known_hash=new_hashes)
-        except Exception:
-            return json.dumps({"success": False, "error": "upload_failed"})
+        with quota_lock(uid):
+            if quota != -1 or max_quota != -1:
+                if not file_cursor.has_active_user_file(uid, new_hashes):
+                    new_size = len(payload)
+                    current_usage = file_cursor.get_user_storage_used(uid)
+                    if quota != -1 and current_usage + new_size > quota:
+                        return json.dumps({"success": False, "error": "Storage quota exceeded"})
+                    # 瞬时单用户文件总大小不得超过 max_user_storage_quota（默认 70MB）
+                    if max_quota != -1 and current_usage + new_size > max_quota:
+                        return json.dumps({"success": False, "error": "Storage quota exceeded"})
+            try:
+                hashes = file.upload_file(port_api, uid, payload, normalized_name, file_cursor,
+                                          cfg.get("file_last_time", 72), known_hash=new_hashes)
+            except Exception:
+                return json.dumps({"success": False, "error": "upload_failed"})
         return json.dumps({
             "success" : True,
             "result" : bool_res()[True],
@@ -3437,6 +3612,31 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             "info_url" : "/file/get_file_info/{}".format(hashes),
             "file" : file_metadata(hashes, uid),
         }, ensure_ascii=False)
+
+    def enforce_chunked_upload_quota(uid : int, result : dict, cfg : dict):
+        """
+        分块上传 finalize 之后的配额核对
+        """
+        if not (result.get("success") and result.get("file_hash")):
+            return None
+        quota = cfg.get("user_storage_quota", -1)
+        max_quota = cfg.get("max_user_storage_quota", 73400320)
+        if quota == -1 and max_quota == -1:
+            return None
+        hashes = result["file_hash"]
+        meta = file_metadata(hashes, uid) or {}
+        new_size = int(meta.get("size") or meta.get("file_size") or 0)
+        if not new_size:
+            return None
+        current_usage = file_cursor.get_user_storage_used(uid)
+        if ((quota != -1 and current_usage > quota)
+                or (max_quota != -1 and current_usage > max_quota)):
+            file.dereference_file(
+                port_api, uid, hashes, file_cursor,
+                cfg.get("file_last_time", 72),
+            )
+            return "Storage quota exceeded"
+        return None
 
     # Experimental: streaming chunked upload (rebased + hardened from Leitarkkk #5).
     @api('/file/chunked_upload', methods=['POST'])
@@ -3481,37 +3681,39 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 if not ext or ext not in allowed_extensions:
                     return json.dumps({"success": False, "error": "Extension not allowed"}, ensure_ascii=False)
 
-            result = file.chunked_upload_file(
-                port_api,
-                uid,
-                normalized_name,
-                chunk_index,
-                chunk_total,
-                chunk_data,
-                file_id,
-                file_cursor,
-                expected_hash,
+            is_final_chunk = (
+                isinstance(chunk_index, int) and isinstance(chunk_total, int)
+                and chunk_total > 0 and chunk_index == chunk_total - 1
             )
 
-            # Enforce user storage quota on successful finalization.
+            def upload_chunks():
+                return file.chunked_upload_file(
+                    port_api,
+                    uid,
+                    normalized_name,
+                    chunk_index,
+                    chunk_total,
+                    chunk_data,
+                    file_id,
+                    file_cursor,
+                    expected_hash,
+                )
+
+            if is_final_chunk:
+                with quota_lock(uid):
+                    result = upload_chunks()
+                    quota_error = enforce_chunked_upload_quota(uid, result, cfg)
+            else:
+                result = upload_chunks()
+                quota_error = None
+
+            if quota_error:
+                return json.dumps(
+                    {"success": False, "error": quota_error},
+                    ensure_ascii=False,
+                )
+
             if result.get("success") and result.get("file_hash"):
-                quota = cfg.get("user_storage_quota", -1)
-                if quota != -1:
-                    hashes = result["file_hash"]
-                    meta = file_metadata(hashes, uid) or {}
-                    new_size = int(meta.get("size") or meta.get("file_size") or 0)
-                    current_usage = file_cursor.get_user_storage_used(uid)
-                    # register_upload already counted this file; approximate by
-                    # checking whether usage already includes it via has_active.
-                    if new_size and current_usage > quota:
-                        file.dereference_file(
-                            port_api, uid, hashes, file_cursor,
-                            cfg.get("file_last_time", 72),
-                        )
-                        return json.dumps(
-                            {"success": False, "error": "Storage quota exceeded"},
-                            ensure_ascii=False,
-                        )
                 return json.dumps({
                     "success": True,
                     "file_hash": result["file_hash"],
@@ -3575,17 +3777,18 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
             quota = cfg.get("user_storage_quota", -1)
             max_quota = cfg.get("max_user_storage_quota", 73400320)
-            current_usage = file_cursor.get_user_storage_used(uid)
-            if new_size and not file_cursor.has_active_user_file(uid, file_hash):
-                if quota != -1 and current_usage + new_size > quota:
-                    return {"success": False, "error": "Storage quota exceeded"}
-                if max_quota != -1 and current_usage + new_size > max_quota:
-                    return {"success": False, "error": "Storage quota exceeded"}
+            with quota_lock(uid):
+                current_usage = file_cursor.get_user_storage_used(uid)
+                if new_size and not file_cursor.has_active_user_file(uid, file_hash):
+                    if quota != -1 and current_usage + new_size > quota:
+                        return {"success": False, "error": "Storage quota exceeded"}
+                    if max_quota != -1 and current_usage + new_size > max_quota:
+                        return {"success": False, "error": "Storage quota exceeded"}
 
-            ok = file.instant_upload_file(
-                port_api, uid, file_hash, normalized_name, new_size,
-                mime_type, extension, file_cursor,
-            )
+                ok = file.instant_upload_file(
+                    port_api, uid, file_hash, normalized_name, new_size,
+                    mime_type, extension, file_cursor,
+                )
             if not ok:
                 return {"success": True, "instant": False}
             return {
@@ -3609,7 +3812,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         hashes = req["hash"]
         if not verify_user(uid, password):
             return bool_res()[False]
-        retain_cross_db_file_references(uid, hashes)
         file_last_time = read_config().get("file_last_time", 72)
         return bool_res()[file.dereference_file(port_api, uid, hashes, file_cursor, file_last_time)]
 
@@ -3665,7 +3867,6 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         hashes = req["hash"]
         if not verify_user(uid, password):
             return bool_res()[False]
-        retain_cross_db_file_references(uid, hashes)
         return bool_res()[file.delete_user_file(port_api, uid, hashes, file_cursor)]
 
     @api('/file/admin_get_all_files', methods=['POST'])
@@ -3850,13 +4051,13 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         normalized_name = normalize_upload_filename(filename)
         if normalized_name is None:
             return json.dumps({"success": False, "error": "invalid_filename"}, ensure_ascii=False)
-        payload = decode_base64_payload(file_b64)
+        cfg = read_config()
+        max_sticker_size = cfg.get("max_sticker_size", 1048576)
+        payload = decode_base64_payload(file_b64, max_sticker_size)
         if payload is None:
             return json.dumps({"success": False, "error": "invalid_base64"}, ensure_ascii=False)
         if not is_sticker_type(payload, normalized_name):
             return json.dumps({"success": False, "error": "unsupported_sticker_type"}, ensure_ascii=False)
-        cfg = read_config()
-        max_sticker_size = cfg.get("max_sticker_size", 1048576)
         if max_sticker_size != -1 and len(payload) > max_sticker_size:
             return json.dumps({"success": False, "error": "sticker_too_large"}, ensure_ascii=False)
         # 瞬时贴图总大小不得超过 max_sticker_storage_quota（默认 30MB）
@@ -4851,22 +5052,15 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                     file_record = file_cursor.acquire_reference(uid, file_hash)
                 if file_record is None:
                     return json.dumps({"success": False, "error": "file_unavailable"})
-            try:
-                msg_record = messages_cursor.add_message(
-                    uid, target_uid, content,
-                    content_type=content_type, file_hash=file_hash,
-                    quote=quote, group_id=group_id, client_mid=client_mid,
-                    file_name=file_record["file_name"] if file_record else None,
-                    forwarded=forwarded, duration=duration,
-                )
-            except Exception:
-                if file_hash:
-                    file.release_references(port_api, [file_hash], file_cursor)
-                raise
+            msg_record = messages_cursor.add_message(
+                uid, target_uid, content,
+                content_type=content_type, file_hash=file_hash,
+                quote=quote, group_id=group_id, client_mid=client_mid,
+                file_name=file_record["file_name"] if file_record else None,
+                forwarded=forwarded, duration=duration,
+            )
 
             if msg_record.get("duplicate"):
-                if file_hash:
-                    file.release_references(port_api, [file_hash], file_cursor)
                 if not messages_cursor.request_matches(
                         msg_record["mid"], uid, target_uid, content, content_type,
                         file_hash=file_hash, quote=quote, group_id=group_id,
@@ -4895,11 +5089,14 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 file_cursor.add_reference(file_hash, "message", msg_record["mid"], uid)
 
             if content_type == "plain":
-                allowed_mentions = group_cursor.get_member_uids(group_id) if group_id else [target_uid]
+                group_members = (
+                    group_cursor.get_member_uids(group_id) if group_id else [])
+                allowed_mentions = group_members if group_id else [target_uid]
                 mentioned_uids = resolve_mentioned_uids(
                     content, user_cursor, allowed_mentions, exclude_uid=uid
                 )
             else:
+                group_members = []
                 mentioned_uids = []
             messages_cursor.set_message_mentions(msg_record["mid"], mentioned_uids)
 
@@ -4933,14 +5130,23 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
             if group_id:
                 room_id = "G{}".format(group_id)
-                for user in group_cursor.get_member_uids(group_id):
+                if not group_members:
+                    group_members = group_cursor.get_member_uids(group_id)
+                # 一条 SQL 取全部成员的房间偏好，避免按成员逐个查询（N+1）
+                pref_map = messages_cursor.get_room_preference_map(
+                    group_members, room_id)
+                pending = []
+                for user in group_members:
                     user_notif = dict(notif)
                     user_notif["room_seq"] = msg_record.get("room_seq")
                     user_notif["mentions_me"] = user in mentioned_uids
-                    user_notif["should_alert"] = user != uid and should_alert(
-                        messages_cursor, user, room_id, mentioned_uids
+                    user_notif["should_alert"] = (
+                        user != uid
+                        and alert_from_preference(
+                            pref_map.get(user), user, mentioned_uids)
                     )
-                    instant_contact.push_message(user, user_notif)
+                    pending.append((user, user_notif))
+                instant_contact.push_messages(pending)
             else:
                 recv_notif = dict(notif)
                 recv_notif["room_id"] = "U{}".format(uid)
@@ -5102,13 +5308,14 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             notif["mentioned_uids"] = []
 
             if group_id:
-                room_id = "G{}".format(group_id)
+                pending = []
                 for user in group_cursor.get_member_uids(group_id):
                     user_notif = dict(notif)
                     user_notif["room_seq"] = msg_record.get("room_seq")
                     user_notif["mentions_me"] = False
                     user_notif["should_alert"] = user != uid
-                    instant_contact.push_message(user, user_notif)
+                    pending.append((user, user_notif))
+                instant_contact.push_messages(pending)
             else:
                 recv_notif = dict(notif)
                 recv_notif["room_id"] = "U{}".format(uid)

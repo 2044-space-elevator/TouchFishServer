@@ -182,21 +182,21 @@ CREATE TABLE IF NOT EXISTS notification_meta (
             values.append((int(uid), ts, self._serialize_event(event), self._event_kind(self._as_dict(event))))
         with self.lock:
             def operation():
-                self.cursor.executemany(
-                    "INSERT INTO notifications (uid, time_stamp, info, kind) VALUES (?, ?, ?, ?)",
-                    values,
-                )
+                inserted = []
+                for value in values:
+                    self.cursor.execute(
+                        "INSERT INTO notifications (uid, time_stamp, info, kind) "
+                        "VALUES (?, ?, ?, ?)",
+                        value,
+                    )
+                    inserted.append(self.cursor.lastrowid)
                 self.conn.commit()
-            self._execute_with_retry(operation)
-        # 按 (uid, time_stamp) 回查 id（取最大 id，兼容低时间戳精度），保证与输入同序
+                return inserted
+
+            ids = self._execute_with_retry(operation)
         records = []
-        for uid, ts, _, _ in values:
-            rows = self.query(
-                "SELECT id FROM notifications WHERE uid = ? AND time_stamp = ? "
-                "ORDER BY id DESC LIMIT 1",
-                (uid, ts),
-            )
-            nid = rows[0][0] if rows else None
+        for index, (uid, ts, _, _) in enumerate(values):
+            nid = ids[index] if index < len(ids) else None
             records.append({"id": nid, "time_stamp": ts})
         return records
 
@@ -251,19 +251,28 @@ CREATE TABLE IF NOT EXISTS notification_meta (
 
             return self._execute_with_retry(operation)
 
-    def query_events_after(self, uid: int, time_stamp, limit: int = None):
+    def query_events_after(self, uid: int, time_stamp, limit: int = None,
+                           offset: int = 0):
         uid = int(uid)
-        sql = ("SELECT id, time_stamp, read_at, info FROM notifications "
-               "WHERE uid = ? AND (kind IS NULL OR kind = 0) AND time_stamp > ? "
-               "ORDER BY time_stamp ASC")
-        params = (uid, time_stamp)
         if limit is not None:
-            sql += " LIMIT ?"
-            params = params + (limit,)
-        return self.query(sql, params)
+            rows = self.query(
+                "SELECT id, time_stamp, read_at, info FROM notifications "
+                "WHERE uid = ? AND (kind IS NULL OR kind = 0) AND time_stamp > ? "
+                "ORDER BY time_stamp DESC, id DESC LIMIT ? OFFSET ?",
+                (uid, time_stamp, limit, offset),
+            )
+            rows.reverse()
+            return rows
+        return self.query(
+            "SELECT id, time_stamp, read_at, info FROM notifications "
+            "WHERE uid = ? AND (kind IS NULL OR kind = 0) AND time_stamp > ? "
+            "ORDER BY time_stamp ASC",
+            (uid, time_stamp),
+        )
 
-    def query_all_events(self, uid: int):
-        return self.query_events_after(uid, 0)
+    def query_all_events(self, uid: int, limit: int = None, offset: int = 0):
+        return self.query_events_after(
+            uid, 0, limit=limit, offset=offset)
 
     def list_events_page(self, uid: int, offset: int = 0, take: int = 50) -> tuple:
         """分页查询系统通知（kind=0），按时间倒序。返回 (rows, total)。"""

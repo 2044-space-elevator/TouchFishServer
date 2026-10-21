@@ -104,9 +104,16 @@ TFV5 的文件存储系统基于哈希去重和用户配额管理。同一文件
 
 上传前会检查：
 - 用户是否被 ban
+- 请求体是否超过服务器上限（超限时在解析/解密前直接返回纯文本 `413 Payload Too Large`）
 - 文件大小是否超过 `max_file_size` 限制
 - 文件名和扩展名是否合法
 - 用户存储配额是否足够（若文件内容已存在且用户已有该文件则不重复计费）
+
+请求体上限由 `max_file_size` 推算，已包含 secret 请求的两层 base64 膨胀
+（文件 → `file_b64` 是一层，整个 JSON 再 AES + base64 是第二层，合计约 ×16/9），
+并保证不小于单块 10MiB 所需的体积；管理员可在 `config.json` 里用
+`max_request_body_size` 显式覆盖。更大的文件请走 `/file/chunked_upload`
+（单块 ≤10MiB，整文件 ≤200MiB）。
 
 被拒时返回 JSON 错误对象（而不是 bool 接口的纯文本 `"<时间戳>False"`，后者不是合法 JSON）——**仅当请求声明了 `detail_error: true`**，未声明时按[错误文档](errors.md)继续回纯文本：
 

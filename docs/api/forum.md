@@ -136,19 +136,34 @@
 
 如果帖子标题和正文中包含 `@用户名`，被提及的用户会收到 `forum.post.mentioned` 通知。
 
-- `* GET /forum/get_post_list/<fid>` 获取某一论坛的所有帖子
+- `* GET /forum/get_post_list/<fid>` 获取论坛帖子（按 `pid` 游标分页）
 
-返回体是兼容对象：
+查询参数（都可省略，省略时行为与旧版一致：一次返回全部帖子）：
+
+| 参数 | 说明 |
+| --- | --- |
+| `limit` | 本页最多返回多少条，服务端会夹在 `1..100` |
+| `before_pid` | 只返回 `pid` 小于它的帖子（上一页最早一条的 `pid`） |
+
+返回体：
 
 ```json
 {
-    "posts" : [<legacy_post_row>, ...],
     "post_rows" : [<post_object>, ...],
-    "pinned_pid" : <pinned_post_id_or_null>
+    "pinned_pid" : <pinned_post_id_or_null>,
+    "has_more" : <bool>,
+    "next_before_pid" : <pid_or_null>
 }
 ```
 
-`posts` 保留旧版数组结构。新客户端应使用 `post_rows`：
+> 破坏性变更：旧版的 `posts`（`SELECT * FROM contents` 的原始行）已移除，
+> 它与 `post_rows` 各带一份正文，响应体直接翻倍。请只读 `post_rows`。
+
+`post_rows` 内按 `pid` 升序；`has_more` 为 `true` 时，用 `next_before_pid`
+作为下一页的 `before_pid` 继续往前翻。`pinned_pid` 指向的帖子可能不在本页
+（它可能比本页所有帖子都旧），客户端需要时请单独调用 `/forum/get_post`。
+
+`post_object`：
 
 ```json
 {
@@ -159,6 +174,12 @@
     "author_uid" : <author_uid>,
     "content" : <content>,
     "send_time" : <send_time>,
+    "comment_count" : <int>,
+    "last_comment" : {
+        "time_stamp" : <comment_time_stamp>,
+        "uid" : <comment_author_uid>,
+        "content" : <comment_content>
+    },
     "attachments" : [
         {
             "hash" : <file_hash>,
@@ -174,6 +195,9 @@
     ]
 }
 ```
+
+`comment_count` / `last_comment` 由列表接口一次批量查出，卡片不需要再为
+每篇帖子单独拉评论；`last_comment` 在没有评论时为 `null`。
 
 没有附件的帖子不包含 `attachments` 字段。附件的 `file_name` 是发帖者上传时使用的名称，不会回退到其他上传者为相同内容使用的名称。
 

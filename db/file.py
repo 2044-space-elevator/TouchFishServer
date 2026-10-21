@@ -76,6 +76,9 @@ class FileDb(Db):
         """)
         self.execute("""INSERT OR IGNORE INTO file_uploaders(hash, uid, created_at)
                         SELECT hash, uid, COALESCE(upload_time, ?) FROM user_file WHERE active = TRUE""", (time.time(),))
+        self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chunk_tasks_uid "
+            "ON chunk_upload_tasks(uid, status)")
 
     def create_user_file_table(self):
         cmd = """
@@ -677,14 +680,6 @@ class FileDb(Db):
             (uid, hashes),
         )
         return rows[0][0] if rows else None
-
-    def decrement_ref(self, hashes : str):
-        """不要管这个，请使用 remove_reference()"""
-        return self.file_exists(hashes)
-
-    def ensure_content_retained(self, hashes : str, reference_count : int = 1):
-        """不要管这个，请使用 add_reference()"""
-        return self.file_exists(hashes)
 
     def reconcile_references(self, references=()):
         """确认引用"""

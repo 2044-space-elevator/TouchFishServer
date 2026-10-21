@@ -3,6 +3,7 @@
 """
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 from json_store import read_json, update_json, write_json
 from random import choices, randint
 import smtplib
@@ -10,6 +11,7 @@ from string import ascii_letters, digits
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import Header
+from threading import BoundedSemaphore
 from time import time
 
 MAX_DELAY = 300
@@ -110,23 +112,76 @@ def verify_captcha(port_api : int, time_stamp : int, verify_text : str, lock):
             pass
         return answer.lower() == str(verify_text).lower(), True
 
-def email_code(sender_email : str, port_api : int, email : str, password : str, config_lock, activate_lock):
+def issue_email_code(port_api : int, email : str, activate_lock):
+    """生成验证码并同步写入 activate.json，返回验证码 必须在请求返回前完成
+    """
+    verify_code = randint(100000, 999999)
+    with activate_lock:
+        update_json(
+            "res/{}/activate.json".format(port_api),
+            lambda activate_lst: activate_lst.__setitem__(email, verify_code),
+        )
+    return verify_code
+
+
+def send_email_code(sender_email : str, port_api : int, email : str, password : str, config_lock, verify_code : int):
+    """发送已生成的验证码"""
     folder_path = "res/{}".format(port_api)
     with config_lock:
         cfg = read_json(folder_path + '/config.json')
-        sender = sender_email
         server_name = cfg["server_name"]
         smtp_host = cfg.get("smtp_host", "") or None
         smtp_port = cfg.get("smtp_port")
         smtp_use_ssl = cfg.get("smtp_use_ssl", True)
     session = login_email(sender_email, password, smtp_host, smtp_port, smtp_use_ssl)
-    verify_code = randint(100000, 999999)
-    with activate_lock:
-        update_json(
-            folder_path + '/activate.json',
-            lambda activate_lst: activate_lst.__setitem__(email, verify_code),
+    return send_email(session, sender_email, email, "{} 验证码".format(server_name), "欢迎使用 {}，您的验证码是 {}。".format(server_name, verify_code))
+
+
+def email_code(sender_email : str, port_api : int, email : str, password : str, config_lock, activate_lock):
+    verify_code = issue_email_code(port_api, email, activate_lock)
+    return send_email_code(sender_email, port_api, email, password, config_lock, verify_code)
+
+
+# 避免被刷爆 IO
+_EMAIL_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="tfv5-smtp")
+_EMAIL_PENDING = BoundedSemaphore(32)
+
+
+def _send_email_code_logged(sender_email, port_api, email, password, config_lock, verify_code):
+    try:
+        ok = send_email_code(sender_email, port_api, email, password, config_lock, verify_code)
+        if not ok:
+            print("[WARN] 验证码邮件发送失败: {}".format(email))
+    except Exception as e:
+        print("[WARN] 验证码邮件发送异常({}): {}".format(email, e))
+    finally:
+        _EMAIL_PENDING.release()
+
+
+def email_code_async(sender_email, port_api, email, password, config_lock, activate_lock):
+    """
+    写入验证码并后台发信
+    False 表示排队已满或验证码写入失败
+    """
+    if not _EMAIL_PENDING.acquire(blocking=False):
+        print("[WARN] 验证码邮件队列已满，拒绝本次请求: {}".format(email))
+        return False
+    try:
+        verify_code = issue_email_code(port_api, email, activate_lock)
+    except Exception as e:
+        _EMAIL_PENDING.release()
+        print("[WARN] 验证码写入失败({}): {}".format(email, e))
+        return False
+    try:
+        _EMAIL_EXECUTOR.submit(
+            _send_email_code_logged,
+            sender_email, port_api, email, password, config_lock, verify_code,
         )
-    return send_email(session, sender, email, "{} 验证码".format(server_name), "欢迎使用 {}，您的验证码是 {}。".format(server_name, verify_code))
+    except Exception as e:
+        _EMAIL_PENDING.release()
+        print("[WARN] 验证码邮件入队失败: {}".format(e))
+        return False
+    return True
 
 def verify_email(port_api : int, email : str, code : int, lock):
     if not isinstance(code, int) or code < 0:

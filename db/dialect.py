@@ -2,6 +2,7 @@
 数据库 translator aka YWD2023fixXSFXer
 qwq
 为了防止 xsfx do not know how to write SQL，now we have GoogleTranslate(for SQL!) 
+好吧当时做这个太石山了，现在只有 DeepSeek 能看懂了，现在是 DeepSeekfixYWD2023fixXSFXer
 """
 from __future__ import annotations
 
@@ -94,6 +95,9 @@ class SQLDialect(ABC):
     paramstyle: str = "qmark"
 
     retryable_error_types: tuple = ()
+    # 可重试的错误码（MySQL errno / PostgreSQL SQLSTATE）与消息片段（SQLite 没码！（当然不是骂SQLITE）
+    retryable_error_codes: tuple = ()
+    retryable_error_hints: tuple = ()
     IntegrityError: type = Exception
     DatabaseError: type = Exception
     ignorable_error_codes: tuple = ()  # 特定错误码静默忽略（如 MySQL 1061 重复索引）
@@ -162,11 +166,86 @@ class SQLDialect(ABC):
         with self._schema_lock:
             return self.table_pk_map.get(table.lower(), [])
 
+    # 这些状态里出现的 `?` 都不是参数占位符：单/双引号字符串、反引号标识符、
+    # -- / # 行注释、/* */ 块注释。注释语法、`--` 规则、字符串里的反斜杠转义
+    # 各家不同，由子类声明。
+    _QUOTE_CHARS = ("'", '"')
+    supports_hash_comment = False
+    line_comment_requires_space = False
+    backslash_escape_strings = False
+
     def _placeholderize(self, sql: str) -> str:
-        """Replace ? with the dialect's placeholder character."""
+        """Replace ? with the dialect's placeholder character.!
+        """
         if self.placeholder == "?":
             return sql
-        return sql.replace("?", self.placeholder)
+        result = []
+        quote = None
+        in_block_comment = False
+        index = 0
+        length = len(sql)
+        while index < length:
+            char = sql[index]
+            if in_block_comment:
+                result.append(char)
+                if char == "*" and index + 1 < length and sql[index + 1] == "/":
+                    result.append(sql[index + 1])
+                    in_block_comment = False
+                    index += 2
+                    continue
+                index += 1
+                continue
+            if quote is not None:
+                result.append(char)
+                # MySQL 默认开启反斜杠转义（NO_BACKSLASH_ESCAPES 关闭）：
+                # 'it\'s ?' 里的引号不结束字符串，反斜杠后的字符要整对跳过。
+                if (self.backslash_escape_strings and char == "\\"
+                        and quote != "`" and index + 1 < length):
+                    result.append(sql[index + 1])
+                    index += 2
+                    continue
+                if char == quote:
+                    if index + 1 < length and sql[index + 1] == quote:
+                        result.append(sql[index + 1])
+                        index += 2
+                        continue
+                    quote = None
+                index += 1
+                continue
+            if char == "/" and index + 1 < length and sql[index + 1] == "*":
+                in_block_comment = True
+                result.append("/*")
+                index += 2
+                continue
+            if char == "-" and index + 1 < length and sql[index + 1] == "-":
+                # MySQL 要求 `--` 后面跟空白/控制字符才算注释，否则它是两个减号；
+                # SQLite / PostgreSQL 没有这个限制。
+                if (not self.line_comment_requires_space
+                        or index + 2 >= length
+                        or sql[index + 2] in " \t\r\n"):
+                    # 行注释：原样保留到换行（换行本身在下一轮正常处理）
+                    end = sql.find("\n", index)
+                    if end == -1:
+                        end = length
+                    result.append(sql[index:end])
+                    index = end
+                    continue
+            if char == "#" and self.supports_hash_comment:
+                # `#` 行注释只有 MySQL 有；PostgreSQL 里 `#` 是普通字符
+                end = sql.find("\n", index)
+                if end == -1:
+                    end = length
+                result.append(sql[index:end])
+                index = end
+                continue
+            if char in self._QUOTE_CHARS:
+                quote = char
+                result.append(char)
+                index += 1
+                continue
+            result.append(self.placeholder if char == "?" else char)
+            index += 1
+        return "".join(result)
 
 
 class SQLiteDialect(SQLDialect):
@@ -177,6 +256,14 @@ class SQLiteDialect(SQLDialect):
         super().__init__()
         import sqlite3
         self.retryable_error_types = (sqlite3.OperationalError,)
+        # 只有这些消息值得重试；schema 错误（no such table 等）应当立刻暴露
+        self.retryable_error_hints = (
+            "database is locked",
+            "database table is locked",
+            "database schema is locked",
+            "database is busy",
+            "disk i/o error",
+        )
         self.IntegrityError = sqlite3.IntegrityError
         self.DatabaseError = sqlite3.DatabaseError
 
@@ -197,9 +284,18 @@ class MySQLDialect(SQLDialect):
     placeholder = "%s"
     paramstyle = "format"
 
+    # MySQL 额外支持反引号标识符与 `#` 行注释，`--` 必须后跟空白才算注释，
+    # 字符串默认走反斜杠转义（NO_BACKSLASH_ESCAPES 未开启时）
+    _QUOTE_CHARS = ("'", '"', "`")
+    supports_hash_comment = True
+    line_comment_requires_space = True
+    backslash_escape_strings = True
+
     def __init__(self):
         super().__init__()
         self._table_text_columns = {}
+        # 死锁 / 锁等待超时 / 连接断开 / 连接数打满 / 服务端正在关闭
+        self.retryable_error_codes = (1205, 1213, 2006, 2013, 1040, 1053)
         try:
             import pymysql.err
             self.retryable_error_types = (
@@ -268,12 +364,7 @@ class MySQLDialect(SQLDialect):
         sql = self._translate_keyed_text_columns(sql)
 
         # Strip DEFAULT from TEXT columns (MySQL doesn't allow defaults on TEXT/BLOB)
-        sql = re.sub(
-            r'\bTEXT\b(.*?)\s+DEFAULT\s+(?:\'[^\']*\'|\S+)',
-            r'TEXT\1',
-            sql,
-            flags=re.IGNORECASE,
-        )
+        sql = self._strip_text_defaults(sql)
 
         # INSERT OR REPLACE INTO ... → REPLACE INTO ...
         sql = re.sub(
@@ -380,6 +471,31 @@ class MySQLDialect(SQLDialect):
             )
 
         return sql
+
+    def _strip_text_defaults(self, sql: str) -> str:
+        """只剥离 TEXT 列自身的 DEFAULT，避免非贪婪正则跨列吃掉后一列的默认值。"""
+        create = re.match(
+            r'(\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s*\()(.*)(\)\s*)$',
+            sql,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if not create:
+            return re.sub(
+                r'\bTEXT\b(.*?)\s+DEFAULT\s+(?:\'[^\']*\'|\S+)',
+                r'TEXT\1',
+                sql,
+                flags=re.IGNORECASE,
+            )
+        definitions = self._split_definitions(create.group(3))
+        for index, definition in enumerate(definitions):
+            if re.match(r'\s*\w+\s+TEXT\b', definition, re.IGNORECASE):
+                definitions[index] = re.sub(
+                    r'\s+DEFAULT\s+(?:\'[^\']*\'|\S+)',
+                    '',
+                    definition,
+                    flags=re.IGNORECASE,
+                )
+        return create.group(1) + ','.join(definitions) + create.group(4)
 
     @staticmethod
     def _split_definitions(body: str) -> list[str]:
@@ -508,6 +624,11 @@ class PostgreSQLDialect(SQLDialect):
 
     def __init__(self):
         super().__init__()
+        # serialization_failure / deadlock_detected / admin_shutdown /
+        # crash_shutdown / connection_exception / too_many_connections
+        self.retryable_error_codes = (
+            "40001", "40P01", "57P01", "57P02", "08000", "08003", "08006", "53300",
+        )
         try:
             import psycopg2.errors
             import psycopg2

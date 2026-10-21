@@ -142,6 +142,9 @@ class GroupDb(Db):
             )
         """)
         self.execute("CREATE INDEX IF NOT EXISTS idx_group_members_uid ON group_members(uid, gid)")
+        self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_join_requests_gid_status "
+            "ON join_requests(gid, status, request_time)")
         self.execute("""
             CREATE TABLE IF NOT EXISTS schema_migrations (
                 name TEXT PRIMARY KEY,

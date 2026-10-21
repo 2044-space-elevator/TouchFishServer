@@ -136,7 +136,15 @@ class MessagesDb(Db):
                 if not rows:
                     self.conn.commit()
                     return
-                seq_by_room = {}
+                existing = self.cursor.execute(
+                    "SELECT room_key, MAX(room_seq) FROM messages "
+                    "WHERE room_seq IS NOT NULL AND room_key IS NOT NULL "
+                    "GROUP BY room_key"
+                ).fetchall()
+                seq_by_room = {
+                    key: int(value) for key, value in existing
+                    if key is not None and value is not None
+                }
                 updates = []
                 for mid, sender, receiver, gid in rows:
                     key = self.room_key_of(sender, receiver, gid)
@@ -168,6 +176,10 @@ class MessagesDb(Db):
                ON messages(room_key, room_seq)""",
             """CREATE INDEX IF NOT EXISTS idx_messages_room_mid
                ON messages(room_key, mid DESC)""",
+            """CREATE INDEX IF NOT EXISTS idx_messages_file_hash
+               ON messages(file_hash)""",
+            """CREATE INDEX IF NOT EXISTS idx_group_pinned_group
+               ON group_pinned_messages(group_id)""",
             """CREATE INDEX IF NOT EXISTS idx_room_read_state_room_seq
                ON room_read_state(room_key, last_read_seq)""",
             """DROP INDEX IF EXISTS idx_room_read_state_room""",
@@ -505,26 +517,21 @@ class MessagesDb(Db):
             """SELECT
                  CASE WHEN m.sender_uid = ? THEN m.receiver_uid ELSE m.sender_uid END AS partner_uid,
                  m.mid, m.client_mid, m.sender_uid, m.content, m.content_type, m.send_time,
-                 m.deleted, m.deleted_at, m.file_name, seqs.room_current_seq
+                 m.deleted, m.deleted_at, m.file_name, latest.room_current_seq
                FROM (
-                 SELECT room_key, MAX(mid) AS max_mid
+                 SELECT room_key,
+                        MAX(CASE WHEN content_type != 'event' THEN mid END) AS max_mid,
+                        MAX(room_seq) AS room_current_seq
                  FROM messages
                   WHERE group_id IS NULL
                    AND (sender_uid = ? OR receiver_uid = ?)
                    AND sender_uid != receiver_uid
-                   AND content_type != 'event'
                   GROUP BY room_key
                ) AS latest
                INNER JOIN messages m ON m.mid = latest.max_mid
-               INNER JOIN (
-                 SELECT room_key AS rk, MAX(room_seq) AS room_current_seq
-                 FROM messages
-                  WHERE group_id IS NULL
-                   AND (sender_uid = ? OR receiver_uid = ?)
-                  GROUP BY room_key
-               ) AS seqs ON seqs.rk = latest.room_key
+               WHERE latest.max_mid IS NOT NULL
                ORDER BY m.mid DESC""",
-            (uid, uid, uid, uid, uid)
+            (uid, uid, uid)
         )
         return [
             {
@@ -715,6 +722,24 @@ class MessagesDb(Db):
 
     def delete_message(self, mid: int) -> bool:
         return self.recall_message(mid, 0) > 0
+
+    def purge_user_state(self, uid: int) -> bool:
+        """
+        删除某用户的会话状态
+        消息本身不删
+        """
+        uid = int(uid)
+        with self.lock:
+            def operation():
+                self.cursor.execute(
+                    "DELETE FROM room_read_state WHERE uid = ?", (uid,))
+                self.cursor.execute(
+                    "DELETE FROM room_preferences WHERE uid = ?", (uid,))
+                self.cursor.execute(
+                    "DELETE FROM message_mentions WHERE uid = ?", (uid,))
+                self.conn.commit()
+                return True
+            return self._execute_with_retry(operation)
 
     def count_file_references(self, file_hash: str) -> int:
         rows = self.query(

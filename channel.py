@@ -13,7 +13,7 @@ import os
 import threading
 import logging
 from collections import defaultdict
-from mention_utils import resolve_mentioned_uids, should_alert
+from mention_utils import resolve_mentioned_uids, should_alert, alert_from_preference
 from config_utils import get_features
 import jwt_tool
 
@@ -22,6 +22,14 @@ async def to_thread(func, *args, **kwargs):
     ctx = contextvars.copy_context()
     func_call = functools.partial(ctx.run, func, *args, **kwargs)
     return await loop.run_in_executor(None, func_call)
+
+
+async def _put_nowait(queue, item):
+    """不阻塞地把 item 放进有界队列！满了就丢  调用方兜底"""
+    try:
+        queue.put_nowait(item)
+    except asyncio.QueueFull:
+        pass
 
 class _InvalidHandshakeFilter(logging.Filter):
     def filter(self, record):
@@ -44,16 +52,6 @@ def _metadata_with_name(metadata, file_name):
     return result
 
 
-def alert_from_preference(pref, uid, mentioned_uids) -> bool:
-    """根据房间偏好判断是否需要提醒。pref 为 get_room_preference 的 dict，缺省按 0 级处理。"""
-    level = int((pref or {}).get("notify_level", 0))
-    if level == 2:
-        return False
-    if level == 1:
-        return uid in mentioned_uids
-    return True
-
-
 def can_access_room(user_cursor, group_cursor, uid: int, room_id: str) -> bool:
     if not isinstance(room_id, str) or len(room_id) < 2:
         return False
@@ -68,6 +66,9 @@ def can_access_room(user_cursor, group_cursor, uid: int, room_id: str) -> bool:
     return False
 
 class InstantConnect():
+    # 单个连接队列上限
+    SEND_QUEUE_LIMIT = 256
+
     def __init__(self, port_api, port_tcp, notification_cursor, user_cursor, messages_cursor,
                  group_cursor, file_cursor=None, jwt_secret=None):
         self.port_api = port_api
@@ -187,15 +188,13 @@ class InstantConnect():
             except (TypeError, ValueError):
                 return None
             jti = payload.get("jti")
-            if not self.user_cursor.token_exists(jti):
-                return None
             sid = payload.get("sid")
-            if not sid or not self.user_cursor.session_is_active(sid, uid):
+            if not sid:
                 return None
-            row = self.user_cursor.uid_query(uid)
-            if not row:
+            row = self.user_cursor.resolve_session_identity(uid, jti, sid)
+            if row is None:
                 return None
-            if self.user_cursor.get_auth_version(uid) != int(payload.get("av", -1)):
+            if int(row[1]) != int(payload.get("av", -1)):
                 return None
             return (uid, jti, sid)
         return to_thread(_check)
@@ -294,8 +293,17 @@ class InstantConnect():
 
     async def _queue_message(self, websocket, message : dict):
         queue = self.send_queue.get(websocket)
-        if queue is not None:
-            await queue.put(message)
+        if queue is None:
+            return
+        try:
+            queue.put_nowait(message)
+        except asyncio.QueueFull:
+            uid = self.clients_belonged.get(websocket)
+            print("[WARN] WS 发送队列已满，断开慢客户端(uid={})".format(uid))
+            try:
+                await websocket.close(code=1013)
+            except Exception:
+                pass
 
     def _queue_ack(self, websocket, client_mid=None, status="sent", mid=None, error=None):
         if client_mid is None or websocket not in self.send_queue or self.loop is None:
@@ -305,7 +313,8 @@ class InstantConnect():
             ack["mid"] = mid
         if error is not None:
             ack["error"] = error
-        asyncio.run_coroutine_threadsafe(self.send_queue[websocket].put(ack), self.loop)
+        asyncio.run_coroutine_threadsafe(
+            _put_nowait(self.send_queue[websocket], ack), self.loop)
 
     async def _disconnect_user(self, uid : int):
         with self._clients_lock:
@@ -902,7 +911,8 @@ class InstantConnect():
                 self.clients_belonged[websocket] = verified_uid
                 self.clients_token[websocket] = verified_jti
                 self.clients_session[websocket] = verified_sid
-            self.send_queue[websocket] = asyncio.Queue()
+                self.send_queue[websocket] = asyncio.Queue(
+                    maxsize=self.SEND_QUEUE_LIMIT)
             await websocket.send(self.encrypt_response({"type" : "AUTH.LOGIN_SUCCEEDED"}, websocket))
             if became_online:
                 await to_thread(self._mark_online, verified_uid)
@@ -959,7 +969,9 @@ class InstantConnect():
                     if quote < -1:
                         self._queue_ack(websocket, client_mid, status="failed", error="invalid_quote")
                         continue
-                    if quote >= 0 and not self._verify_quote(quote, send_to, self.clients_belonged[websocket]):
+                    if quote >= 0 and not await to_thread(
+                            self._verify_quote, quote, send_to,
+                            self.clients_belonged[websocket]):
                         self._queue_ack(websocket, client_mid, status="failed", error="invalid_quote")
                         continue
                     if len(plain) > self.max_message_length:
@@ -979,7 +991,8 @@ class InstantConnect():
                             client_mid=client_mid
                         )
                         if msg_record.get("duplicate"):
-                            if not self.messages_cursor.request_matches(
+                            if not await to_thread(
+                                    self.messages_cursor.request_matches,
                                     msg_record["mid"], sender_uid, send_to, plain, "plain",
                                     quote=quote):
                                 self._queue_ack(
@@ -990,10 +1003,12 @@ class InstantConnect():
                             self._queue_ack(websocket, client_mid, mid=msg_record["mid"], status="sent")
                             continue
                         self._queue_ack(websocket, client_mid, mid=msg_record["mid"], status="sent")
-                        mentioned_uids = resolve_mentioned_uids(
+                        mentioned_uids = await to_thread(
+                            resolve_mentioned_uids,
                             plain, self.user_cursor, [send_to], exclude_uid=sender_uid
                         )
-                        self.messages_cursor.set_message_mentions(
+                        await to_thread(
+                            self.messages_cursor.set_message_mentions,
                             msg_record["mid"], mentioned_uids
                         )
                         sender_str = "U{}".format(sender_uid)
@@ -1008,13 +1023,15 @@ class InstantConnect():
                             "room_id" : sender_str,
                             "room_seq" : msg_record.get("room_seq")
                         }
-                        recv_notif["quote_preview"] = (
-                            self.messages_cursor.get_quote_preview(quote, msg_record) if quote >= 0 else None
-                        )
+                        if quote >= 0:
+                            recv_notif["quote_preview"] = await to_thread(
+                                self.messages_cursor.get_quote_preview, quote, msg_record)
+                        else:
+                            recv_notif["quote_preview"] = None
                         recv_notif["mentioned_uids"] = mentioned_uids
                         recv_notif["mentions_me"] = send_to in mentioned_uids
-                        recv_notif["should_alert"] = should_alert(
-                            self.messages_cursor, send_to, sender_str, mentioned_uids
+                        recv_notif["should_alert"] = await to_thread(
+                            should_alert, self.messages_cursor, send_to, sender_str, mentioned_uids
                         )
                         sender_notif = dict(recv_notif)
                         sender_notif["room_id"] = "U{}".format(send_to)
@@ -1049,7 +1066,8 @@ class InstantConnect():
                             client_mid=client_mid
                         )
                         if msg_record.get("duplicate"):
-                            if not self.messages_cursor.request_matches(
+                            if not await to_thread(
+                                    self.messages_cursor.request_matches,
                                     msg_record["mid"], self.clients_belonged[websocket], 0,
                                     plain, "plain", quote=quote, group_id=gid):
                                 self._queue_ack(
@@ -1060,13 +1078,15 @@ class InstantConnect():
                             self._queue_ack(websocket, client_mid, mid=msg_record["mid"], status="sent")
                             continue
                         self._queue_ack(websocket, client_mid, mid=msg_record["mid"], status="sent")
-                        mentioned_uids = resolve_mentioned_uids(
+                        mentioned_uids = await to_thread(
+                            resolve_mentioned_uids,
                             plain,
                             self.user_cursor,
                             members,
                             exclude_uid=self.clients_belonged[websocket],
                         )
-                        self.messages_cursor.set_message_mentions(
+                        await to_thread(
+                            self.messages_cursor.set_message_mentions,
                             msg_record["mid"], mentioned_uids
                         )
                         notif_dict = {
@@ -1081,11 +1101,15 @@ class InstantConnect():
                             "group_id" : gid,
                             "room_seq" : msg_record.get("room_seq")
                         }
-                        notif_dict["quote_preview"] = (
-                            self.messages_cursor.get_quote_preview(quote, msg_record) if quote >= 0 else None
-                        )
+                        if quote >= 0:
+                            notif_dict["quote_preview"] = await to_thread(
+                                self.messages_cursor.get_quote_preview, quote, msg_record)
+                        else:
+                            notif_dict["quote_preview"] = None
                         room_id = "G{}".format(gid)
-                        pref_map = self.messages_cursor.get_room_preference_map(members, room_id) if members else {}
+                        pref_map = await to_thread(
+                            self.messages_cursor.get_room_preference_map, members, room_id
+                        ) if members else {}
                         sender_uid = self.clients_belonged[websocket]
                         pending = []
                         for user in members:
@@ -1126,7 +1150,9 @@ class InstantConnect():
                     if quote < -1:
                         self._queue_ack(websocket, client_mid, status="failed", error="invalid_quote")
                         continue
-                    if quote >= 0 and not self._verify_quote(quote, send_to, self.clients_belonged[websocket]):
+                    if quote >= 0 and not await to_thread(
+                            self._verify_quote, quote, send_to,
+                            self.clients_belonged[websocket]):
                         self._queue_ack(websocket, client_mid, status="failed", error="invalid_quote")
                         continue
                     # hyw
@@ -1147,24 +1173,23 @@ class InstantConnect():
                         if not await to_thread(self.user_cursor.is_friend, sender_uid, send_to):
                             self._queue_ack(websocket, client_mid, status="failed", error="not_friends")
                             continue
-                        metadata = (self.file_cursor.acquire_reference(sender_uid, file_hashes)
-                                    if self.file_cursor is not None else None)
+                        metadata = (
+                            await to_thread(self.file_cursor.acquire_reference,
+                                            sender_uid, file_hashes)
+                            if self.file_cursor is not None else None)
                         if metadata is None:
                             self._queue_ack(websocket, client_mid, status="failed", error="file_not_owned")
                             continue
-                        try:
-                            msg_record = await to_thread(
-                                self.messages_cursor.add_message,
-                                sender_uid, send_to, file_hashes,
-                                content_type='file', file_hash=file_hashes, quote=quote,
-                                client_mid=client_mid, file_name=metadata["file_name"],
-                                duration=duration
-                            )
-                        except Exception:
-                            self.file_cursor.decrement_ref(file_hashes)
-                            raise
+                        msg_record = await to_thread(
+                            self.messages_cursor.add_message,
+                            sender_uid, send_to, file_hashes,
+                            content_type='file', file_hash=file_hashes, quote=quote,
+                            client_mid=client_mid, file_name=metadata["file_name"],
+                            duration=duration
+                        )
                         if msg_record.get("duplicate"):
-                            if not self.messages_cursor.request_matches(
+                            if not await to_thread(
+                                    self.messages_cursor.request_matches,
                                     msg_record["mid"], sender_uid, send_to, file_hashes, "file",
                                     file_hash=file_hashes, quote=quote, duration=duration):
                                 self._queue_ack(
@@ -1177,7 +1202,8 @@ class InstantConnect():
                         if not await to_thread(
                                 self.file_cursor.add_reference,
                                 file_hashes, "message", msg_record["mid"], sender_uid):
-                            self.messages_cursor.recall_message(
+                            await to_thread(
+                                self.messages_cursor.recall_message,
                                 msg_record["mid"], sender_uid, emit_event=False)
                             self._queue_ack(websocket, client_mid, status="failed", error="file_reference_failed")
                             continue
@@ -1196,20 +1222,24 @@ class InstantConnect():
                             "room_id" : sender_str,
                             "room_seq" : msg_record.get("room_seq")
                         }
-                        recv_notif["quote_preview"] = (
-                            self.messages_cursor.get_quote_preview(quote, msg_record) if quote >= 0 else None
-                        )
+                        if quote >= 0:
+                            recv_notif["quote_preview"] = await to_thread(
+                                self.messages_cursor.get_quote_preview, quote, msg_record)
+                        else:
+                            recv_notif["quote_preview"] = None
                         if duration is not None:
                             recv_notif["duration"] = duration
                         if self.file_cursor is not None:
                             recv_notif["file"] = _metadata_with_name(
-                                self.file_cursor.get_metadata(file_hashes, owner_uid=sender_uid),
+                                await to_thread(
+                                    self.file_cursor.get_metadata,
+                                    file_hashes, owner_uid=sender_uid),
                                 metadata["file_name"],
                             )
                         recv_notif["mentioned_uids"] = []
                         recv_notif["mentions_me"] = False
-                        recv_notif["should_alert"] = should_alert(
-                            self.messages_cursor, send_to, sender_str, []
+                        recv_notif["should_alert"] = await to_thread(
+                            should_alert, self.messages_cursor, send_to, sender_str, []
                         )
                         sender_notif = dict(recv_notif)
                         sender_notif["room_id"] = "U{}".format(send_to)
@@ -1241,24 +1271,23 @@ class InstantConnect():
                             self._queue_ack(websocket, client_mid, status="failed", error="not_group_member")
                             continue
                         sender_uid = self.clients_belonged[websocket]
-                        metadata = (self.file_cursor.acquire_reference(sender_uid, file_hashes)
-                                    if self.file_cursor is not None else None)
+                        metadata = (
+                            await to_thread(self.file_cursor.acquire_reference,
+                                            sender_uid, file_hashes)
+                            if self.file_cursor is not None else None)
                         if metadata is None:
                             self._queue_ack(websocket, client_mid, status="failed", error="file_not_owned")
                             continue
-                        try:
-                            msg_record = await to_thread(
-                                self.messages_cursor.add_message,
-                                sender_uid, 0, file_hashes,
-                                content_type='file', file_hash=file_hashes, quote=quote, group_id=gid,
-                                client_mid=client_mid, file_name=metadata["file_name"],
-                                duration=duration
-                            )
-                        except Exception:
-                            self.file_cursor.decrement_ref(file_hashes)
-                            raise
+                        msg_record = await to_thread(
+                            self.messages_cursor.add_message,
+                            sender_uid, 0, file_hashes,
+                            content_type='file', file_hash=file_hashes, quote=quote, group_id=gid,
+                            client_mid=client_mid, file_name=metadata["file_name"],
+                            duration=duration
+                        )
                         if msg_record.get("duplicate"):
-                            if not self.messages_cursor.request_matches(
+                            if not await to_thread(
+                                    self.messages_cursor.request_matches,
                                     msg_record["mid"], sender_uid, 0, file_hashes, "file",
                                     file_hash=file_hashes, quote=quote, group_id=gid, duration=duration):
                                 self._queue_ack(
@@ -1271,7 +1300,8 @@ class InstantConnect():
                         if not await to_thread(
                                 self.file_cursor.add_reference,
                                 file_hashes, "message", msg_record["mid"], sender_uid):
-                            self.messages_cursor.recall_message(
+                            await to_thread(
+                                self.messages_cursor.recall_message,
                                 msg_record["mid"], sender_uid, emit_event=False)
                             self._queue_ack(websocket, client_mid, status="failed", error="file_reference_failed")
                             continue
@@ -1290,20 +1320,26 @@ class InstantConnect():
                             "group_id" : gid,
                             "room_seq" : msg_record.get("room_seq")
                         }
-                        notif_dict["quote_preview"] = (
-                            self.messages_cursor.get_quote_preview(quote, msg_record) if quote >= 0 else None
-                        )
+                        if quote >= 0:
+                            notif_dict["quote_preview"] = await to_thread(
+                                self.messages_cursor.get_quote_preview, quote, msg_record)
+                        else:
+                            notif_dict["quote_preview"] = None
                         if duration is not None:
                             notif_dict["duration"] = duration
                         if self.file_cursor is not None:
                             notif_dict["file"] = _metadata_with_name(
-                                self.file_cursor.get_metadata(
-                                    file_hashes, owner_uid=self.clients_belonged[websocket]
+                                await to_thread(
+                                    self.file_cursor.get_metadata,
+                                    file_hashes,
+                                    owner_uid=self.clients_belonged[websocket],
                                 ),
                                 metadata["file_name"],
                             )
                         room_id = "G{}".format(gid)
-                        pref_map = self.messages_cursor.get_room_preference_map(members, room_id) if members else {}
+                        pref_map = await to_thread(
+                            self.messages_cursor.get_room_preference_map, members, room_id
+                        ) if members else {}
                         sender_uid = self.clients_belonged[websocket]
                         pending = []
                         for user in members:
@@ -1331,7 +1367,9 @@ class InstantConnect():
                         continue
                     room_id = message["room_id"]
                     sender_uid = self.clients_belonged[websocket]
-                    if not can_access_room(self.user_cursor, self.group_cursor, sender_uid, room_id):
+                    if not await to_thread(
+                            can_access_room, self.user_cursor, self.group_cursor,
+                            sender_uid, room_id):
                         continue
                     # 新增字段：scope（缺省 typing）、progress（仅 uploading）、ts（服务器兜底）
                     scope = message.get("scope", "typing")
@@ -1379,7 +1417,8 @@ class InstantConnect():
                         if progress is not None:
                             broadcast["progress"] = progress
                         gid = int(room_id[1:])
-                        members = self.group_cursor.get_member_uids(gid)
+                        members = await to_thread(
+                            self.group_cursor.get_member_uids, gid)
                         for user in members:
                             if user != sender_uid:
                                 with self._clients_lock:
@@ -1397,7 +1436,8 @@ class InstantConnect():
                     if (not isinstance(room_id, str) or isinstance(last_mid, bool)
                             or not isinstance(last_mid, int) or last_mid <= 0):
                         continue
-                    if not can_access_room(
+                    if not await to_thread(
+                            can_access_room,
                             self.user_cursor, self.group_cursor, sender_uid, room_id):
                         continue
                     if room_id.startswith('U'):
@@ -1406,10 +1446,12 @@ class InstantConnect():
                     else:
                         room_key = self.messages_cursor.room_key_of(
                             sender_uid, 0, group_id=int(room_id[1:]))
-                    cursor = self.messages_cursor.sync_cursor_for_mid(room_key, last_mid)
+                    cursor = await to_thread(
+                        self.messages_cursor.sync_cursor_for_mid, room_key, last_mid)
                     if cursor is None or cursor[0] is None:
                         continue
-                    if not self.messages_cursor.update_read_state(
+                    if not await to_thread(
+                            self.messages_cursor.update_read_state,
                             sender_uid, room_key, cursor[0], last_mid):
                         continue
                     # 多端已读同步

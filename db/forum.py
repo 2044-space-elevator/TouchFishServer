@@ -1,34 +1,16 @@
 from db.tool import Db
 from time import time
-import threading
-from json_store import read_json, update_json
+import os
+from json_store import read_json
 
 
-_comments_locks = {}
-_comments_locks_lock = threading.Lock()
+# 单条 SQL 的占位符数量上限
+_COMMENT_QUERY_BATCH = 500
 
 
 def comments_path(port_api : int):
     return "res/{}/forum/comments.json".format(port_api)
 
-
-def get_comments_lock(port_api : int):
-    with _comments_locks_lock:
-        lock = _comments_locks.get(port_api)
-        if lock is None:
-            lock = threading.Lock()
-            _comments_locks[port_api] = lock
-        return lock
-
-
-def read_comments(port_api : int):
-    with get_comments_lock(port_api):
-        return read_json(comments_path(port_api))
-
-
-def update_comments(port_api : int, callback):
-    with get_comments_lock(port_api):
-        return update_json(comments_path(port_api), callback)
 
 class ForumDb(Db):
     def __init__(self, path : str, port_api : int, port_tcp : int, dialect=None):
@@ -58,6 +40,9 @@ class ForumDb(Db):
     """
         self.execute(cmd)
         self.execute(cmd2)
+        # 版块帖子列表按 (fid, pid) 游标分页
+        self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_contents_fid ON contents(fid, pid)")
         self.execute("""
     CREATE TABLE IF NOT EXISTS post_attachments (
         pid INTEGER NOT NULL,
@@ -86,6 +71,168 @@ class ForumDb(Db):
         PRIMARY KEY (fid, uid)
     )
     """)
+        self._create_comments_table()
+        self._migrate_comments_json()
+
+    def _create_comments_table(self):
+        self.execute("""
+    CREATE TABLE IF NOT EXISTS post_comments (
+        fid INTEGER NOT NULL,
+        pid INTEGER NOT NULL,
+        time_stamp TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        uid INTEGER NOT NULL,
+        content TEXT NOT NULL,
+        PRIMARY KEY (pid, time_stamp)
+    )
+    """)
+        self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_post_comments_pid "
+            "ON post_comments(pid, created_at)")
+        self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_post_comments_uid "
+            "ON post_comments(uid)")
+
+    def _migrate_comments_json(self):
+        """
+        旧版 comments.json 导入 post_comments
+        """
+        path = comments_path(self.api_pt)
+        if not os.path.exists(path):
+            return
+        try:
+            data = read_json(path)
+        except Exception as e:
+            print("[WARN] comments.json 读取失败，暂不迁移: {}".format(e))
+            return
+        rows = []
+        for fid_key, posts in (data or {}).items():
+            if not isinstance(posts, dict):
+                continue
+            for pid_key, thread in posts.items():
+                if not isinstance(thread, dict):
+                    continue
+                for time_stamp, entry in thread.items():
+                    if not (isinstance(entry, list) and len(entry) >= 2):
+                        continue
+                    try:
+                        fid_value = int(fid_key)
+                        pid_value = int(pid_key)
+                        created_at = float(time_stamp)
+                    except (TypeError, ValueError):
+                        continue
+                    rows.append((
+                        fid_value, pid_value, str(time_stamp), created_at,
+                        int(entry[0]), str(entry[1]),
+                    ))
+        if rows:
+            try:
+                self.update(
+                    "INSERT OR IGNORE INTO post_comments "
+                    "(fid, pid, time_stamp, created_at, uid, content) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    rows,
+                )
+            except Exception as e:
+                print("[WARN] comments.json 迁移失败，保留原文件: {}".format(e))
+                return
+        try:
+            os.replace(path, path + ".migrated")
+        except OSError:
+            pass
+
+    def add_comment(self, fid, pid, uid, content, time_stamp=None):
+        created_at = time()
+        time_stamp = str(created_at) if time_stamp is None else str(time_stamp)
+        try:
+            self.execute(
+                "INSERT INTO post_comments "
+                "(fid, pid, time_stamp, created_at, uid, content) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (int(fid), int(pid), time_stamp, created_at, int(uid), str(content)),
+            )
+            return time_stamp
+        except self.dialect.IntegrityError:
+            return None
+
+    def get_comments(self, fid, pid):
+        return self.query(
+            "SELECT time_stamp, uid, content FROM post_comments "
+            "WHERE fid = ? AND pid = ? ORDER BY created_at ASC",
+            (int(fid), int(pid)),
+        )
+
+    def delete_comment(self, fid, pid, time_stamp, can_delete=None):
+        """删除一条评论，返回被删评论的作者 uid；不存在或无权限返回 None。
+
+        can_delete(creator) 在同一个事务里对「读出来的作者」求值，权限判断与删除
+        之间没有窗口（此前是先 get_comment_creator 再单独删除）。
+        """
+        time_stamp = str(time_stamp)
+
+        def operation():
+            with self.lock:
+                self.cursor.execute(
+                    "SELECT uid FROM post_comments "
+                    "WHERE fid = ? AND pid = ? AND time_stamp = ?",
+                    (int(fid), int(pid), time_stamp),
+                )
+                row = self.cursor.fetchone()
+                if row is None:
+                    self.conn.commit()
+                    return None
+                creator = row[0]
+                if can_delete is not None and not can_delete(creator):
+                    self.conn.commit()
+                    return None
+                self.cursor.execute(
+                    "DELETE FROM post_comments "
+                    "WHERE fid = ? AND pid = ? AND time_stamp = ?",
+                    (int(fid), int(pid), time_stamp),
+                )
+                self.conn.commit()
+                return creator
+
+        return self._execute_with_retry(operation)
+
+    def comment_summaries(self, fid, pids):
+        """批量返回每个帖子的评论数 + 最后一条评论。
+
+        需要 SQLite >= 3.25 /
+        MySQL >= 8.0
+        """
+        pids = sorted({int(pid) for pid in pids})
+        if not pids:
+            return {}
+        summaries = {}
+        for start in range(0, len(pids), _COMMENT_QUERY_BATCH):
+            batch = pids[start:start + _COMMENT_QUERY_BATCH]
+            placeholders = ",".join("?" * len(batch))
+            rows = self.query(
+                """SELECT c.pid, c.uid, c.content, c.time_stamp,
+                          (SELECT COUNT(*) FROM post_comments t
+                            WHERE t.fid = c.fid AND t.pid = c.pid) AS total
+                     FROM post_comments c
+                    WHERE c.fid = ? AND c.pid IN ({})
+                      AND c.created_at = (
+                        SELECT MAX(t2.created_at) FROM post_comments t2
+                         WHERE t2.fid = c.fid AND t2.pid = c.pid)
+                    ORDER BY c.created_at DESC""".format(placeholders),
+                tuple([int(fid)] + batch),
+            )
+            for pid, uid, content, time_stamp, total in rows:
+                if pid in summaries:
+                    continue
+                summaries[pid] = {
+                    "count": int(total),
+                    "last": {
+                        "time_stamp": time_stamp,
+                        "uid": uid,
+                        "content": content,
+                    },
+                }
+        return summaries
+
     
     def create_forum(self, forumname, creater : int, introduction):
         """
@@ -122,7 +269,6 @@ class ForumDb(Db):
         with self.lock:
             fid = self._execute_with_retry(insert_forum)
 
-        update_comments(self.api_pt, lambda comments: comments.setdefault(str(fid), {}))
         return fid
     
     def query_forum_fid(self, fid):
@@ -148,6 +294,33 @@ class ForumDb(Db):
     
     def query_all_post(self, fid):
         return self.query("SELECT * FROM contents WHERE fid = ?", (fid, ))
+
+    def query_posts_page(self, fid, before_pid=None, limit=None):
+        """按 pid 游标分页；limit=None 时保持旧的“返回全部”行为。
+
+        返回 (rows, has_more)，rows 内按 pid 升序，便于客户端直接追加。
+        """
+        where = "fid = ?"
+        params = [fid]
+        if before_pid is not None:
+            where += " AND pid < ?"
+            params.append(int(before_pid))
+        columns = "SELECT fid, pid, title, creater, content, send_time FROM contents"
+        if limit is None:
+            rows = self.query(
+                "{} WHERE {} ORDER BY pid ASC".format(columns, where),
+                tuple(params),
+            )
+            return rows, False
+        params.append(int(limit) + 1)
+        rows = self.query(
+            "{} WHERE {} ORDER BY pid DESC LIMIT ?".format(columns, where),
+            tuple(params),
+        )
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        rows.reverse()
+        return rows, has_more
     
     def query_all_forums(self):
         return self.query("SELECT * FROM forums ORDER BY post_num DESC")
@@ -229,13 +402,6 @@ class ForumDb(Db):
         with self.lock:
             pid = self._execute_with_retry(insert_post)
 
-        def add_post_bucket(comments):
-            comments.setdefault(str(fid), {})[str(pid)] = {}
-
-        try:
-            update_comments(self.api_pt, add_post_bucket)
-        except Exception as e:
-            print("[WARN] send_post: comments JSON 更新失败 fid={} pid={}: {}".format(fid, pid, e))
         return pid
 
     def get_post_attachments(self, pids) -> dict:
@@ -348,12 +514,12 @@ class ForumDb(Db):
                 self.cursor.execute("DELETE FROM forums WHERE fid = ?", (fid,))
                 self.cursor.execute("DELETE FROM contents WHERE fid = ?", (fid,))
                 self.cursor.execute("DELETE FROM forum_members WHERE fid = ?", (fid,))
+                self.cursor.execute("DELETE FROM post_comments WHERE fid = ?", (fid,))
                 self.cursor.execute("DROP TABLE IF EXISTS F{}".format(fid))
                 self.conn.commit()
                 return attachment_hashes
 
             attachment_hashes = self._execute_with_retry(operation)
-        update_comments(self.api_pt, lambda comments: comments.pop(str(fid), None))
         return attachment_hashes
 
     def delete_post(self, fid : int, pid : int):
@@ -366,6 +532,8 @@ class ForumDb(Db):
             self.cursor.execute("DELETE FROM post_attachments WHERE pid = ?", (pid,))
             self.cursor.execute("DELETE FROM contents where pid = ?", (pid,))
             self.cursor.execute(
+                "DELETE FROM post_comments WHERE fid = ? AND pid = ?", (fid, pid))
+            self.cursor.execute(
                 "UPDATE forums set post_num = CASE WHEN post_num > 0 THEN post_num - 1 ELSE 0 END where fid = ?",
                 (fid,)
             )
@@ -374,16 +542,6 @@ class ForumDb(Db):
 
         with self.lock:
             attachment_hashes = self._execute_with_retry(do_delete)
-
-        def remove_post_bucket(comments):
-            forum_comments = comments.get(str(fid))
-            if isinstance(forum_comments, dict):
-                forum_comments.pop(str(pid), None)
-
-        try:
-            update_comments(self.api_pt, remove_post_bucket)
-        except Exception as e:
-            print("[WARN] delete_post: comments JSON 更新失败 fid={} pid={}: {}".format(fid, pid, e))
         return attachment_hashes
 
     def clean_user_content(self, uid : int, return_attachment_hashes=False):
@@ -409,6 +567,7 @@ class ForumDb(Db):
                     self.cursor.execute("DELETE FROM forums WHERE fid = ?", (fid,))
                     self.cursor.execute("DELETE FROM contents WHERE fid = ?", (fid, ))
                     self.cursor.execute("DELETE FROM forum_members WHERE fid = ?", (fid,))
+                    self.cursor.execute("DELETE FROM post_comments WHERE fid = ?", (fid,))
                     self.cursor.execute("DROP TABLE IF EXISTS F{}".format(fid))
 
                 self.cursor.execute("SELECT fid FROM forums")
@@ -431,47 +590,23 @@ class ForumDb(Db):
                             attachment[0] for attachment in self.cursor.fetchall()
                         )
                         self.cursor.execute("DELETE FROM post_attachments WHERE pid = ?", (pid,))
+                        self.cursor.execute(
+                            "DELETE FROM post_comments WHERE fid = ? AND pid = ?",
+                            (fid, pid))
                     self.cursor.execute("DELETE FROM contents WHERE creater = ? and fid = ?", (uid, fid))
                     self.cursor.execute(
                         "UPDATE forums SET post_num = CASE WHEN post_num >= ? THEN post_num - ? ELSE 0 END WHERE fid = ?",
                         (len(post_ids), len(post_ids), fid),
                     )
 
+                # 该用户留下的评论一并删除（帖子/版块已删的评论前面已按 fid/pid 清掉）
+                self.cursor.execute("DELETE FROM post_comments WHERE uid = ?", (uid,))
+
                 self.conn.commit()
                 return deleted_forums, deleted_posts, deleted_attachment_hashes
 
             deleted_forums, deleted_posts, deleted_attachment_hashes = self._execute_with_retry(operation)
 
-        deleted_posts_text = {
-            str(fid): {str(pid) for pid in post_ids}
-            for fid, post_ids in deleted_posts.items()
-        }
-
-        def clean_comments(comments):
-            for fid in deleted_forums:
-                comments.pop(str(fid), None)
-
-            for fid, forum_comments in list(comments.items()):
-                if not isinstance(forum_comments, dict):
-                    continue
-
-                removed_posts = deleted_posts_text.get(fid, set())
-                for pid in list(forum_comments.keys()):
-                    if pid in removed_posts:
-                        forum_comments.pop(pid, None)
-                        continue
-
-                    thread = forum_comments.get(pid)
-                    if not isinstance(thread, dict):
-                        continue
-
-                    for time_stamp, entry in list(thread.items()):
-                        if isinstance(entry, list) and entry and entry[0] == uid:
-                            del thread[time_stamp]
-
-            return True
-
-        update_comments(self.api_pt, clean_comments)
         if return_attachment_hashes:
             return deleted_attachment_hashes
         return True

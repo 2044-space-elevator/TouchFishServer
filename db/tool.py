@@ -4,6 +4,24 @@ import time
 from db.dialect import CursorProxy, SQLiteDialect
 
 
+def is_retryable_error(dialect, exc) -> bool:
+    """只有锁冲突 / 连接抖动 / 序列化失败才重试
+    """
+    hints = getattr(dialect, "retryable_error_hints", ())
+    codes = getattr(dialect, "retryable_error_codes", ())
+    if not hints and not codes:
+        return True
+    code = getattr(exc, "pgcode", None)  # psycopg2 的 SQLSTATE
+    if code is None and exc.args and isinstance(exc.args[0], int):
+        code = exc.args[0]  # pymysql 的 errno
+    if code is not None and code in codes:
+        return True
+    if hints:
+        message = str(exc).lower()
+        return any(hint in message for hint in hints)
+    return code is None
+
+
 class Db:
     def __init__(self, path_or_dsn, PORT_API, PORT_TCP,
                  WAL_mode=True, max_retries=3, dialect=None):
@@ -53,6 +71,14 @@ class Db:
         self._local.cursor = None
         self._init_thread()
 
+    def _is_retryable(self, exc) -> bool:
+        error_types = self.dialect.retryable_error_types or (
+            self.dialect.DatabaseError,
+        )
+        if not isinstance(exc, error_types):
+            return False
+        return is_retryable_error(self.dialect, exc)
+
     def _execute_with_retry(self, db_operation, *args, **kwargs):
         error_types = self.dialect.retryable_error_types or (
             self.dialect.DatabaseError,
@@ -60,12 +86,12 @@ class Db:
         for attempt in range(self.max_retries):
             try:
                 return db_operation(*args, **kwargs)
-            except error_types:
+            except error_types as exc:
                 try:
                     self.conn.rollback()
                 except Exception:
                     pass
-                if attempt == self.max_retries - 1:
+                if attempt == self.max_retries - 1 or not self._is_retryable(exc):
                     raise
                 self._reconnect()
                 time.sleep(0.1)
@@ -77,11 +103,12 @@ class Db:
                 raise
 
     def update(self, command: str, parameters: list):
-        with self.lock:
-            def operation():
+        # 锁只包住单次尝试：重试之间的 sleep / 重连不再占着全局写锁
+        def operation():
+            with self.lock:
                 self.cursor.executemany(command, parameters)
                 self.conn.commit()
-            self._execute_with_retry(operation)
+        self._execute_with_retry(operation)
 
     def query(self, command: str, parameters: tuple = None):
         def operation():
@@ -95,8 +122,8 @@ class Db:
         return self._execute_with_retry(operation)
 
     def execute(self, command: str, parameters: tuple = None):
-        with self.lock:
-            def operation():
+        def operation():
+            with self.lock:
                 if parameters:
                     self.cursor.execute(command, parameters)
                 else:
@@ -104,7 +131,7 @@ class Db:
                 lastrowid = self.cursor.lastrowid
                 self.conn.commit()
                 return lastrowid
-            return self._execute_with_retry(operation)
+        return self._execute_with_retry(operation)
 
     def __enter__(self):
         return self

@@ -39,6 +39,11 @@ _MEDIA_PENDING_STALE = 600.0
 _MEDIA_MISS_MEMO_TTL = 3600.0
 _MEDIA_MISS_MEMO_LIMIT = 4096
 
+# 分块上传的单块上限与整文件上限。请求体上限要用到单块大小
+# （web.request_body_limit），所以放在模块级，别在这里再定义一份。
+MAX_CHUNK_SIZE = 10 * 1024 * 1024
+MAX_TOTAL_SIZE = 200 * 1024 * 1024
+
 _media_queue = deque()
 _media_queued = set()
 _media_cancelled = {}
@@ -342,13 +347,6 @@ def clean_user_files(port_api : int, uid : int, file_cursor : FileDb):
     return rows
 
 
-def release_references(port_api : int, hashes, file_cursor : FileDb,
-                       file_last_time : float = 72.0):
-    for file_hash in hashes:
-        file_cursor.decrement_ref(file_hash)
-    return []
-
-
 def collect_expired(port_api: int, sticker_cursor,  file_cursor: FileDb, file_last_time: float = 0.0):
     """回收过期文件（贴图不参与自动删除）"""
     deleted = []
@@ -393,9 +391,6 @@ def chunked_upload_file(port_api : int, uid : int, file_name : str, chunk_index 
 
     :return: dict with success/error, plus file_id (intermediate) or file_hash (final)
     """
-    MAX_CHUNK_SIZE = 10 * 1024 * 1024
-    MAX_TOTAL_SIZE = 200 * 1024 * 1024
-
     if not isinstance(uid, int):
         return {"success": False, "error": "Invalid uid"}
     if not isinstance(chunk_index, int) or not isinstance(chunk_total, int) or chunk_index < 0 or chunk_total < 1 or chunk_index >= chunk_total:
