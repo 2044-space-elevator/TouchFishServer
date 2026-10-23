@@ -23,6 +23,7 @@
 - [search.md](search.md) 用户/群组搜索 API
 - [sticker.md](sticker.md) 表情包相关（为什么要单开呢？我也不知道） API
 - [errors.md](errors.md) 错误码、详细错误响应与兼容规则
+- [jwt_keys.md](../jwt_keys.md) JWT 签名密钥、JWKS / Discovery 与外部平台接入（运维与安全）
 
 ## 文档约定
 
@@ -54,6 +55,12 @@
 返回值：PEM 格式的 RSA 公钥文件，文件名为 `<port_api>.pem`，其中 `port_api` 是服务器的 API 端口。
 
 服务器在部署成功后会自动生成公钥哈希值，TFV5 要求部署者将哈希值通过可靠的方式公布于用户中。**为防止中间人攻击，务必对公钥文件进行 SHA256 哈希并校对部署者提供的公钥哈希值**。
+
+> 注意：`/get_rsa_pub` 返回的是 **请求信封加密**用的 RSA 公钥，与 JWT 签名公钥是两套密钥。
+> 如果服务器启用了非对称 JWT 签发，外部平台应改用 `GET /.well-known/jwks.json` 获取 JWT 验签公钥；
+> 元数据见 `GET /.well-known/openid-configuration`。默认 HS256 模式下 JWKS 为空数组；
+> 若 `jwt_issuer` 不是 `http(s)` 绝对 URL（如默认的 `"7001"`），该端点返回 `404 issuer_not_configured`。
+> 详见[账号文档](auth.md)与 [JWT Keys](../jwt_keys.md)。
 
 ## Api 类型和对应请求方法
 

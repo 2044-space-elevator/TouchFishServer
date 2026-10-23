@@ -372,7 +372,13 @@
     "groups_limit" : <groups_limit>,
     "single_group_max_people" : <single_group_max_people>,
     "max_file_size" : <max_file_size>,
-    "features" : { "forum" : false, "chat" : {"private_chat" : false} }
+    "features" : { "forum" : false, "chat" : {"private_chat" : false} },
+    "allow_register" : true,
+    "external_auth_url" : "https://auth.example.touchfish.xin",
+    "platform_auth_enabled" : false,
+    "platform_auth_issuer" : "https://tf.example.touchfish.xin",
+    "platform_auth_allow_ips" : "10.0.0.0/8,127.0.0.1",
+    "platform_auth_shared_token" : "<token 或空串表示清除>"
 }
 ```
 
@@ -384,6 +390,11 @@
 - `file_last_time` 必须是大于等于 `0` 的整数
 - `groups_limit`、`single_group_max_people`、`max_file_size` 支持传入 `-1` 表示不限制
 - `features` 只接受已知键（见 `/info` 的 `features` 结构），叶值必须是布尔；未提交的键保持不变（深合并）。关闭后对应写端点返回 `FEATURE_DISABLED_*`（403）
+- `allow_register` 控制是否允许平台与客户端自助注册新账号；关闭后既有账号不受影响
+- `external_auth_url` 填 TouchFish Auth 基址；留空表示禁用外部登录
+- `platform_auth_*` 见下文「平台专用端点 `/auth/platform/*`」一节
+- `platform_auth_shared_token` 传空串 `""` 表示**清除**已配置的令牌；不提交该字段表示保持不变。
+  **不回显**：`/auth/server_settings/query` 只返回 `platform_auth_shared_token_set` 布尔（是否已配置），不返回令牌本身，与 SMTP 密码一致
 
 返回体与 `/auth/server_settings/query` 相同。更新成功后服务端会立即热重载配置（含 WS 功能开关快照）。
 
@@ -677,6 +688,10 @@
 
 注册成功返回时间戳加 True，否则返回时间戳加 False。需注意如果要邮箱验证，用户初始状态为 `banned`。
 
+**注册开关**：实例配置 `allow_register`（默认 `true`，可从 `/info` 读取）为 `false` 时，
+该端点返回 `{"error": "register_disabled"}`（详细模式下为 `REGISTER_DISABLED`，HTTP 403），
+不会创建账号。外部登录平台也应据此拒绝新账户的开通，客户端应隐藏注册入口。
+
 ## 第三方签发（外部平台登录）
 
 服务端支持**外部平台登录（断言模型，非 OAuth）**：外部平台用自己的私钥签发 JWT，本服凭配置的公钥验签，再经 `/auth/external/login` 换取本地 access/refresh 会话。换取之后，刷新、设备（会话）管理、踢出、WebSocket 鉴权全部与密码登录完全一致。
@@ -696,11 +711,22 @@
 {
   "jwt_external_issuers": [
     {
-      "iss": "https://idp.example.com",
-      "algorithms": ["RS256"],
+      "iss": "https://idp.example.touchfish.xin",
+      "algorithms": ["RS256", "ES256"],
       "audience": "touchfish",
-      "public_key_pem": "res/<port_api>/secret/idp_public.pem",
+      "jwks_uri": "https://idp.example.touchfish.xin/.well-known/jwks.json",
       "allow_auto_create": false
+    },
+    {
+      "iss": "https://login.example.touchfish.xin",
+      "algorithms": ["RS256"],
+      "discovery": true,
+      "require_exp": true
+    },
+    {
+      "iss": "https://legacy.example.touchfish.xin",
+      "algorithms": ["RS256"],
+      "public_key_pem": "res/<port_api>/secret/idp_public.pem"
     }
   ]
 }
@@ -711,19 +737,38 @@
 | 字段 | 必填 | 说明 |
 | --- | --- | --- |
 | `iss` | 是 | 外部签发方的 `issuer`，token 的 `iss` 必须与之匹配 |
-| `algorithms` | 否 | 允许的签名算法，默认 `["RS256"]`（支持 RS256/ES256 等非对称算法） |
-| `audience` | 否 | 期望的 `aud`；不填则不校验 audience |
-| `public_key_pem` | 是 | 签发方的公钥（RSA/EC PEM 字符串，或指向 PEM 文件的路径） |
+| `algorithms` | 否 | 允许的签名算法，默认 `["RS256"]`；支持 RS256/384/512、PS256/384/512、ES256/384/512。**不支持 HS\* 与 none** |
+| `audience` | 否 | 期望的 `aud`（字符串或字符串数组）；不填则不校验 audience |
+| `public_key_pem` / `public_key` | 否 | 静态公钥：RSA/EC PEM 字符串，或指向 PEM 文件的路径 |
+| `public_key_jwk` | 否 | 静态单把 JWK（RFC 7517） |
+| `jwks` | 否 | 静态 JWKS 文档，如 `{"keys": [...]}` |
+| `jwks_uri` | 否 | 远程 JWKS 地址；自动拉取、缓存、按 `kid` 选钥 |
+| `discovery` | 否 | 为 `true` 且未配置 `jwks_uri` 时，从 `<iss>/.well-known/openid-configuration` 解析 `jwks_uri` |
+| `discovery_url` | 否 | 显式指定 discovery 地址（issuer 不是标准 URL 时使用） |
+| `jwks_cache_seconds` | 否 | JWKS 缓存秒数，默认 600 |
+| `jwks_timeout_seconds` | 否 | 拉取超时秒数，默认 5（0.5~30） |
+| `jwks_stale_seconds` | 否 | 拉取失败时允许继续使用旧缓存的秒数，默认 86400 |
+| `allow_insecure_http` | 否 | 是否允许 `http://` 与回环/内网地址，默认 `false`；仅本地联调使用 |
+| `leeway_seconds` | 否 | 时钟偏移容忍，默认 30（0~300） |
+| `require_exp` | 否 | 是否强制要求 `exp`，默认 `false`（兼容老 issuer）；新接入建议设为 `true` |
+| `required_claims` | 否 | 必须存在的 claim 列表，例如 `["email"]` |
 | `allow_auto_create` | 否 | 未绑定的外部身份是否自动创建本地账号，默认 `false`（即默认只允许绑定已有账号）。自动建号使用随机密码、状态为 `user`；用户名优先取 token 的 `username`/`preferred_username` claim，缺失或冲突时回退为 `ext_<sub>` 并加数字后缀 |
 
 `public_key_pem` 既可以直接内联 PEM 文本，也可以填文件路径（如 `res/<port_api>/secret/idp_public.pem`）。
 
-> 配置在服务端启动时缓存，修改 `config.json` 后需**重启服务端**才能生效。请勿配置重复的 `iss`（重复时条目查找只取第一条）。
+公钥来源优先级：`public_key_jwk` > `jwks` > `public_key_pem` > `jwks_uri` > `discovery`。
+同一 `iss` 只应配置一次（重复时按配置顺序取第一条）。
+
+> 修改 `config.json` 后，HTTP 侧按 mtime 自动热加载；WebSocket 侧的 issuer 快照要等下一次配置刷新（保存服务器设置）或重启后生效。
 
 ### 外部 token 的要求
 
 - `iss`：必须命中 `jwt_external_issuers` 中某个条目的 `iss`；
 - `sub`：非空字符串，是外部平台内部的用户标识（**不是**本地 uid）；
+- `alg`：必须是 RS/PS/ES 等非对称算法；`none` 与 `HS*` 一律拒绝；
+- `kid`：可选；JWKS 有多把钥匙时用它精确选钥，轮换后新 `kid` 会触发一次自动刷新；
+- `exp`：默认仍按 PyJWT 规则校验（存在即校验过期）；`require_exp=true` 时缺失直接拒绝；
+- `nbf` / `iat`：`nbf` 按 `leeway_seconds` 容忍时钟偏移，`iat` 不做严格校验；
 - `username` / `preferred_username` / `email`：可选 claim，仅在自动建号时使用（`email` 需通过格式与唯一性校验才会写入）；
 - 映射键为 `(iss, sub)`：一个本地账号在同一 issuer 下最多绑定一个外部身份。
 
@@ -818,13 +863,99 @@
 }
 ```
 
+### 平台专用端点 `/auth/platform/*`
+
+供**受信任的外部登录平台**（本仓的 `touchfish-auth`）使用。与 `/auth/external/*` 的区别：
+平台端点不需要本地会话，改用「IP 白名单 + 可选共享令牌」鉴权，且**不创建本服会话、不消耗
+`jwt_max_per_user` 配额**——解绑与探测绑定状态时尤其重要。
+
+配置（实例 `config.json`）：
+
+```
+{
+    "platform_auth_enabled": true,
+    "platform_auth_issuer": "https://auth.example.com",
+    "platform_auth_allow_ips": "127.0.0.1,::1",
+    "platform_auth_shared_token": "<openssl rand -hex 32>"
+}
+```
+
+鉴权规则：
+
+- `platform_auth_enabled` 为 `false` 时所有 `/auth/platform/*` 一律 `403`；
+- `remote_addr` 必须命中 `platform_auth_allow_ips`（逗号分隔，支持 CIDR；留空等价于 `127.0.0.1,::1`）；
+- `platform_auth_shared_token` 非空时，还必须带 `X-Platform-Token` 头且与之相等。
+
+> **风险提示**：启用 `reverse_proxy_enabled` 后 `remote_addr` 来自 `X-Forwarded-For`，可被客户端伪造。
+> 生产环境**须**同时配置 `platform_auth_shared_token`
+
+> **配额（升级存量部署注意）**：新装服务器默认给 `/auth/platform/*` 独立配额（bind/unbind 300/min、status 600/min），
+> 但**存量 `config.json` 没有这几项时会落到 `default` 60/min**。启用平台登录后，每次 TFV5 账号密码登录
+> 都会调一次 `platform_bind`，平台侧本地限流是 120/min——远端 60 会先被拒。请在 `config.json` 的
+> `rate_limits` 里补上：
+> ```json
+> "rate_limits": {
+>     "default": {"requests": 60, "range": 60},
+>     "/auth/platform/bind": {"requests": 300, "range": 60},
+>     "/auth/platform/unbind": {"requests": 300, "range": 60},
+>     "/auth/platform/status": {"requests": 600, "range": 60}
+> }
+> ```
+> 改完保存即可，服务端热重载。
+
+#### POST /auth/platform/bind
+
+校验 TouchFish 凭据并建立 `(iss, sub) -> uid` 映射。
+
+```
+{
+    "iss": "<平台 issuer>",
+    "sub": "<平台用户标识>",
+    "identifier": "<用户名或数字 uid>",
+    "password": "<明文密码>"
+}
+```
+
+返回：`{"success": true, "uid": <uid>, "username": "<name>", "created": <true_or_false>}`。
+**总是先校验密码再判断映射**：`(iss, sub)` 已指向同一 uid 时幂等返回 `created: false`，
+因此它也可以当作"只验密码、无副作用"的接口使用。
+
+错误：`platform_not_configured`、`external_token_invalid`（iss 不匹配）、`invalid_request`、
+`auth_failed`（账号或密码错误）、`user_banned`、`external_already_linked`（该 uid 已绑定其他 sub）。
+
+#### POST /auth/platform/unbind
+
+按 `(iss, sub)` 解绑，不递增 `auth_version`（不会踢掉该用户所有设备）。
+
+```
+{"iss": "<平台 issuer>", "sub": "<平台用户标识>"}
+```
+
+返回 `{"success": true}`；无此映射时同样返回成功（幂等）。错误：`external_token_invalid`、`invalid_request`、`conflict`。
+
+#### GET /auth/platform/status
+
+明文只读，供平台判断绑定是否仍然有效，避免自己维护副本。
+
+```
+GET /auth/platform/status?iss=<issuer>&sub=<平台用户标识>
+```
+
+返回 `{"linked": true, "uid": <uid>, "username": "<name>", "stat": "<user_or_banned>"}`
+或 `{"linked": false}`。
+
+> 注意：`status` 不校验调用方身份（除上述 IP/令牌外），会返回该身份对应的 uid 与用户名。
+> 这正是必须配共享令牌的原因。
+
 ### 校验流程与旧版路径
 
 `resolve_auth` 的 token 校验顺序：
 
-1. 先用本地 HS256 密钥验签（自签 token 路径，含 `jti` 登记 + `sid` 会话校验）；
-2. 本地验签失败时，若配置了 `jwt_external_issuers`，则逐一尝试外部签发方验签；
+1. 先用本服签名密钥验签：默认 HS256 用 `jwt_secret`；配置非对称算法后按 header 的 `kid` 从密钥环选钥。本服 token 还要通过 `jti` 登记 + `sid` 会话 + `auth_version` 校验；
+2. 本服验签失败时，若配置了 `jwt_external_issuers`，先按未验签的 `iss` 选中配置条目，再按 `kid` 从静态/远程 JWKS 选钥，验签并校验 `iss`/`aud`/`exp`/`required_claims`；
 3. 都失败返回 `token_expired`。
+
+HTTP 的 `token` 字段与 WebSocket 的 `AUTH.LOGIN.token` 使用同一套验签逻辑；HS256 与 RS/ES 等算法切换后两端行为一致。
 
 **旧版直接接受（legacy，不推荐）**：外部 token 也可以直接放在普通请求的 `token` 字段中作为 bearer 使用（不产生本地会话，逐请求验签）。该路径要求 token 携带 `av` claim 且 `sub` 必须是已存在的本地 uid（整数），`av` 外部平台无法自行得知，仅适合能读取本服状态的深度集成场景。新接入请使用 `/auth/external/login`。
 
@@ -837,6 +968,152 @@
 
 ### 不支持
 
-- 不拉取远程 JWKS（`jwks_uri` 尚未实现，需静态提供公钥 PEM）；
+- 完整的 OAuth 2.0 / OIDC Provider
 - `sub` 必须为字符串（PyJWT 会校验），非字符串 `sub` 的签发方需要调整；
-- 自动建号不支持指定初始权限（固定为 `user`）。
+- 自动建号不支持指定初始权限（固定为 `user`）
+- 外部 token 的 `sub` 不会被直接映射为本地 uid；直接 bearer 路径仍要求 `av` 且 `sub` 为本地 uid（见上文 legacy 说明）
+
+## 本服作为签发方（非对称 JWT / JWKS / Discovery）
+
+本服默认仍用 HS256 签发，存量部署零变化。配置非对称算法后，access token 的 header 会带 `kid`，
+外部平台可以通过 `/.well-known/jwks.json` 取公钥独立验签，不需要共享 `jwt_secret`。
+
+### 配置
+
+在 `res/<port_api>/config.json` 中按需增加：
+
+```json
+{
+  "jwt_signing_algorithm": "RS256",
+  "jwt_issuer": "https://tf.example.com",
+  "jwt_audience": "",
+  "jwt_key_retention_days": 30,
+  "jwt_rsa_key_size": 2048,
+  "jwt_jwks_enabled": true,
+  "jwt_discovery_enabled": true,
+  "jwt_public_base_url": "https://tf.example.touchfish.xin"
+}
+```
+
+| 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `jwt_signing_algorithm` | `HS256` | `HS256/HS384/HS512/RS256/RS384/RS512/PS256/PS384/PS512/ES256/ES384/ES512`；非对称算法首次签到时自动生成并保存密钥 |
+| `jwt_issuer` | 空 | token 的 `iss`；空则沿用端口号字符串（与升级前一致），建议设为对外 URL |
+| `jwt_audience` | 空 | 可选 `aud`；空则不下发 |
+| `jwt_key_retention_days` | 30 | 轮换后旧公钥继续发布/验签的天数 |
+| `jwt_rsa_key_size` | 2048 | 生成 RSA 密钥的位数（2048~8192） |
+| `jwt_jwks_enabled` | true | 是否暴露 JWKS 端点；关闭时 discovery 也返回 404 |
+| `jwt_discovery_enabled` | true | 是否暴露 discovery 端点 |
+| `jwt_public_base_url` | 空 | JWKS/discovery 的对外基址；空则用请求的 `url_root`（反向代理后请显式配置） |
+
+密钥文件位于 `res/<port_api>/secret/jwt_keys/`：`index.json` 记录元数据，`<kid>.pem` 是 PKCS8 私钥。
+`kid` 使用 RFC 7638 JWK Thumbprint，与密钥内容强绑定。签名密钥与请求信封的 `pri.pem/pub.pem` **互相独立**。
+
+### GET /.well-known/jwks.json
+
+公开、无需加密信封、无需认证；`/.well-known/jwks` 是同一响应的别名。响应示例：
+
+```json
+{
+  "keys": [
+    {
+      "kty": "RSA",
+      "n": "base64url...",
+      "e": "AQAB",
+      "alg": "RS256",
+      "use": "sig",
+      "kid": "EsJYaNb7fX9Xm9Q35IktXf_3MGj62O49jAG63hdiDqc"
+    }
+  ]
+}
+```
+
+HS256 模式下返回 `{"keys": []}`（合法但无可验证公钥）；启用非对称签名后自动出现当前钥与保留期内的旧钥。
+响应带 `Cache-Control: public, max-age=300`。
+
+### GET /.well-known/openid-configuration
+
+只声明验签所需元数据，不声明尚未实现的 `authorization_endpoint`/`token_endpoint`：
+
+```json
+{
+  "issuer": "https://tf.example.touchfish.xin",
+  "jwks_uri": "https://tf.example.touchfish.xin/.well-known/jwks.json",
+  "id_token_signing_alg_values_supported": ["RS256"],
+  "subject_types_supported": ["public"],
+  "claims_supported": ["sub", "iss", "aud", "exp", "iat", "nbf", "jti", "sid", "av", "name", "nick", "region", "perk_level", "is_superuser"]
+}
+```
+
+只依赖 `jwks_uri` 的验签库可以直接使用；要求完整 OIDC Provider 元数据的客户端会因缺少 authorize/token 而无法完成登录流程。
+
+> **未配置 issuer 时返回 404**：`jwt_issuer` 必须是 `http(s)` 绝对 URL（建议同时设置 `jwt_public_base_url`）。
+> 默认配置（如 `"jwt_issuer": "7001"`）不满足该条件，此端点返回 `404 {"error": "issuer_not_configured"}`。
+> 注意 `external_auth_url` / `platform_auth_enabled` 是**独立的实例配置项**，无条件下发，
+> 与 `jwt_issuer` 是否合法无关——即未配 issuer 仍可在站点设置里开启平台登录开关。
+
+### 兼容与迁移
+
+- **默认 HS256**：不配置 `jwt_signing_algorithm` 时行为与升级前完全一致；
+- **新旧 token 并存**：验签按 header.`alg` 分流，`HS*` 继续用 `jwt_secret`，所以切换算法后存量 token 仍有效，直到自然过期或被吊销；
+- **refresh token** 是不透明随机串，与 JWT 算法无关，切换不需要重新登录；
+- 切换建议：先用 `/auth/manage/signing_keys/rotate`（或手工配置）生成 RS256 密钥并切换，旧 HS256 token 到期后自然退出；
+- 若外部平台需要稳定的 `iss`，务必设置 `jwt_issuer` 与 `jwt_public_base_url`，不要依赖请求 Host。
+
+### POST /auth/manage/signing_keys/list
+
+root 专用，走加密信封。请求体：
+
+```json
+{"token": "<root access token>"}
+```
+
+返回：
+
+```json
+{
+  "keys": [
+    {"kid": "...", "algorithm": "RS256", "created_at": 1789707673.8, "retired_at": null, "active": true}
+  ],
+  "signing_algorithm": "RS256",
+  "issuer": "https://tf.example.touchfish.xin",
+  "jwks_uri": "https://tf.example.touchfish.xin/.well-known/jwks.json",
+  "retention_days": 30
+}
+```
+
+### POST /auth/manage/signing_keys/rotate
+
+root 专用，走加密信封。生成指定算法的新钥并默认切换 `jwt_signing_algorithm`：
+
+```json
+{
+  "token": "<root access token>",
+  "algorithm": "RS256",
+  "issuer": "https://tf.example.touchfish.xin",
+  "activate": true
+}
+```
+
+- `algorithm`：必须是 RS/PS/ES 非对称算法，默认 `RS256`；
+- `issuer`：可选，传入时同时写入 `jwt_issuer`；
+- `activate`：默认 `true`；为 `false` 时只生成密钥、不改 `jwt_signing_algorithm`。
+  注意：无论 `activate` 取值，新钥都会成为该算法的 **active** 签发钥，旧钥进入保留期。
+
+返回：
+
+```json
+{
+  "success": true,
+  "kid": "...",
+  "algorithm": "RS256",
+  "previous_algorithm": "HS256",
+  "signing_algorithm": "RS256",
+  "jwks_uri": "https://tf.example.touchfish.xin/.well-known/jwks.json"
+}
+```
+
+旧钥不会立即删除：在 `jwt_key_retention_days` 内继续出现在 JWKS 中并可验签，之后由清理逻辑移除。
+轮换不会强制现有会话下线。
+
+> 运维细节（密钥备份、轮换周期、反向代理、性能）见 [`docs/jwt_keys.md`](../jwt_keys.md)。

@@ -8,6 +8,8 @@ import base64
 import binascii
 import os
 import secrets
+import hmac
+import ipaddress
 from db import *
 from db.user import (
     USERS_COL_PUBLIC_EMAIL,
@@ -19,6 +21,7 @@ import file
 
 import announcements
 import jwt_tool
+import jwt_keys
 from crypto import generate_rsa_keys, return_app_route
 from rate_limiter import RateLimiter
 from mention_utils import resolve_mentioned_uids, should_alert, alert_from_preference
@@ -210,16 +213,19 @@ def show_online_status_visible(row) -> bool:
     value = row[index] if len(row) > index else 1
     return value is None or bool(value)
 
-def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, forum_cursor, file_cursor, notification_cursor, messages_cursor, group_cursor, instant_contact, sticker_cursor=None, jwt_secret=None):
+def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, forum_cursor, file_cursor, notification_cursor, messages_cursor, group_cursor, instant_contact, sticker_cursor=None, jwt_secret=None, jwt_key_store=None):
     """
     pri 是 cryptography 库的私钥对象
     pub_pem 是二进制 pem 文件路径
     ImgCaptcha 是 captcha.ImageCaptcha 对象
     ~_cursor 表示 db.tool.Db 对象
-    jwt_secret 是 JWT 签名密钥（不传时自动加载/生成）
+    jwt_secret 是 HS256 JWT 签名密钥（不传时自动加载/生成）
+    jwt_key_store 是本服非对称签名密钥环（不传时自动创建）
     """
     app = Flask(__name__)
     jwt_secret = jwt_tool.load_secret(port_api) if jwt_secret is None else jwt_secret
+    if jwt_key_store is None:
+        jwt_key_store = jwt_keys.KeyStore("res/{}/secret".format(port_api))
 
     def resolve_auth(content):
         """
@@ -231,8 +237,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         """
         token = content.get("token")
         if token:
-            # 本地自签 HS256 token
-            payload = jwt_tool.verify_token(jwt_secret, token)
+            # 本服签发 token：HS* 用 jwt_secret，非对称用密钥环（按 kid 选钥）
+            payload = jwt_tool.verify_local_token(jwt_secret, token, jwt_key_store)
             if payload is not None:
                 try:
                     uid = int(payload.get("sub"))
@@ -352,12 +358,71 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             _config_stat = stat
             return dict(_config_cache)
 
+    # ---- JWT 签发 / JWKS 配置读取（配置在启动后仍可热改） ----
+
+    def jwt_signing_algorithm(cfg=None):
+        """当前签发算法；未知值回退 HS256，保证存量服务器行为不变。"""
+        cfg = read_config() if cfg is None else cfg
+        return jwt_keys.normalize_algorithm(cfg.get("jwt_signing_algorithm", "HS256"))
+
+    def jwt_issuer(cfg=None):
+        """token 的 iss；未配置时沿用端口号（与升级前一致）。"""
+        cfg = read_config() if cfg is None else cfg
+        value = cfg.get("jwt_issuer")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return str(port_api)
+
+    def jwt_audience(cfg=None):
+        cfg = read_config() if cfg is None else cfg
+        value = cfg.get("jwt_audience")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        return None
+
+    def jwt_public_base_url(cfg=None):
+        """对外基址：优先 jwt_public_base_url，否则用当前请求的 url_root（ProxyFix 已生效）。"""
+        cfg = read_config() if cfg is None else cfg
+        value = cfg.get("jwt_public_base_url")
+        if isinstance(value, str) and value.strip():
+            return value.strip().rstrip("/")
+        try:
+            return (flask_request.url_root or "").rstrip("/")
+        except Exception:
+            return ""
+
+    def jwt_jwks_uri(cfg=None):
+        base = jwt_public_base_url(cfg)
+        return (base + "/.well-known/jwks.json") if base else "/.well-known/jwks.json"
+
+    def jwt_key_retention_days(cfg=None):
+        cfg = read_config() if cfg is None else cfg
+        try:
+            days = int(cfg.get("jwt_key_retention_days", 30))
+        except (TypeError, ValueError):
+            days = 30
+        return days if 0 <= days <= 3650 else 30
+
     def apply_request_body_limit(cfg):
         limit = request_body_limit(cfg)
         if app.config.get("MAX_CONTENT_LENGTH") != limit:
             app.config["MAX_CONTENT_LENGTH"] = limit
 
     apply_request_body_limit(read_config())
+
+    def _warm_external_issuers():
+        """后台预热外部 issuer 的 JWKS，避免首次外部登录阻塞在网络上。"""
+        try:
+            issuers = read_config().get("jwt_external_issuers") or []
+            for entry in issuers:
+                if isinstance(entry, dict):
+                    jwt_tool.warm_external_issuer(entry)
+        except Exception:
+            pass
+
+    threading.Thread(
+        target=_warm_external_issuers, name="tfv5-jwks-warm", daemon=True
+    ).start()
 
     group_cursor._config_reader = read_config
 
@@ -554,10 +619,21 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             "jwt_expires_seconds" : int(cfg.get("jwt_expires_seconds", 3600)),
             "jwt_refresh_expires_seconds" : int(cfg.get("jwt_refresh_expires_seconds", 604800)),
             "jwt_max_per_user" : int(cfg.get("jwt_max_per_user", 5)),
+            "jwt_signing_algorithm" : jwt_signing_algorithm(cfg),
+            "jwt_issuer" : jwt_issuer(cfg),
+            "jwt_jwks_uri" : jwt_jwks_uri(cfg) if cfg.get("jwt_jwks_enabled", True) else "",
+            "jwt_jwks_enabled" : bool(cfg.get("jwt_jwks_enabled", True)),
             "external_login_issuers" : [
                 entry.get("iss") for entry in (cfg.get("jwt_external_issuers") or [])
                 if isinstance(entry, dict) and isinstance(entry.get("iss"), str) and entry.get("iss")
             ],
+            # 客户端据此发现"去哪里做外部登录"。空串 = 未启用。
+            "external_auth_url" : (
+                cfg.get("external_auth_url", "").strip().rstrip("/")
+                if isinstance(cfg.get("external_auth_url"), str) else ""
+            ),
+            "platform_auth_enabled" : bool(cfg.get("platform_auth_enabled", False)),
+            "allow_register" : bool(cfg.get("allow_register", True)),
             "default_asset_urls" : {
                 "logo" : "/avatar/get_logo",
                 "forum" : "/avatar/get_default/forum",
@@ -576,6 +652,16 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             ret["smtp_use_ssl"] = cfg.get("smtp_use_ssl", True)
             ret["reverse_proxy_enabled"] = cfg.get("reverse_proxy_enabled", False)
             ret["proxy_count"] = cfg.get("proxy_count", 1)
+            # 平台端点的非敏感项直接回显；共享令牌与 SMTP 密码同理，只回显"是否已配置"
+            ret["platform_auth_issuer"] = (
+                cfg.get("platform_auth_issuer", "").strip().rstrip("/")
+                if isinstance(cfg.get("platform_auth_issuer"), str) else ""
+            )
+            ret["platform_auth_allow_ips"] = (
+                cfg.get("platform_auth_allow_ips", "")
+                if isinstance(cfg.get("platform_auth_allow_ips"), str) else ""
+            )
+            ret["platform_auth_shared_token_set"] = bool(cfg.get("platform_auth_shared_token"))
         return ret
 
     def validate_default_join_targets(targets):
@@ -1012,6 +1098,76 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         notify_user(target_uid, "auth.stat.changed", "账号状态已变更", "你的账号状态已更新为 {}。".format(new_auth), sender=uid, meta={"new_auth" : new_auth})
         return True
     
+    # ---- 外部认证平台（TouchFish Auth）专用准入 ----
+    # 该组端点只服务于服务端到服务端的调用：
+    #   IP/CIDR 白名单（remote_addr 已经过 ProxyFix）
+    #   + 可选共享令牌（防 X-Forwarded-For 伪造绕过白名单）
+    PLATFORM_PREFIX = "/auth/platform/"
+
+    def platform_issuer(cfg=None):
+        """平台端点只接受一个 issuer：显式配置优先，否则取唯一的外部签发方。"""
+        cfg = read_config() if cfg is None else cfg
+        value = cfg.get("platform_auth_issuer")
+        if isinstance(value, str) and value.strip():
+            return value.strip().rstrip("/")
+        entries = cfg.get("jwt_external_issuers") or []
+        if len(entries) == 1 and isinstance(entries[0], dict):
+            iss = entries[0].get("iss")
+            if isinstance(iss, str):
+                return iss.strip().rstrip("/")
+        return ""
+
+    def platform_allow_ips(cfg):
+        raw = cfg.get("platform_auth_allow_ips")
+        items = [s.strip() for s in raw.split(",") if s.strip()] if isinstance(raw, str) else []
+        return items or ["127.0.0.1", "::1"]
+
+    def _ip_in_spec(addr, spec):
+        try:
+            if "/" in spec:
+                return addr in ipaddress.ip_network(spec, strict=False)
+            return addr == ipaddress.ip_address(spec)
+        except ValueError:
+            return False
+
+    def platform_caller_allowed(cfg):
+        if not bool(cfg.get("platform_auth_enabled", False)):
+            return False
+        try:
+            addr = ipaddress.ip_address(flask_request.remote_addr or "")
+        except ValueError:
+            return False
+        if not any(_ip_in_spec(addr, spec) for spec in platform_allow_ips(cfg)):
+            return False
+        expected = cfg.get("platform_auth_shared_token")
+        if isinstance(expected, str) and expected:
+            provided = flask_request.headers.get("X-Platform-Token", "")
+            if not hmac.compare_digest(provided, expected):
+                return False
+        return True
+
+    def warn_platform_security():
+        """平台端点开了却没配共享令牌时给出显著警告。
+
+        此时只靠 IP 白名单，而 reverse_proxy_enabled=true 后 remote_addr 来自
+        X-Forwarded-For，可被伪造 —— 等于把 bind/unbind/status 暴露给任意人。
+        启动时调用一次（read_config 已定义，可安全调用）。
+        """
+        try:
+            cfg = read_config()
+        except Exception:  # noqa: BLE001
+            return
+        if not bool(cfg.get("platform_auth_enabled", False)):
+            return
+        token = cfg.get("platform_auth_shared_token")
+        if isinstance(token, str) and token:
+            return
+        print("[WARN] platform_auth_enabled=true 但未设置 platform_auth_shared_token："
+              "当前仅靠 IP 白名单鉴权，启用反向代理后 X-Forwarded-For 可被伪造，"
+              "建议配置共享令牌（openssl rand -hex 32）")
+
+    warn_platform_security()
+
     @app.before_request
     def enforce_request_limits():
         cfg = read_config()
@@ -1021,6 +1177,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         content_length = flask_request.content_length
         if limit and content_length is not None and content_length > limit:
             return "Payload Too Large", 413
+        if flask_request.path.startswith(PLATFORM_PREFIX):
+            # 先于限流判断，被拒的请求不消耗配额
+            if not platform_caller_allowed(cfg):
+                return "Forbidden", 403
         ip = flask_request.remote_addr
         endpoint = flask_request.path
         if not limiter.is_allowed(ip, endpoint):
@@ -1029,6 +1189,57 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     @app.route("/get_rsa_pub")
     def get_rsa_key():
         return send_file("res/{}/secret/pub.pem".format(port_api), download_name="{}.pem".format(port_api))
+
+    def _wellknown_response(document, status=200):
+        response = Response(
+            json.dumps(document, ensure_ascii=False),
+            status=status,
+            mimetype="application/json",
+        )
+        if status == 200:
+            response.headers["Cache-Control"] = "public, max-age=300"
+        else:
+            response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.route("/.well-known/jwks.json")
+    @app.route("/.well-known/jwks")
+    def get_jwks():
+        """本服 JWT 公钥集（外部平台据此独立验签，无需共享 jwt_secret）。"""
+        cfg = read_config()
+        if not cfg.get("jwt_jwks_enabled", True):
+            return _wellknown_response({"error": "not_found"}, status=404)
+        try:
+            document = jwt_keys.build_jwks(jwt_key_store, jwt_key_retention_days(cfg))
+        except Exception as error:
+            print("[ERR] 生成 JWKS 失败: {}".format(error))
+            return _wellknown_response({"error": "server_error"}, status=500)
+        return _wellknown_response(document)
+
+    @app.route("/.well-known/openid-configuration")
+    def get_openid_configuration():
+        """只声明验签所需元数据，不声明尚未实现的 authorize/token 端点。"""
+        cfg = read_config()
+        if (not cfg.get("jwt_discovery_enabled", True)
+                or not cfg.get("jwt_jwks_enabled", True)):
+            # 没有可用的 JWKS 时，不发布指向 404 的 discovery 元数据
+            return _wellknown_response({"error": "not_found"}, status=404)
+        issuer = jwt_issuer(cfg)
+        if not (isinstance(issuer, str) and issuer.startswith(("http://", "https://"))):
+            # jwt_issuer 未配置时它只是端口号字符串，不是合法 issuer。
+            # 与其发布一个错的 issuer 让人误配，不如不发布。
+            return _wellknown_response({
+                "error": "issuer_not_configured",
+                "detail": "jwt_issuer 必须是绝对的 http(s) URL，例如 https://fish.example.com",
+            }, status=404)
+        try:
+            document = jwt_keys.build_discovery(
+                issuer, jwt_jwks_uri(cfg), jwt_key_store.algorithms()
+            )
+        except Exception as error:
+            print("[ERR] 生成 OIDC discovery 失败: {}".format(error))
+            return _wellknown_response({"error": "server_error"}, status=500)
+        return _wellknown_response(document)
 
     @api("/auth/login", methods=["POST"])
     def login(req):
@@ -1115,9 +1326,18 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if not session_id:
             return {"error": "auth_failed"}
 
-        token, payload = jwt_tool.issue_token(
-            jwt_secret, uid, auth_version, access_expires, port_api, session_id=session_id
-        )
+        try:
+            token, payload = jwt_tool.issue_token(
+                jwt_secret, uid, auth_version, access_expires, jwt_issuer(),
+                session_id=session_id,
+                audience=jwt_audience(),
+                algorithm=jwt_signing_algorithm(),
+                key_store=jwt_key_store,
+            )
+        except Exception as error:
+            print("[ERR] 签发 JWT 失败: {}".format(error))
+            user_cursor.revoke_session(session_id, uid)
+            return {"error": "auth_failed"}
         if not user_cursor.issue_token(payload["jti"], uid, payload["iat"], payload["exp"], ip=client_ip, ua=user_agent):
             user_cursor.revoke_session(session_id, uid)
             return {"error": "auth_failed"}
@@ -1156,9 +1376,17 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if not user_cursor.rotate_session(session_id, refresh_token, new_refresh_token, now, new_expires):
             return {"error": "auth_failed"}
 
-        token, payload = jwt_tool.issue_token(
-            jwt_secret, uid, auth_version, access_expires, port_api, session_id=session_id
-        )
+        try:
+            token, payload = jwt_tool.issue_token(
+                jwt_secret, uid, auth_version, access_expires, jwt_issuer(),
+                session_id=session_id,
+                audience=jwt_audience(),
+                algorithm=jwt_signing_algorithm(),
+                key_store=jwt_key_store,
+            )
+        except Exception as error:
+            print("[ERR] 签发 JWT 失败: {}".format(error))
+            return {"error": "auth_failed"}
         if not user_cursor.issue_token(payload["jti"], uid, payload["iat"], payload["exp"]):
             return {"error": "auth_failed"}
 
@@ -1760,6 +1988,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         username = req["username"]
         password = req["password"]
         cfg = read_config()
+        if not cfg.get("allow_register", True):
+            return {"error": "register_disabled"}
         is_captcha = cfg.get("captcha", False)
         is_email_activate = cfg.get("email_activate", "")
         if (not isinstance(username, str) or len(username) < int(cfg.get("min_username_length", 4))
@@ -2375,6 +2605,54 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                     return json.dumps({"success": False, "error": "invalid_request"})
                 updates["smtp_use_ssl"] = req["smtp_use_ssl"]
 
+            # ---- 外部认证平台相关配置 ----
+            if "allow_register" in req:
+                if not isinstance(req["allow_register"], bool):
+                    return json.dumps({"success": False, "error": "invalid_request"})
+                updates["allow_register"] = req["allow_register"]
+
+            if "external_auth_url" in req:
+                value = req["external_auth_url"]
+                if not isinstance(value, str):
+                    return json.dumps({"success": False, "error": "invalid_request"})
+                value = value.strip().rstrip("/")
+                # 只允许 http(s)，否则客户端 WebView 可能被 javascript: 之类注入
+                if value and not (value.startswith("http://") or value.startswith("https://")):
+                    return json.dumps({"success": False, "error": "invalid_request"})
+                updates["external_auth_url"] = value
+
+            if "platform_auth_enabled" in req:
+                if not isinstance(req["platform_auth_enabled"], bool):
+                    return json.dumps({"success": False, "error": "invalid_request"})
+                updates["platform_auth_enabled"] = req["platform_auth_enabled"]
+
+            if "platform_auth_issuer" in req:
+                value = req["platform_auth_issuer"]
+                if not isinstance(value, str):
+                    return json.dumps({"success": False, "error": "invalid_request"})
+                value = value.strip().rstrip("/")
+                if value and not (value.startswith("http://") or value.startswith("https://")):
+                    return json.dumps({"success": False, "error": "invalid_request"})
+                updates["platform_auth_issuer"] = value
+
+            if "platform_auth_allow_ips" in req:
+                value = req["platform_auth_allow_ips"]
+                if not isinstance(value, str):
+                    return json.dumps({"success": False, "error": "invalid_request"})
+                parts = [item.strip() for item in value.split(",") if item.strip()]
+                for spec in parts:
+                    try:
+                        ipaddress.ip_network(spec, strict=False)
+                    except ValueError:
+                        return json.dumps({"success": False, "error": "invalid_request"})
+                updates["platform_auth_allow_ips"] = ",".join(parts)
+
+            if "platform_auth_shared_token" in req:
+                value = req["platform_auth_shared_token"]
+                if not isinstance(value, str) or len(value) > 128:
+                    return json.dumps({"success": False, "error": "invalid_request"})
+                updates["platform_auth_shared_token"] = value.strip()
+
             if "reverse_proxy_enabled" in req:
                 if not isinstance(req["reverse_proxy_enabled"], bool):
                     return json.dumps({"success": False, "error": "invalid_request"})
@@ -2430,6 +2708,74 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return json.dumps(serialize_server_settings(cfg, include_manage=True), ensure_ascii=False)
         except Exception:
             return json.dumps({"success": False, "error": "unavailable"})
+
+    @api("/auth/manage/signing_keys/list", methods=["POST"])
+    def list_signing_keys(req):
+        """
+        列出本服 JWT 签名密钥（root）。
+        返回的 kid/algorithm 与 /.well-known/jwks.json 中的公钥一一对应。
+        """
+        try:
+            uid = req.get("uid")
+            if uid is None or verify_root(uid, req.get("password")) is None:
+                return {"error": "forbidden"}
+            cfg = read_config()
+            return {
+                "keys": jwt_key_store.list_keys(),
+                "signing_algorithm": jwt_signing_algorithm(cfg),
+                "issuer": jwt_issuer(cfg),
+                "jwks_uri": jwt_jwks_uri(cfg),
+                "retention_days": jwt_key_retention_days(cfg),
+            }
+        except Exception as error:
+            print("[ERR] 读取 JWT 签名密钥失败: {}".format(error))
+            return {"error": "unavailable"}
+
+    @api("/auth/manage/signing_keys/rotate", methods=["POST"])
+    def rotate_signing_key(req):
+        """
+        轮换 JWT 签名密钥（root）。
+
+        默认同时把 jwt_signing_algorithm 切到新算法（activate=true）：
+        旧密钥在保留期内仍可验签并继续出现在 JWKS 中，存量 token 不会立即失效。
+        activate=false 只改密钥、不改配置；新钥仍会成为该算法的 active 签发钥。
+        """
+        try:
+            uid = req.get("uid")
+            if uid is None or verify_root(uid, req.get("password")) is None:
+                return {"error": "forbidden"}
+            algorithm = jwt_keys.normalize_algorithm(
+                req.get("algorithm", "RS256"), default=None
+            )
+            if algorithm not in jwt_keys.ASYMMETRIC_ALGORITHMS:
+                return {"error": "invalid_request"}
+            activate = req.get("activate", True)
+            if not isinstance(activate, bool):
+                return {"error": "invalid_request"}
+            issuer = req.get("issuer")
+            if issuer is not None and (not isinstance(issuer, str) or len(issuer.strip()) > 512):
+                return {"error": "invalid_request"}
+            previous_algorithm = jwt_signing_algorithm()
+            kid = jwt_key_store.rotate(
+                algorithm, retention_days=jwt_key_retention_days()
+            )
+            if activate:
+                def apply(cfg):
+                    cfg["jwt_signing_algorithm"] = algorithm
+                    if isinstance(issuer, str) and issuer.strip():
+                        cfg["jwt_issuer"] = issuer.strip()
+                update_config(apply)
+            return {
+                "success": True,
+                "kid": kid,
+                "algorithm": algorithm,
+                "previous_algorithm": previous_algorithm,
+                "signing_algorithm": jwt_signing_algorithm(),
+                "jwks_uri": jwt_jwks_uri(),
+            }
+        except Exception as error:
+            print("[ERR] 轮换 JWT 签名密钥失败: {}".format(error))
+            return {"error": "unavailable"}
 
     @api("/notification/query_all", methods=['POST'])
     def query_all_notifications(req):
@@ -2551,6 +2897,94 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     @app.route("/info")
     def info():
         return serialize_server_settings(read_config())
+
+    # ---- 外部认证平台专用端点 ----
+    # 这三个端点只登记"谁绑了谁"，刻意不创建本地会话：
+    # 绑定是纯校验 + 写映射，不应该占用用户的 jwt_max_per_user 配额，
+    # 更不应该因超限吊销用户最老的会话。
+
+    @api("/auth/platform/bind", methods=["POST"])
+    def platform_bind(req):
+        """校验 TouchFish 凭据并建立 (iss, sub) -> uid 映射。不建会话、不发 token。"""
+        cfg = read_config()
+        iss = platform_issuer(cfg)
+        if not iss:
+            return {"error": "platform_not_configured"}
+        if req.get("iss") != iss:
+            return {"error": "external_token_invalid"}
+        sub = req.get("sub")
+        if not isinstance(sub, str) or not sub or len(sub) > 128:
+            return {"error": "invalid_request"}
+
+        identifier = req.get("identifier")
+        password = req.get("password")
+        if not isinstance(password, str) or not password:
+            return {"error": "invalid_request"}
+        if isinstance(identifier, bool):
+            return {"error": "invalid_request"}
+        if isinstance(identifier, int):
+            uid = identifier
+        elif isinstance(identifier, str) and identifier.strip():
+            text = identifier.strip()
+            if text.isdigit():
+                uid = int(text)
+            else:
+                rows = user_cursor.username_query(text)
+                if not rows:
+                    return {"error": "auth_failed"}
+                uid = rows[0][0]
+        else:
+            return {"error": "invalid_request"}
+
+        if not user_cursor.verify_user(uid, password):
+            return {"error": "auth_failed"}
+        row = user_cursor.uid_query(uid)
+        if not row:
+            return {"error": "auth_failed"}
+        if row[0][4] == "banned":
+            return {"error": "user_banned"}
+
+        existing = user_cursor.get_identity_uid(iss, sub)
+        if existing == uid:
+            return {"success": True, "uid": uid, "username": row[0][1], "created": False}
+        if existing is not None:
+            return {"error": "external_already_linked"}
+        if not user_cursor.bind_identity(iss, sub, uid):
+            return {"error": "external_already_linked"}
+        return {"success": True, "uid": uid, "username": row[0][1], "created": True}
+
+    @api("/auth/platform/unbind", methods=["POST"])
+    def platform_unbind(req):
+        """按 (iss, sub) 解绑。不 bump auth_version，避免踢掉用户所有设备。"""
+        cfg = read_config()
+        iss = platform_issuer(cfg)
+        if not iss or req.get("iss") != iss:
+            return {"error": "external_token_invalid"}
+        sub = req.get("sub")
+        if not isinstance(sub, str) or not sub:
+            return {"error": "invalid_request"}
+        uid = user_cursor.get_identity_uid(iss, sub)
+        if uid is None:
+            return {"success": True}
+        if not user_cursor.unbind_identity(uid, iss):
+            return {"error": "conflict"}
+        return {"success": True}
+
+    @app.route("/auth/platform/status")
+    def platform_status():
+        """明文只读：平台据此判断绑定是否仍然有效，避免自己维护副本。"""
+        cfg = read_config()
+        iss = platform_issuer(cfg)
+        sub = flask_request.args.get("sub", "")
+        if not iss or not sub:
+            return {"linked": False}
+        uid = user_cursor.get_identity_uid(iss, sub)
+        if uid is None:
+            return {"linked": False}
+        row = user_cursor.uid_query(uid)
+        if not row:
+            return {"linked": False}
+        return {"linked": True, "uid": uid, "username": row[0][1], "stat": row[0][4]}
 
     def _sticker_item_dict(row):
         return {

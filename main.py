@@ -10,6 +10,7 @@ from json_store import update_json, write_json
 import db
 from db.dialect import SQLiteDialect, MySQLDialect, PostgreSQLDialect
 import avatar
+import jwt_keys
 from file import (init, collect_expired, sweep_stale_chunk_uploads,
                   sweep_orphan_media, start_media_worker, set_media_notifier)
 import logging
@@ -59,6 +60,7 @@ FLASK_THREAD = None
 TCP_THREAD = None
 INSTANT_CONTACT = None
 IMGCAPTCHA = None
+JWT_KEY_STORE = None
 HASHER = None
 ENABLE_DEBUG = False
 ENABLE_WERKZEUG_LOG = False
@@ -159,7 +161,12 @@ def create_new_server():
         "single_group_max_people" : 200,
         "default_join_targets" : [],
         "rate_limits" : {
-            "default" : {"requests": 60, "range": 60}
+            "default" : {"requests": 60, "range": 60},
+            # 外部认证平台是服务端到服务端调用，且被 IP 白名单限制，
+            # 因此给更宽松的独立配额；要收紧就改这里的数字。
+            "/auth/platform/bind" : {"requests": 300, "range": 60},
+            "/auth/platform/unbind" : {"requests": 300, "range": 60},
+            "/auth/platform/status" : {"requests": 600, "range": 60}
         },
         "max_file_size" : 73400320,
         "user_storage_quota" : 73400320,
@@ -168,7 +175,22 @@ def create_new_server():
         "legacy_auth_enabled" : True,
         "jwt_expires_seconds" : 3600,
         "jwt_refresh_expires_seconds" : 604800,
-        "jwt_max_per_user" : 5
+        "jwt_max_per_user" : 5,
+        "jwt_signing_algorithm" : "HS256",
+        "jwt_issuer" : "",
+        "jwt_audience" : "",
+        "jwt_key_retention_days" : 30,
+        "jwt_rsa_key_size" : 2048,
+        "jwt_jwks_enabled" : True,
+        "jwt_discovery_enabled" : True,
+        "jwt_public_base_url" : "",
+        "jwt_external_issuers" : [],
+        "allow_register" : True,
+        "external_auth_url" : "",
+        "platform_auth_enabled" : False,
+        "platform_auth_issuer" : "",
+        "platform_auth_allow_ips" : "127.0.0.1,::1",
+        "platform_auth_shared_token" : ""
     }
     write_json("res/{}/config.json".format(PORT_API), cfg)
     write_json("res/{}/captcha/captcha.json".format(PORT_API), {})
@@ -344,7 +366,7 @@ def main(args=None):
     global NOTIFICATION_CURSOR
     global GROUP_CURSOR
     global MESSAGES_CURSOR
-    
+    global JWT_KEY_STORE
 
     if args is None:
         args = parse_args([])
@@ -416,6 +438,15 @@ def main(args=None):
             server_cfg = json.load(f)
     except Exception:
         server_cfg = {}
+
+    # JWT 签名密钥环：与请求信封的 pri.pem/pub.pem 完全独立。
+    # 构造时只建目录、不生成密钥；首次以非对称算法签发时才落盘。
+    JWT_KEY_STORE = jwt_keys.KeyStore(
+        "res/{}/secret".format(PORT_API),
+        rsa_key_size=jwt_keys.normalize_rsa_key_size(
+            server_cfg.get("jwt_rsa_key_size", 2048)
+        ),
+    )
 
     db_backend = server_cfg.get("db_backend", "sqlite")
     if db_backend in ("mysql", "postgresql"):
@@ -521,6 +552,7 @@ def main(args=None):
     INSTANT_CONTACT = InstantConnect(
         PORT_API, PORT_TCP, NOTIFICATION_CURSOR, USER_CURSOR,
         MESSAGES_CURSOR, GROUP_CURSOR, FILE_CURSOR,
+        jwt_key_store=JWT_KEY_STORE,
     )
 
     # 媒体推送
@@ -626,7 +658,11 @@ def main(args=None):
     set_media_notifier(_media_ready_notifier)
     start_media_worker(PORT_API, FILE_CURSOR)
 
-    FLASK_APP = web.main(PORT_API, PORT_TCP, pub_pem, PRI_KEY, IMGCAPTCHA, USER_CURSOR, FORUM_CURSOR, FILE_CURSOR, NOTIFICATION_CURSOR, MESSAGES_CURSOR, GROUP_CURSOR, INSTANT_CONTACT, STICKER_CURSOR)
+    FLASK_APP = web.main(
+        PORT_API, PORT_TCP, pub_pem, PRI_KEY, IMGCAPTCHA, USER_CURSOR, FORUM_CURSOR,
+        FILE_CURSOR, NOTIFICATION_CURSOR, MESSAGES_CURSOR, GROUP_CURSOR,
+        INSTANT_CONTACT, STICKER_CURSOR, jwt_key_store=JWT_KEY_STORE,
+    )
     start_api = args.start_api
     if not args.cli_mode:
         prt("注意：生产环境内不适合显式启动 api 服务器！", "yellow")

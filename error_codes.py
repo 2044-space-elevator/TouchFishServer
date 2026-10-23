@@ -78,6 +78,8 @@ ERRORS = {
     "external_token_invalid": ("EXTERNAL_TOKEN_INVALID", "External token is invalid", 401),
     "external_not_linked": ("EXTERNAL_NOT_LINKED", "External identity is not linked to a local account", 403),
     "external_already_linked": ("EXTERNAL_ALREADY_LINKED", "External identity is already linked", 409),
+    "register_disabled": ("REGISTER_DISABLED", "Registration is disabled on this server", 403),
+    "platform_not_configured": ("PLATFORM_NOT_CONFIGURED", "External auth platform is not configured", 400),
     "Server error": ("SERVER_ERROR", "Internal server error", 500),
 }
 

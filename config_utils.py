@@ -113,6 +113,12 @@ SETTINGS_SPEC = [
     {"key": "smtp_use_ssl", "type": "bool", "default": True, "category": "smtp"},
     {"key": "reverse_proxy_enabled", "type": "bool", "default": False, "category": "network"},
     {"key": "proxy_count", "type": "int", "min": 0, "default": 1, "category": "network"},
+    {"key": "allow_register", "type": "bool", "default": True, "category": "security"},
+    {"key": "external_auth_url", "type": "str", "default": "", "category": "security"},
+    {"key": "platform_auth_enabled", "type": "bool", "default": False, "category": "security"},
+    {"key": "platform_auth_issuer", "type": "str", "default": "", "category": "security"},
+    {"key": "platform_auth_allow_ips", "type": "str", "default": "127.0.0.1,::1", "category": "security"},
+    {"key": "platform_auth_shared_token", "type": "str", "default": "", "category": "security"},
     {"key": "features", "type": "object", "default": FEATURE_DEFAULTS, "category": "features"},
 ]
 

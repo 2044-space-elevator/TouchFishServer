@@ -21,6 +21,13 @@
     },
     "email_activate" : <is_email_activate>,
     "external_login_issuers" : [<iss>, ...],
+    "external_auth_url" : "https://auth.example.touchfish.xin",
+    "allow_register" : <true_or_false>,
+    "platform_auth_enabled" : <true_or_false>,
+    "jwt_signing_algorithm" : <jwt_signing_algorithm>,
+    "jwt_issuer" : <jwt_issuer>,
+    "jwt_jwks_uri" : <jwt_jwks_uri>,
+    "jwt_jwks_enabled" : <true_or_false>,
     "file_last_time" : <file_last_time>,
     "groups_limit" : <groups_limit>,
     "max_file_size" : <max_file_size>,
@@ -67,6 +74,22 @@ Example:
 configuration to publish TURN servers.
 
 `external_login_issuers` 为已配置的外部登录签发方 `iss` 列表（仅标识，不含任何密钥）；为空数组表示服务器未启用外部平台登录。详见[账号文档](auth.md)的「第三方签发（外部平台登录）」。
+
+`external_auth_url` 为外部登录平台（TouchFish Auth）的基址，例如 `https://auth.example.touchfish.xin`；空字符串表示未配置。
+**客户端的外部登录发现流程依赖该字段**：先读它，再请求 `{external_auth_url}/.well-known/auth-config` 获取登录方式清单；
+为空时应隐藏「用外部平台登录」入口，而不是硬编码地址。
+
+`allow_register` 表示本服是否允许自助注册（默认 `true`）。为 `false` 时 `POST /auth/register` 返回 `REGISTER_DISABLED`，
+外部平台也应据此拒绝新账户的开通。客户端应隐藏注册入口。
+
+`platform_auth_enabled` 表示是否启用平台专用端点（`/auth/platform/*`，见[账号文档](auth.md)）。
+该字段只表示开关状态，不泄露白名单与令牌等安全配置。
+
+`jwt_signing_algorithm` 为本服当前签发 access token 的算法（默认 `HS256`；配置非对称算法后为 `RS256`/`ES256` 等）。
+`jwt_issuer` 为 token 的 `iss`；`jwt_jwks_uri` 为可供外部平台验签的 JWKS 地址（绝对 URL）；
+`jwt_jwks_enabled` 表示 JWKS 端点是否开放；关闭时 `jwt_jwks_uri` 为空字符串。
+HS256 模式下 JWKS 为空数组，属正常现象。
+详见[账号文档](auth.md)的「本服作为签发方（非对称 JWT / JWKS / Discovery）」。
 
 `features` 为服务器功能开关的当前值（在实例 config.json 的 `features` 中配置，缺省全部开启）。
 按设计，细分开关关闭后对应写操作会被服务端拒绝（错误码 `FEATURE_DISABLED_*`），客户端应据此隐藏入口；

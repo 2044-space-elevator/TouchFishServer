@@ -143,7 +143,16 @@ def add_config_routes(app, user_cursor, jwt_secret):
 
 
 def resolve_auth_for_admin(content, user_cursor, jwt_secret):
-    """管理员权限验证"""
+    """管理员权限验证
+
+    .. deprecated:: do not use this
+
+    注意：这里只调 `jwt_tool.verify_token`（HS256）
+    一旦实例切换到非对称算法
+    （`jwt_signing_algorithm` = RS256/ES256 …）
+    HS256 验签 BOOM
+    真要启用，请改用 `web.resolve_auth` 那套按 kid 选钥的逻辑。
+    """
     token = content.get("token")
     if not token:
         return False, {"error": "authentication_required"}

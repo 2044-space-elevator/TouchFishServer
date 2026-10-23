@@ -16,6 +16,7 @@ from collections import defaultdict
 from mention_utils import resolve_mentioned_uids, should_alert, alert_from_preference
 from config_utils import get_features
 import jwt_tool
+import jwt_keys
 
 async def to_thread(func, *args, **kwargs):
     loop = asyncio.get_running_loop()
@@ -70,7 +71,7 @@ class InstantConnect():
     SEND_QUEUE_LIMIT = 256
 
     def __init__(self, port_api, port_tcp, notification_cursor, user_cursor, messages_cursor,
-                 group_cursor, file_cursor=None, jwt_secret=None):
+                 group_cursor, file_cursor=None, jwt_secret=None, jwt_key_store=None):
         self.port_api = port_api
         self.port_tcp = port_tcp
         self.notification_cursor = notification_cursor
@@ -85,7 +86,12 @@ class InstantConnect():
         self.messages_cursor = messages_cursor
         self.file_cursor = file_cursor
         self.jwt_secret = jwt_tool.load_secret(port_api) if jwt_secret is None else jwt_secret
+        self.jwt_key_store = (
+            jwt_keys.KeyStore("res/{}/secret".format(port_api))
+            if jwt_key_store is None else jwt_key_store
+        )
         self.legacy_auth_enabled = True
+        self.external_issuers = []
         self._load_config()
         self.aes_key = dict()
         self.pri_key = crypto.load_pri("res/{}/secret/pri.pem".format(port_api))
@@ -180,23 +186,43 @@ class InstantConnect():
         返回 (uid, jti, sid) 或 None。
         """
         def _check():
-            payload = jwt_tool.verify_token(self.jwt_secret, token)
+            # 本服签发 token：HS* 用 jwt_secret，非对称用密钥环（按 kid 选钥）
+            payload = jwt_tool.verify_local_token(
+                self.jwt_secret, token, self.jwt_key_store
+            )
+            if payload is not None:
+                try:
+                    uid = int(payload.get("sub"))
+                except (TypeError, ValueError):
+                    return None
+                jti = payload.get("jti")
+                sid = payload.get("sid")
+                if not sid:
+                    return None
+                row = self.user_cursor.resolve_session_identity(uid, jti, sid)
+                if row is None:
+                    return None
+                if int(row[1]) != int(payload.get("av", -1)):
+                    return None
+                return (uid, jti, sid)
+
+            # 外部签发 token：与 HTTP 旧版直接接受路径保持一致（sub 必须是本地 uid 且 av 匹配）。
+            # 推荐仍先走 /auth/external/login 换成本地会话 token 再连 WS。
+            if not self.external_issuers:
+                return None
+            payload = jwt_tool.verify_external_token(token, self.external_issuers)
             if payload is None:
                 return None
             try:
                 uid = int(payload.get("sub"))
             except (TypeError, ValueError):
                 return None
-            jti = payload.get("jti")
-            sid = payload.get("sid")
-            if not sid:
+            if not self.user_cursor.uid_query(uid):
                 return None
-            row = self.user_cursor.resolve_session_identity(uid, jti, sid)
-            if row is None:
+            auth_version = self.user_cursor.get_auth_version(uid)
+            if int(payload.get("av", -1)) != int(auth_version):
                 return None
-            if int(row[1]) != int(payload.get("av", -1)):
-                return None
-            return (uid, jti, sid)
+            return (uid, payload.get("jti"), payload.get("sid"))
         return to_thread(_check)
 
     def _check_ws_rate(self, uid: int, max_per_second: int = 10, bucket: str = "msg") -> bool:
@@ -223,6 +249,8 @@ class InstantConnect():
                 cfg = {}
         self.max_message_length = cfg.get("max_message_length", 10000)
         self.legacy_auth_enabled = bool(cfg.get("legacy_auth_enabled", True))
+        raw_issuers = cfg.get("jwt_external_issuers")
+        self.external_issuers = raw_issuers if isinstance(raw_issuers, list) else []
         self.features = get_features(cfg)
         rtc_cfg = cfg.get("rtc", {})
         self.rtc_turn_enabled = bool(rtc_cfg.get("turn_enabled", False)) if isinstance(rtc_cfg, dict) else False
