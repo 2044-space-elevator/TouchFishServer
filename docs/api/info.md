@@ -22,6 +22,7 @@
     "email_activate" : <is_email_activate>,
     "external_login_issuers" : [<iss>, ...],
     "external_auth_url" : "https://auth.example.touchfish.xin",
+    "external_auth_providers" : [{"id": "github", "name": "GitHub"}],
     "allow_register" : <true_or_false>,
     "platform_auth_enabled" : <true_or_false>,
     "jwt_signing_algorithm" : <jwt_signing_algorithm>,
@@ -78,6 +79,13 @@ configuration to publish TURN servers.
 `external_auth_url` 为外部登录平台（TouchFish Auth）的基址，例如 `https://auth.example.touchfish.xin`；空字符串表示未配置。
 **客户端的外部登录发现流程依赖该字段**：先读它，再请求 `{external_auth_url}/.well-known/auth-config` 获取登录方式清单；
 为空时应隐藏「用外部平台登录」入口，而不是硬编码地址。
+
+`external_auth_providers` 是认证平台当前可用的**第三方登录方式**（如 GitHub），由本服务代为拉取
+`{external_auth_url}/api/site` 的 `oauth_providers` 后下发，**成功缓存 60 秒、失败缓存 30 秒**。
+
+
+客户端应据此渲染 GitHub 登录等按钮。
+
 
 `allow_register` 表示本服是否允许自助注册（默认 `true`）。为 `false` 时 `POST /auth/register` 返回 `REGISTER_DISABLED`，
 外部平台也应据此拒绝新账户的开通。客户端应隐藏注册入口。

@@ -32,6 +32,7 @@ from json_store import read_json, update_json
 from datetime import datetime
 from file_types import IMAGE_TYPES, detect_file_type, is_sticker_type
 import oss_store
+import external_auth_providers
 from sync_limits import SYNC_MAX_LIMIT, parse_sync_missing_sequences
 from error_codes import legacy_bool_text
 
@@ -633,6 +634,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 if isinstance(cfg.get("external_auth_url"), str) else ""
             ),
             "platform_auth_enabled" : bool(cfg.get("platform_auth_enabled", False)),
+            # 认证平台支持的第三方登录方式，由服务器代拉取后下发（60s 缓存）。
+            # 客户端据此渲染 GitHub 等按钮，无需自己访问认证平台。
+            "external_auth_providers" : external_auth_providers.providers(
+                cfg.get("external_auth_url") if isinstance(cfg.get("external_auth_url"), str) else ""
+            ),
             "allow_register" : bool(cfg.get("allow_register", True)),
             "default_asset_urls" : {
                 "logo" : "/avatar/get_logo",
@@ -1166,7 +1172,32 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
               "当前仅靠 IP 白名单鉴权，启用反向代理后 X-Forwarded-For 可被伪造，"
               "建议配置共享令牌（openssl rand -hex 32）")
 
+    def warn_external_login_entry():
+        try:
+            cfg = read_config()
+        except Exception:  # noqa: BLE001
+            return
+        if not bool(cfg.get("platform_auth_enabled", False)):
+            return
+        url = cfg.get("external_auth_url")
+        if not (isinstance(url, str) and url.strip()):
+            issuer = cfg.get("platform_auth_issuer")
+            hint = f"当前 platform_auth_issuer={issuer!r} 只用于校验令牌签发者" \
+                if isinstance(issuer, str) and issuer else ""
+            print("[WARN] platform_auth_enabled=true 但未设置 external_auth_url："
+                  "客户端将不会显示 使用 TouchFish Auth 登录 入口。"
+                  f"{hint}，客户端需要的是可访问的授权平台地址，"
+                  "请在 server_settings 里填写 external_auth_url")
+            return
+        issuers = cfg.get("jwt_external_issuers")
+        if not isinstance(issuers, list) or not issuers:
+            print("[WARN] external_auth_url 已配置，但 jwt_external_issuers 为空，无法使用"
+                  f"请在 jwt_external_issuers 里加一条 iss={url!r} 的配置"
+                  "（jwks_uri 指向该平台的 /.well-known/jwks.json，"
+                  "本地 http 调试请加入 allow_insecure_http=true）")
+
     warn_platform_security()
+    warn_external_login_entry()
 
     @app.before_request
     def enforce_request_limits():
