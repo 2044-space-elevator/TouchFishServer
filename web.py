@@ -10,6 +10,7 @@ import os
 import secrets
 import hmac
 import ipaddress
+import re
 from db import *
 from db.user import (
     USERS_COL_PUBLIC_EMAIL,
@@ -142,6 +143,14 @@ def _positive_int(value):
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
+
+
+_HASH_PATTERN = re.compile(r'^[0-9a-fA-F]{8,128}$')
+
+
+def is_valid_file_hash(hashes) -> bool:
+    """校验文件 hash"""
+    return isinstance(hashes, str) and bool(_HASH_PATTERN.match(hashes))
 
 
 def request_body_limit(cfg):
@@ -288,7 +297,19 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if uid is None or pwd is None:
             return True, (None, False)
         if content.get("jwt"):
-            # JWT login！login！
+            if not content.get("token"):
+                if not read_config().get("legacy_auth_enabled", True):
+                    return False, {"error": "auth_failed"}
+                # 旧版认证
+                if not user_cursor.verify_user(uid, pwd):
+                    return False, {"error": "auth_failed"}
+                row = user_cursor.uid_query(uid)
+                if not row:
+                    return False, {"error": "auth_failed"}
+                identity = {"uid": int(uid), "stat": row[0][4]}
+                flask_g.auth_identity = identity
+                return True, (identity, True)
+            # 带 token
             return True, (None, False)
         if not read_config().get("legacy_auth_enabled", True):
             return False, {"error": "auth_failed"}
@@ -473,6 +494,22 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         except Exception as e:
             print("[WARN] 副作用失败({}): {}".format(action, e))
             return None
+
+    def run_critical_side_effect(action : str, callback) -> bool:
+        """安全关键副作用：失败必须让调用方感知，不能静默吞掉。
+
+        用于「吊销会话 / 封禁 / 删除账号」这类必须断开 WebSocket 的场景：
+        断连失败时若仍返回 success，调用方（前端）会认为操作已完成，
+        而被封禁/吊销的用户其实还能通过已建立的 WS 长连接继续收发消息
+        （WS 不会重新校验 auth_version）。
+        返回 False 表示副作用失败，调用方应把失败如实回传给客户端。
+        """
+        try:
+            result = callback()
+            return result is not False
+        except Exception as e:
+            print("[ERR] 关键副作用失败({}): {}".format(action, e))
+            return False
 
     def run_notification_side_effect(action : str, callback):
         return run_side_effect("notification/{}".format(action), callback)
@@ -1096,10 +1133,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         # 吊销全部 JWT；封禁时把人家的 WebSocket 全部使用尖头靴子踢掉
         user_cursor.bump_auth_version(target_uid)
         if new_auth == "banned":
-            run_side_effect(
+            if not run_critical_side_effect(
                 "disconnect_banned_user",
                 lambda: instant_contact.disconnect_user(target_uid)
-            )
+            ):
+                return False
 
         notify_user(target_uid, "auth.stat.changed", "账号状态已变更", "你的账号状态已更新为 {}。".format(new_auth), sender=uid, meta={"new_auth" : new_auth})
         return True
@@ -1337,7 +1375,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             oldest_sid = user_cursor.get_oldest_session(uid)
             if oldest_sid:
                 user_cursor.revoke_session(oldest_sid, uid)
-                run_side_effect(
+                run_critical_side_effect(
                     "disconnect_session_owner",
                     lambda: instant_contact.disconnect_session(oldest_sid)
                 )
@@ -1658,10 +1696,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if not user_cursor.session_is_active(session_id, uid):
             return {"error": "not_found"}
         user_cursor.revoke_session(session_id, uid)
-        run_side_effect(
+        if not run_critical_side_effect(
             "disconnect_session_owner",
             lambda: instant_contact.disconnect_session(session_id)
-        )
+        ):
+            return {"error": "unavailable"}
         return {"success": True}
 
     @api("/auth/sessions/revoke_all", methods=["POST"])
@@ -1679,20 +1718,25 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if target_uid is not None:
             # 管理员操作目标用户：吊销其全部会话
             user_cursor.revoke_sessions(uid)
-            run_side_effect(
+            if not run_critical_side_effect(
                 "disconnect_user_owner",
                 lambda: instant_contact.disconnect_user(uid)
-            )
+            ):
+                return {"error": "unavailable"}
             return {"success": True}
         # 普通用户：吊销除当前会话外的全部会话
+        disconnect_failed = False
         for session_id, *_rest in user_cursor.list_sessions(uid):
             if session_id == current_sid:
                 continue
             user_cursor.revoke_session(session_id, uid)
-            run_side_effect(
+            if not run_critical_side_effect(
                 "disconnect_session_owner",
                 lambda sid=session_id: instant_contact.disconnect_session(sid)
-            )
+            ):
+                disconnect_failed = True
+        if disconnect_failed:
+            return {"error": "unavailable"}
         return {"success": True}
 
     @api("/auth/sessions/rename", methods=["POST"])
@@ -1776,10 +1820,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if not user_cursor.session_is_active(session_id, uid):
             return {"error": "not_found"}
         user_cursor.revoke_session(session_id, uid)
-        run_side_effect(
+        if not run_critical_side_effect(
             "disconnect_session_owner",
             lambda: instant_contact.disconnect_session(session_id)
-        )
+        ):
+            return {"error": "unavailable"}
         return {"success": True}
 
     @api("/auth/logout", methods=["POST"])
@@ -1793,7 +1838,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         sid = identity.get("sid")
         if sid:
             user_cursor.revoke_session(sid, identity["uid"])
-            run_side_effect(
+            run_critical_side_effect(
                 "disconnect_session_owner",
                 lambda: instant_contact.disconnect_session(sid)
             )
@@ -1856,16 +1901,20 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if not isinstance(device_id, str) or not device_id:
             return {"error": "invalid_request"}
         sessions_revoked = 0
+        disconnect_failed = False
         for row in user_cursor.list_sessions(uid):
             session_id = row[0]
             sess_device_id = row[7]
             if sess_device_id == device_id:
                 user_cursor.revoke_session(session_id, uid)
-                run_side_effect(
+                if not run_critical_side_effect(
                     "disconnect_session_owner",
                     lambda sid=session_id: instant_contact.disconnect_session(sid)
-                )
+                ):
+                    disconnect_failed = True
                 sessions_revoked += 1
+        if disconnect_failed:
+            return {"error": "unavailable"}
         return {"success": True, "sessions_revoked": sessions_revoked}
 
     @api("/auth/validate", methods=["POST"])
@@ -2258,10 +2307,11 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             if "password" in updates or next_auth is not None:
                 user_cursor.bump_auth_version(target_uid)
             if next_auth == "banned":
-                run_side_effect(
+                if not run_critical_side_effect(
                     "disconnect_banned_user",
                     lambda: instant_contact.disconnect_user(target_uid)
-                )
+                ):
+                    return bool_res()[False]
 
             if next_auth is not None:
                 notify_user(target_uid, "auth.stat.changed", "账号状态已变更", "你的账号状态已更新为 {}。".format(next_auth), sender=uid, meta={"new_auth" : next_auth})
@@ -2302,10 +2352,13 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
             user_cursor.delete_tokens(target_uid)
 
-            run_side_effect(
+            # 断连失败必须让调用方知道：账号已从 DB 删除，
+            # 但残留的 WS 连接还能继续收发消息。
+            if not run_critical_side_effect(
                 "disconnect_deleted_user",
                 lambda: instant_contact.disconnect_user(target_uid)
-            )
+            ):
+                return bool_res()[False]
             run_side_effect(
                 "clean_deleted_user_state",
                 lambda: clean_deleted_user_state(target_uid)
@@ -3045,6 +3098,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     def _read_blob_head(kind, hashes, length=4096):
         """读取 blob 的 (总大小, 头部字节)"""
+        if not is_valid_file_hash(hashes):
+            return None
         target = file.sticker_path(port_api, hashes) if kind == "sticker" else file.file_path(port_api, hashes)
         if os.path.isfile(target):
             try:
@@ -3058,6 +3113,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     def _read_blob_bytes(kind, hashes):
         """完整读取 blob 内容（仅用于 ≤10MB 的 gzip/tgs 嗅探回退）。"""
+        if not is_valid_file_hash(hashes):
+            return None
         target = file.sticker_path(port_api, hashes) if kind == "sticker" else file.file_path(port_api, hashes)
         if os.path.isfile(target):
             try:
@@ -4398,6 +4455,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     @app.route('/file/get_file_info/<hashes>')
     def get_file_info(hashes):
+        if not is_valid_file_hash(hashes):
+            return {}
         metadata = file_metadata(hashes)
         if metadata is None:
             return {}
@@ -4409,6 +4468,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     @app.route("/file/get_file/<hashes>")
     def get_file(hashes : str):
+        if not is_valid_file_hash(hashes):
+            return ("", 404)
         if not file_cursor.file_exists(hashes):
             return ("", 404)
         metadata = file_metadata(hashes) or {}
@@ -4453,6 +4514,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
     @app.route("/file/get_thumbnail/<hashes>")
     def get_thumbnail(hashes : str):
         """缩略图"""
+        if not is_valid_file_hash(hashes):
+            return ("", 404)
         media = file_cursor.get_media(hashes)
         if media is None or media["status"] != "done":
             return ("", 404)
@@ -4557,6 +4620,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
 
     @app.route("/sticker/get/<hashes>")
     def get_sticker(hashes : str):
+        if not is_valid_file_hash(hashes):
+            return ("", 404)
         if sticker_cursor is None:
             return ("", 404)
         info = sticker_cursor.get_sticker_file_info(hashes)
