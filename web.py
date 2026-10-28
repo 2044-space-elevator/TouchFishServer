@@ -1441,6 +1441,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         payload = jwt_tool.verify_external_token(external_token, external_issuers)
         if payload is None:
             return None, None
+        # 只接受 TFV5 token，第三方 OAuth token无法使用（来源于 https://github.com/ILoveScratch2/TouchFish-Auth ）
+        token_use = payload.get("token_use")
+        if token_use not in (None, "tfv5"):
+            return None, None
         iss = payload.get("iss")
         sub = payload.get("sub")
         if not isinstance(iss, str) or not iss or not isinstance(sub, str) or not sub:
