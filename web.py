@@ -2906,6 +2906,22 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return bool_res()[False]
         return bool_res()[notification_cursor.delete_events_before(uid, time_stamp)]
 
+    @api("/notification/delete_ids", methods=['POST'])
+    def delete_notifications_by_ids(req):
+        uid = req["uid"]
+        password = req["password"]
+        if not verify_user(uid, password):
+            return bool_res()[False]
+        raw_ids = req.get("ids")
+        if isinstance(raw_ids, str):
+            # 兼容逗号
+            raw_ids = [part for part in raw_ids.split(",") if part.strip()]
+        if not isinstance(raw_ids, list):
+            return bool_res()[False]
+        # ²=！
+        notification_cursor.delete_event_ids(uid, raw_ids)
+        return bool_res()[True]
+
     @api("/notification/delete_all", methods=['POST'])
     def delete_all_notifications(req):
         uid = req["uid"]
@@ -3722,7 +3738,18 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         user_stat = user_row[4]
         if not (user_stat in ["admin", "root"] or uid == creater):
             return bool_res()[False]
-        return bool_res()[forum_cursor.pin_post(fid, pid)]
+        post_info = query_post(fid, pid)
+        pinned = forum_cursor.pin_post(fid, pid)
+        # 自己置顶自己的帖子不通知
+        if pinned and post_info:
+            author_uid = post_info[0][3]
+            if author_uid != uid:
+                notify_user(
+                    author_uid, "forum.post.pinned", "你的帖子已被置顶",
+                    "你的帖子《{}》已被版主置顶。".format(post_info[0][2]),
+                    sender=uid, meta={"fid": fid, "pid": pid}
+                )
+        return bool_res()[pinned]
 
     @api("/forum/unpin_post", methods=["POST"], feature=("forum",))
     def unpin_post(req):

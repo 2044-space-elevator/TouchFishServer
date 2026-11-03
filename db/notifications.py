@@ -412,6 +412,37 @@ CREATE TABLE IF NOT EXISTS notification_meta (
             )
         return len(target_ids)
 
+    def delete_event_ids(self, uid: int, ids) -> int:
+        """按 id 删除指定通知，返回实际删除条数
+        """
+        uid = int(uid)
+        safe_ids = []
+        for item in ids or []:
+            try:
+                nid = int(item)
+            except (TypeError, ValueError):
+                continue
+            if nid > 0:
+                safe_ids.append(nid)
+        if not safe_ids:
+            return 0
+        placeholders = ",".join("?" * len(safe_ids))
+        before = self.query(
+            "SELECT COUNT(*) FROM notifications WHERE uid = ? AND id IN ({})".format(
+                placeholders
+            ),
+            tuple([uid] + safe_ids),
+        )
+        removed = before[0][0] if before else 0
+        if removed:
+            self.execute(
+                "DELETE FROM notifications WHERE uid = ? AND id IN ({})".format(
+                    placeholders
+                ),
+                tuple([uid] + safe_ids),
+            )
+        return removed
+
     def delete_all_events(self, uid: int) -> bool:
         uid = int(uid)
         self.execute("DELETE FROM notifications WHERE uid = ?", (uid,))
