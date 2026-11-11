@@ -5,3 +5,5 @@ from db.notifications import *
 from db.group import *
 from db.messages import *
 from db.sticker import *
+from db.tickets import *
+from db.punishments import *

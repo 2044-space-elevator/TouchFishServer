@@ -66,12 +66,33 @@ def can_access_room(user_cursor, group_cursor, uid: int, room_id: str) -> bool:
         return group_cursor.is_member(target_id, uid)
     return False
 
+def content_block(punishments_cursor, uid: int, user_stat):
+    """内容写 WS（ban you!）
+    """
+    if user_stat == "pending":
+        return "pending_activation"
+    if user_stat == "banned":
+        return "account_banned"
+    if punishments_cursor is None:
+        return None
+    active = punishments_cursor.active_restriction(uid)
+    if active is None:
+        return None
+    kind = active[2]
+    if kind == "ban":
+        return "account_banned"
+    if kind == "mute":
+        return "account_muted"
+    return None
+
+
 class InstantConnect():
     # 单个连接队列上限
     SEND_QUEUE_LIMIT = 256
 
     def __init__(self, port_api, port_tcp, notification_cursor, user_cursor, messages_cursor,
-                 group_cursor, file_cursor=None, jwt_secret=None, jwt_key_store=None):
+                 group_cursor, file_cursor=None, jwt_secret=None, jwt_key_store=None,
+                 punishments_cursor=None):
         self.port_api = port_api
         self.port_tcp = port_tcp
         self.notification_cursor = notification_cursor
@@ -85,6 +106,7 @@ class InstantConnect():
         self.group_cursor = group_cursor
         self.messages_cursor = messages_cursor
         self.file_cursor = file_cursor
+        self.punishments_cursor = punishments_cursor
         self.jwt_secret = jwt_tool.load_secret(port_api) if jwt_secret is None else jwt_secret
         self.jwt_key_store = (
             jwt_keys.KeyStore("res/{}/secret".format(port_api))
@@ -964,9 +986,16 @@ class InstantConnect():
 
                 if message['type'] in ("message.plain", "message.file"):
                     info = await to_thread(self.user_cursor.uid_query, sender_uid)
-                    if not info or info[0][4] == 'banned':
-                        self._queue_ack(websocket, message.get('client_mid'), status="failed", error="banned")
-                        break
+                    block = await to_thread(
+                        content_block, self.punishments_cursor,
+                        sender_uid, info[0][4] if info else "unknown")
+                    if block is not None:
+                        self._queue_ack(websocket, message.get('client_mid'),
+                                        status="failed", error=block)
+                        # 封禁直接断开；禁言只拒这一条，连接保留
+                        if block == "account_banned":
+                            break
+                        continue
 
                     if not self._check_ws_rate(sender_uid):
                         self._queue_ack(websocket, message.get('client_mid'), status="failed", error="rate_limited")

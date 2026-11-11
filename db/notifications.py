@@ -270,6 +270,20 @@ CREATE TABLE IF NOT EXISTS notification_meta (
             (uid, time_stamp),
         )
 
+    def query_events_before(self, uid: int, time_stamp, limit: int = 50):
+        """
+        取更早的通知
+        """
+        uid = int(uid)
+        rows = self.query(
+            "SELECT id, time_stamp, read_at, info FROM notifications "
+            "WHERE uid = ? AND (kind IS NULL OR kind = 0) AND time_stamp < ? "
+            "ORDER BY time_stamp DESC, id DESC LIMIT ?",
+            (uid, float(time_stamp), int(limit)),
+        )
+        rows.reverse()
+        return rows
+
     def query_all_events(self, uid: int, limit: int = None, offset: int = 0):
         return self.query_events_after(
             uid, 0, limit=limit, offset=offset)

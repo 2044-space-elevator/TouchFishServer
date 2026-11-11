@@ -14,6 +14,11 @@ FEATURE_DEFAULTS = {
     "sticker": True,
     "announcement": True,
     "presence": True,
+    "tickets": {
+        "report": True,
+        "consult": True,
+        "appeal": True,
+    },
 }
 
 

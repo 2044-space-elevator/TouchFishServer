@@ -18,6 +18,7 @@ from db.user import (
     USERS_COL_SHOW_ONLINE_STATUS,
 )
 import avatar
+import notification_locks
 import file
 
 import announcements
@@ -155,11 +156,6 @@ def is_valid_file_hash(hashes) -> bool:
 
 def request_body_limit(cfg):
     """单个请求的请求体上限。
-
-    由「一次请求最多能带多少原始 payload」反推：单文件上传受 max_file_size、
-    贴纸/头像分别受 max_sticker_size / max_avatar_size 限制，分块上传的每个
-    分块受 file.MAX_CHUNK_SIZE 限制——任意一项大于上限都会变成 413。
-    配置项 max_request_body_size 可显式覆盖。
     """
     override = cfg.get("max_request_body_size")
     if isinstance(override, int) and not isinstance(override, bool) and override > 0:
@@ -223,7 +219,7 @@ def show_online_status_visible(row) -> bool:
     value = row[index] if len(row) > index else 1
     return value is None or bool(value)
 
-def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, forum_cursor, file_cursor, notification_cursor, messages_cursor, group_cursor, instant_contact, sticker_cursor=None, jwt_secret=None, jwt_key_store=None):
+def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, forum_cursor, file_cursor, notification_cursor, messages_cursor, group_cursor, instant_contact, sticker_cursor=None, jwt_secret=None, jwt_key_store=None, tickets_cursor=None, punishments_cursor=None):
     """
     pri 是 cryptography 库的私钥对象
     pub_pem 是二进制 pem 文件路径
@@ -345,7 +341,37 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                            feature_checker=lambda path: feature_gate(read_config(), *path))
     limiter = RateLimiter(port_api)
     manager_auths = {"admin", "root"}
-    managed_auths = {"user", "banned", "admin", "root"}
+    managed_auths = {"user", "banned", "pending", "admin", "root"}
+    # 受限状态：
+    # pending = 邮箱未激活，banned = 被封禁
+    # 现在我们有区别了
+    _BLOCKED_STATS = {"banned", "pending"}
+
+    def _active_ban(uid):
+        """当前生效的封禁"""
+        if punishments_cursor is None:
+            return None
+        return punishments_cursor.active_ban(uid)
+
+    def _content_block(uid, user_stat):
+        if user_stat == "pending":
+            return "pending_activation"
+        if user_stat == "banned":
+            _sweep_legacy_ban(uid)
+            row = user_cursor.uid_query(uid)
+            user_stat = row[0][4] if row else user_stat
+            if user_stat == "banned":
+                return "account_banned"
+        punishment = punishments_cursor.active_restriction(uid) \
+            if punishments_cursor is not None else None
+        if punishment is None:
+            return None
+        kind = punishment[2]
+        if kind == "ban":
+            return "account_banned"
+        if kind == "mute":
+            return "account_muted"
+        return None
     locks = {
         'config': threading.Lock(),
         'activate': threading.Lock(),
@@ -872,7 +898,19 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return []
 
     def serialize_notifications(rows):
-        return json.dumps(notification_cursor.serialize_rows(rows), ensure_ascii=False)
+        serialized = notification_locks.apply_punishment_locks(
+            notification_cursor.serialize_rows(rows), punishments_cursor)
+        return json.dumps(serialized, ensure_ascii=False)
+
+    def _locked_notification_ids(uid):
+        """当前不可删除的通知"""
+        if punishments_cursor is None:
+            return set()
+        serialized = notification_locks.apply_punishment_locks(
+            notification_cursor.serialize_rows(
+                notification_cursor.query_events_after(uid, 0)),
+            punishments_cursor)
+        return notification_locks.locked_ids(serialized)
 
     def get_user_row(uid):
         info = user_cursor.uid_query(uid)
@@ -1346,6 +1384,18 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         """
         if not verify_user(uid, pwd):
             return {"error": "auth_failed"}
+        row = user_cursor.uid_query(uid)
+        if row and row[0][4] == "pending":
+            # 独立错误码：客户端据此跳激活页，而不是显示"账号被封禁"
+            return {"error": "pending_activation"}
+        # 先清历史遗留的 banned 再判定：旧数据的封禁状态没有对应处罚记录，
+        # 若不在登录入口清理，这些账号既登不进来、也进不到能触发清理的页面。
+        if row and row[0][4] == "banned":
+            _sweep_legacy_ban(uid)
+            row = user_cursor.uid_query(uid)
+        if _active_ban(uid) is not None or (row and row[0][4] == "banned"):
+            # 封禁以处罚表为准；users.stat='banned' 只用于兼容历史数据
+            return {"error": "account_banned"}
         return create_session_for_user(uid, device_id, device_name, platform)
 
     def create_session_for_user(uid, device_id=None, device_name=None, platform=0):
@@ -1438,6 +1488,10 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
          revoked_at, _ip, _ua, _device_id, _location) = row
         if revoked_at is not None or expires_at <= now:
             return {"error": "auth_failed"}
+        # 封禁必须能打断续期：只拦登录的话，封禁前建立的会话
+        # 可以靠 refresh 一直续下去（默认 7 天），等于没封。
+        if _active_ban(uid) is not None:
+            return {"error": "account_banned"}
         auth_version = user_cursor.get_auth_version(uid)
 
         new_refresh_token = secrets.token_hex(32)
@@ -1565,7 +1619,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         row = user_cursor.uid_query(uid)
         if not row:
             return {"error": "external_token_invalid"}
-        if row[0][4] == "banned":
+        if row[0][4] in _BLOCKED_STATS:
             return {"error": "user_banned"}
         return create_session_for_user(
             uid, req.get("device_id"), req.get("device_name"), req.get("platform", 0)
@@ -1942,6 +1996,15 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if not info:
             return json.dumps({"success": False, "error": "not_found"})
         row = info[0]
+        restriction = None
+        if punishments_cursor is not None:
+            active = punishments_cursor.active_restriction(uid)
+            if active is not None and active[2] in ("ban", "mute"):
+                restriction = {
+                    "kind": active[2],
+                    "reason": active[3],
+                    "expires_at": active[6],
+                }
         return json.dumps({
             "uid": row[0],
             "username": row[1],
@@ -1953,6 +2016,8 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             "public_email": public_email_visible(row),
             "show_read_status": show_read_status_visible(row),
             "show_online_status": show_online_status_visible(row),
+            # 当前生效的禁言/封禁，客户端据此提前告知用户，而不是等提交失败
+            "restriction": restriction,
         }, ensure_ascii=False)
 
     @api("/auth/change_pwd", methods=["POST"])
@@ -2114,7 +2179,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             return bool_res()[False]
         target_uid = user_cursor.username_query(username)[0][0]
         if is_email_activate and succeeded:
-            user_cursor.change_auth(target_uid, "banned")
+            user_cursor.change_auth(target_uid, "pending")
         if not ensure_notification_table(target_uid):
             user_cursor.delete_user(target_uid)
             return bool_res()[False]
@@ -2151,7 +2216,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         uid_row = get_user_row(uid)
         if uid_row is None:
             return bool_res()[False]
-        if uid_row[4] != "banned":
+        if uid_row[4] not in _BLOCKED_STATS:
             # 已经激活过：不需要再发，按成功处理（幂等）
             return bool_res()[True]
         email = uid_row[2]
@@ -2882,6 +2947,23 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         return serialize_notifications(
             notification_cursor.query_all_events(uid, limit=limit, offset=offset))
 
+    @api("/notification/query_before", methods=['POST'])
+    def query_notifications_before(req):
+        """通知中心翻页"""
+        uid = req["uid"]
+        password = req["password"]
+        if not verify_user(uid, password):
+            return bool_res()[False]
+        try:
+            time_stamp = float(req["time_stamp"])
+            limit = int(req.get("limit", 50))
+        except (KeyError, TypeError, ValueError):
+            return bool_res()[False]
+        limit = max(1, min(limit, 200))
+        return serialize_notifications(
+            notification_cursor.query_events_before(
+                uid, time_stamp, limit=limit))
+
     @api("/notification/query_after", methods=['POST'])
     def query_notifications_after(req):
         uid = req["uid"]
@@ -2904,7 +2986,13 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             time_stamp = float(req["time_stamp"])
         except (KeyError, TypeError, ValueError):
             return bool_res()[False]
-        return bool_res()[notification_cursor.delete_events_before(uid, time_stamp)]
+        locked = _locked_notification_ids(uid)
+        rows = notification_cursor.query_events_after(uid, 0)
+        targets = [row[0] for row in rows
+                   if row[1] <= time_stamp and row[0] not in locked]
+        if targets:
+            notification_cursor.delete_event_ids(uid, targets)
+        return bool_res()[True]
 
     @api("/notification/delete_ids", methods=['POST'])
     def delete_notifications_by_ids(req):
@@ -2918,8 +3006,22 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             raw_ids = [part for part in raw_ids.split(",") if part.strip()]
         if not isinstance(raw_ids, list):
             return bool_res()[False]
-        # ²=！
-        notification_cursor.delete_event_ids(uid, raw_ids)
+        locked = _locked_notification_ids(uid)
+        keep = []
+        blocked = False
+        for item in raw_ids:
+            try:
+                nid = int(item)
+            except (TypeError, ValueError):
+                continue
+            if nid in locked:
+                blocked = True
+                continue
+            keep.append(nid)
+        if keep:
+            notification_cursor.delete_event_ids(uid, keep)
+        if blocked:
+            return {"success": False, "error": "punishment_locked"}
         return bool_res()[True]
 
     @api("/notification/delete_all", methods=['POST'])
@@ -2928,7 +3030,12 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         password = req["password"]
         if not verify_user(uid, password):
             return bool_res()[False]
-        return bool_res()[notification_cursor.delete_all_events(uid)]
+        locked = _locked_notification_ids(uid)
+        rows = notification_cursor.query_events_after(uid, 0)
+        targets = [row[0] for row in rows if row[0] not in locked]
+        if targets:
+            notification_cursor.delete_event_ids(uid, targets)
+        return bool_res()[True]
 
     @api("/notification/unread_count", methods=['POST'])
     def notification_unread_count(req):
@@ -3045,7 +3152,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         row = user_cursor.uid_query(uid)
         if not row:
             return {"error": "auth_failed"}
-        if row[0][4] == "banned":
+        if row[0][4] in _BLOCKED_STATS:
             return {"error": "user_banned"}
 
         existing = user_cursor.get_identity_uid(iss, sub)
@@ -3335,7 +3442,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if user_row is None:
             return bool_res()[False]
         user_stat = user_row[4]
-        if user_stat == 'banned':
+        if user_stat in _BLOCKED_STATS:
             return bool_res()[False]
         with locks['queue']:
             def enqueue(queue):
@@ -3536,8 +3643,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if user_row is None:
             return bool_res()[False]
         user_stat = user_row[4]
-        if user_stat == 'banned':
-            return bool_res()[False]
+        block = _content_block(uid, user_stat)
+        if block is not None:
+            return {"success": False, "error": block}
         if not query_forum(fid):
             return bool_res()[False]
         max_post = read_config().get("max_post_content_length", 20000)
@@ -3876,7 +3984,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if user_row is None:
             return bool_res()[False]
         user_stat = user_row[4]
-        if user_stat == 'banned':
+        if user_stat in _BLOCKED_STATS:
             return bool_res()[False]
         if not query_forum(fid):
             return bool_res()[False]
@@ -3924,8 +4032,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if user_row is None:
             return bool_res()[False]
         user_stat = user_row[4]
-        if user_stat == 'banned':
-            return bool_res()[False]
+        block = _content_block(uid, user_stat)
+        if block is not None:
+            return {"success": False, "error": block}
         try:
             fid = int(fid)
             pid = int(pid)
@@ -4011,6 +4120,564 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
                 "你在帖子中的评论已被其他用户删除。", sender=uid,
                 meta={"fid": fid, "pid": pid, "comment_time": time_stamp}
             )
+        return bool_res()[True]
+
+    _MAX_TICKET_ATTACHMENTS = 9
+
+    def _parse_attachment_hashes(raw):
+        """校验并登记工单附件
+        """
+        if raw is None:
+            return [], None
+        if not isinstance(raw, list):
+            return [], "invalid_attachments"
+        if len(raw) > _MAX_TICKET_ATTACHMENTS:
+            return [], "too_many_attachments"
+        hashes = []
+        for item in raw:
+            if not isinstance(item, str):
+                return [], "invalid_attachments"
+            value = item.strip()
+            if len(value) != 64 or not all(
+                    ch in "0123456789abcdefABCDEF" for ch in value):
+                return [], "invalid_attachments"
+            if value in hashes:
+                continue
+            hashes.append(value)
+        return hashes, None
+
+    def _attachment_payload(hashes):
+        if not hashes:
+            return []
+        media = {}
+        if file_cursor is not None:
+            try:
+                media = file_cursor.get_media_many(hashes) or {}
+            except Exception as error:
+                print("[ERR] 读取附件元数据失败: {}".format(error))
+        payload = []
+        for value in hashes:
+            info = media.get(value) or {}
+            payload.append({
+                "hash": value,
+                "width": info.get("width"),
+                "height": info.get("height"),
+                "blurhash": info.get("blurhash"),
+                "has_thumb": bool(info.get("thumb_width")) or bool(
+                    info.get("thumb_is_original")),
+            })
+        return payload
+
+    def _user_names(uids):
+        wanted = {int(u) for u in uids if u}
+        if not wanted:
+            return {}
+        placeholders = ",".join("?" * len(wanted))
+        try:
+            rows = user_cursor.query(
+                "SELECT uid, username FROM users WHERE uid IN ({})".format(
+                    placeholders),
+                tuple(wanted),
+            )
+        except Exception as error:
+            print("[ERR] 查询工单用户名失败: {}".format(error))
+            return {}
+        return {int(row[0]): row[1] for row in rows}
+
+    def _ticket_to_dict(row, names=None):
+        names = names or {}
+        return {
+            "id": row[0], "uid": row[1], "type": row[2],
+            "target_type": row[3], "target_id": row[4],
+            "title": row[5], "content": row[6], "status": row[7],
+            "handler_uid": row[8], "reply": row[9],
+            "created_at": row[10], "updated_at": row[11],
+            "priority": row[12], "assignee_uid": row[13],
+            "user_unread": row[14],
+            "attachments": _attachment_payload(
+                tickets_cursor.load_attachments(row[15]) if tickets_cursor else []
+            ),
+            "creator_name": names.get(int(row[1])),
+            "assignee_name": names.get(int(row[13])) if row[13] else None,
+        }
+
+    def _ticket_message_to_dict(row, names=None):
+        names = names or {}
+        return {
+            "id": row[0], "ticket_id": row[1], "sender_uid": row[2],
+            "content": row[3], "is_staff": bool(row[4]),
+            "created_at": row[5],
+            "attachments": _attachment_payload(
+                tickets_cursor.load_attachments(row[6]) if tickets_cursor else []
+            ),
+            "sender_name": names.get(int(row[2])),
+        }
+
+    def _tickets_payload(rows):
+        uids = []
+        for row in rows:
+            uids.append(row[1])
+            if row[13]:
+                uids.append(row[13])
+        names = _user_names(uids)
+        return [_ticket_to_dict(row, names) for row in rows]
+
+    def _is_manager(uid):
+        row = get_user_row(uid)
+        return bool(row) and row[4] in ("admin", "root")
+
+    @api("/ticket/create", methods=["POST"])
+    def ticket_create(req):
+        uid = req["uid"]
+        password = req["password"]
+        if not verify_user(uid, password):
+            return bool_res()[False]
+        if tickets_cursor is None:
+            return bool_res()[False]
+        user_row = get_user_row(uid)
+        if user_row is None or user_row[4] in _BLOCKED_STATS:
+            return bool_res()[False]
+
+        ticket_type = req.get("type")
+        if ticket_type not in ("report", "consult", "appeal"):
+            return {"success": False, "error": "invalid_ticket_type"}
+        if not feature_gate(read_config(), "tickets", ticket_type):
+            return {"success": False, "error": "ticket_type_disabled"}
+
+        title = req.get("title")
+        content = req.get("content")
+        if not isinstance(title, str) or not isinstance(content, str):
+            return bool_res()[False]
+        title = title.strip()
+        content = content.strip()
+        if len(content) > 4000:
+            return {"success": False, "error": "content_too_long"}
+
+        attachment_hashes, attachment_error = _parse_attachment_hashes(
+            req.get("attachments"))
+        if attachment_error:
+            return {"success": False, "error": attachment_error}
+        if not content and not attachment_hashes:
+            return {"success": False, "error": "empty_content"}
+        for value in attachment_hashes:
+            if file_cursor.acquire_reference(uid, value) is None:
+                return {"success": False, "error": "invalid_attachments"}
+
+        if len(title) > 120:
+            title = title[:120]
+        if not title:
+            title = content[:40] if content else "附件工单"
+
+        target_type = req.get("target_type")
+        if target_type not in (None, "post", "comment", "user", "forum"):
+            target_type = None
+        target_id = req.get("target_id")
+
+        priority = req.get("priority", "normal")
+        if priority not in ("low", "normal", "high", "urgent"):
+            priority = "normal"
+
+        ticket_id = tickets_cursor.create(
+            uid, ticket_type, title, content,
+            target_type=target_type, target_id=target_id, priority=priority,
+            attachments=attachment_hashes,
+        )
+        if not ticket_id:
+            return bool_res()[False]
+
+        notify_user(uid, "ticket.created", "工单已提交",
+                    "你的工单《{}》已提交，我们会尽快处理。".format(title),
+                    sender=uid, meta={"ticket_id": ticket_id,
+                                      "ticket_type": ticket_type})
+        reviewer_rows = user_cursor.query(
+            "SELECT uid FROM users WHERE stat IN ('admin', 'root')"
+        )
+        notify_users([row[0] for row in reviewer_rows if row[0] != uid],
+                     "ticket.pending", "新的工单",
+                     "有一张{}工单《{}》等待处理。".format(ticket_type, title),
+                     sender=uid, meta={"ticket_id": ticket_id,
+                                       "ticket_type": ticket_type})
+        return {"success": True, "ticket_id": ticket_id}
+
+    @api("/ticket/list", methods=["POST"])
+    def ticket_list(req):
+        uid = req["uid"]
+        password = req["password"]
+        if not verify_user(uid, password):
+            return bool_res()[False]
+        if tickets_cursor is None:
+            return bool_res()[False]
+        try:
+            offset = max(int(req.get("offset", 0)), 0)
+            take = min(max(int(req.get("take", 30)), 1), 100)
+        except (TypeError, ValueError):
+            return bool_res()[False]
+        rows, total = tickets_cursor.list_for_user(uid, offset, take)
+        return json.dumps({
+            "tickets": _tickets_payload(rows),
+            "total": total,
+        }, ensure_ascii=False)
+
+    @api("/ticket/detail", methods=["POST"])
+    def ticket_detail(req):
+        uid = req["uid"]
+        password = req["password"]
+        if not verify_user(uid, password):
+            return bool_res()[False]
+        if tickets_cursor is None:
+            return bool_res()[False]
+        try:
+            ticket_id = int(req["ticket_id"])
+        except (KeyError, TypeError, ValueError):
+            return bool_res()[False]
+        row = tickets_cursor.get(ticket_id)
+        # 别人的工单只有管理员能看
+        if row is None or (row[1] != uid and not _is_manager(uid)):
+            return bool_res()[False]
+        messages = tickets_cursor.list_messages(ticket_id)
+        names = _user_names(
+            [row[1], row[13]] + [item[2] for item in messages]
+        )
+        payload = _ticket_to_dict(row, names)
+        payload["messages"] = [
+            _ticket_message_to_dict(item, names) for item in messages
+        ]
+        # 本人打开即视为读过
+        if row[1] == uid and row[14]:
+            tickets_cursor.mark_read(ticket_id)
+            payload["user_unread"] = 0
+        return json.dumps(payload, ensure_ascii=False)
+
+    @api("/ticket/message/send", methods=["POST"])
+    def ticket_message_send(req):
+        """工单内回话"""
+        uid = req["uid"]
+        password = req["password"]
+        if not verify_user(uid, password):
+            return bool_res()[False]
+        if tickets_cursor is None:
+            return bool_res()[False]
+        try:
+            ticket_id = int(req["ticket_id"])
+        except (KeyError, TypeError, ValueError):
+            return bool_res()[False]
+        content = req.get("content")
+        if content is None:
+            content = ""
+        if not isinstance(content, str):
+            return bool_res()[False]
+        content = content.strip()
+        if len(content) > 4000:
+            return bool_res()[False]
+
+        attachment_hashes, attachment_error = _parse_attachment_hashes(
+            req.get("attachments"))
+        if attachment_error:
+            return {"success": False, "error": attachment_error}
+        if not content and not attachment_hashes:
+            return bool_res()[False]
+        for value in attachment_hashes:
+            if file_cursor.acquire_reference(uid, value) is None:
+                return {"success": False, "error": "invalid_attachments"}
+
+        row = tickets_cursor.get(ticket_id)
+        if row is None:
+            return bool_res()[False]
+        is_staff = _is_manager(uid) and row[1] != uid
+        if row[1] != uid and not is_staff:
+            return bool_res()[False]
+
+        if not tickets_cursor.add_message(
+                ticket_id, uid, content, is_staff,
+                attachments=attachment_hashes):
+            return bool_res()[False]
+
+        if is_staff:
+            notify_user(row[1], "ticket.replied", "工单有新回复",
+                        "你的工单《{}》收到一条回复。".format(row[5]),
+                        sender=uid, meta={"ticket_id": ticket_id})
+        else:
+            reviewer_rows = user_cursor.query(
+                "SELECT uid FROM users WHERE stat IN ('admin', 'root')"
+            )
+            notify_users([r[0] for r in reviewer_rows if r[0] != uid],
+                         "ticket.pending", "工单有新消息",
+                         "工单《{}》收到举报人的补充说明。".format(row[5]),
+                         sender=uid, meta={"ticket_id": ticket_id})
+        return json.dumps({"success": True}, ensure_ascii=False)
+
+    @api("/ticket/my_count", methods=["POST"])
+    def ticket_my_count(req):
+        uid = req["uid"]
+        password = req["password"]
+        if not verify_user(uid, password):
+            return bool_res()[False]
+        if tickets_cursor is None:
+            return bool_res()[False]
+        return json.dumps({
+            "success": True,
+            "unread": tickets_cursor.user_unread_total(uid),
+        }, ensure_ascii=False)
+
+    @api("/ticket/queue", methods=["POST"])
+    def ticket_queue(req):
+        uid = req["uid"]
+        password = req["password"]
+        if not verify_user(uid, password):
+            return bool_res()[False]
+        if tickets_cursor is None or not _is_manager(uid):
+            return bool_res()[False]
+        status = req.get("status")
+        if status not in (None, "open", "processing", "resolved", "rejected"):
+            return bool_res()[False]
+        scope = req.get("scope", "pending")
+        if scope not in ("pending", "all"):
+            return bool_res()[False]
+        try:
+            offset = max(int(req.get("offset", 0)), 0)
+            take = min(max(int(req.get("take", 30)), 1), 100)
+        except (TypeError, ValueError):
+            return bool_res()[False]
+        sort = req.get("sort", "priority")
+        if sort not in ("priority", "time"):
+            return bool_res()[False]
+        ticket_type = req.get("type")
+        if ticket_type not in (None, "report", "consult", "appeal"):
+            return bool_res()[False]
+        priority_filter = req.get("priority")
+        if priority_filter not in (None, "low", "normal", "high", "urgent"):
+            return bool_res()[False]
+        creator_raw = req.get("creator_uid")
+        creator_uid = None
+        if creator_raw not in (None, ""):
+            try:
+                creator_uid = int(creator_raw)
+            except (TypeError, ValueError):
+                return bool_res()[False]
+        rows, total = tickets_cursor.list_queue(
+            status, offset, take, include_closed=(scope == "all"),
+            sort=sort, ticket_type=ticket_type, priority=priority_filter,
+            creator_uid=creator_uid)
+        return json.dumps({
+            "tickets": _tickets_payload(rows),
+            "total": total,
+        }, ensure_ascii=False)
+
+    @api("/ticket/pending_count", methods=["POST"])
+    def ticket_pending_count(req):
+        uid = req["uid"]
+        password = req["password"]
+        if not verify_user(uid, password):
+            return bool_res()[False]
+        if tickets_cursor is None or not _is_manager(uid):
+            return bool_res()[False]
+        return json.dumps(
+            {"success": True, "count": tickets_cursor.pending_count()},
+            ensure_ascii=False,
+        )
+
+    @api("/ticket/handle", methods=["POST"])
+    def ticket_handle(req):
+        uid = req["uid"]
+        password = req["password"]
+        if not verify_user(uid, password):
+            return bool_res()[False]
+        if tickets_cursor is None or not _is_manager(uid):
+            return bool_res()[False]
+        try:
+            ticket_id = int(req["ticket_id"])
+        except (KeyError, TypeError, ValueError):
+            return bool_res()[False]
+        status = req.get("status")
+        if status is not None and status not in ("open", "processing",
+                                                 "resolved", "rejected"):
+            return {"success": False, "error": "invalid_status"}
+        reply = req.get("reply")
+        if not isinstance(reply, str):
+            reply = None
+        if reply is not None:
+            reply = reply.strip()[:2000] or None
+        priority = req.get("priority")
+        if priority is not None and priority not in (
+                "low", "normal", "high", "urgent"):
+            return {"success": False, "error": "invalid_priority"}
+        assignee_raw = req.get("assignee_uid")
+        clear_assignee = bool(req.get("clear_assignee"))
+        assignee_uid = None
+        if assignee_raw is not None and not clear_assignee:
+            try:
+                assignee_uid = int(assignee_raw)
+            except (TypeError, ValueError):
+                return {"success": False, "error": "invalid_assignee"}
+            # 指派对象必须是管理员
+            if not _is_manager(assignee_uid):
+                return {"success": False, "error": "invalid_assignee"}
+
+        ok, reason = tickets_cursor.handle(
+            ticket_id, uid, status, reply,
+            priority=priority, assignee_uid=assignee_uid,
+            clear_assignee=clear_assignee,
+        )
+        if not ok:
+            return {"success": False, "error": reason}
+
+        if reply:
+            attachment_hashes, attachment_error = _parse_attachment_hashes(
+                req.get("attachments"))
+            if attachment_error:
+                return {"success": False, "error": attachment_error}
+            tickets_cursor.add_message(
+                ticket_id, uid, reply, True, attachments=attachment_hashes)
+
+        row = tickets_cursor.get(ticket_id)
+        if row is not None and row[1] != uid:
+            status_text = {
+                "processing": "正在处理",
+                "resolved": "已处理",
+                "rejected": "未通过",
+            }.get(status, status or "")
+            body = "你的工单《{}》".format(row[5])
+            if status:
+                body += "状态更新为：{}。".format(status_text)
+            if reply:
+                body += "说明：{}".format(reply)
+            notify_user(row[1], "ticket.handled", "工单状态更新", body,
+                        sender=uid, meta={"ticket_id": ticket_id,
+                                          "status": status})
+        return {"success": True}
+
+
+    _PUNISHMENT_KIND_LABELS = {"warn": "警告", "mute": "禁言", "ban": "封禁"}
+    _PUNISHMENT_NOTICE = {
+        "warn": ("你收到一条警告",
+                 "处罚类型：警告。理由：{reason}。"
+                 "本次警告不限制任何功能，但会留档。"),
+        "mute": ("你已被禁言",
+                 "处罚类型：禁言。理由：{reason}。"
+                 "禁言期间无法发送消息、发帖和评论，仍可提交工单申诉。"),
+        "ban": ("你的账号已被封禁",
+                "处罚类型：封禁。理由：{reason}。"
+                "封禁期间无法登录，如认为有误可联系管理员申诉。"),
+    }
+
+    def _sweep_legacy_ban(uid):
+        """
+        清理历史遗留 users.stat='banned'
+        """
+        row = user_cursor.uid_query(uid)
+        if not row or row[0][4] != "banned":
+            return
+        if _active_ban(uid) is not None:
+            return
+        user_cursor.change_auth(uid, "user")
+        notify_user(uid, "punishment.expired", "处罚已到期",
+                    "你的封禁已到期，账号已恢复正常。")
+
+    @api("/punishment/create", methods=["POST"])
+    def punishment_create(req):
+        uid = req["uid"]
+        password = req["password"]
+        if not verify_user(uid, password):
+            return bool_res()[False]
+        if punishments_cursor is None or not _is_manager(uid):
+            return bool_res()[False]
+        try:
+            target_uid = int(req["target_uid"])
+        except (KeyError, TypeError, ValueError):
+            return bool_res()[False]
+        kind = req.get("kind")
+        if kind not in ("warn", "mute", "ban"):
+            return {"success": False, "error": "invalid_kind"}
+        reason = req.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            # 理由必填
+            return {"success": False, "error": "reason_required"}
+        reason = reason.strip()[:500]
+        target_row = get_user_row(target_uid)
+        if target_row is None:
+            return {"success": False, "error": "user_not_found"}
+        if target_row[4] == "root":
+            return {"success": False, "error": "forbidden"}
+        if uid == target_uid:
+            return {"success": False, "error": "cannot_punish_self"}
+
+        duration = req.get("duration_seconds")
+        if duration is not None:
+            try:
+                duration = int(duration)
+            except (TypeError, ValueError):
+                return {"success": False, "error": "invalid_duration"}
+            if duration <= 0:
+                duration = None
+
+        punishment_id = punishments_cursor.create(
+            target_uid, kind, reason, uid, duration_seconds=duration
+        )
+        if not punishment_id:
+            return bool_res()[False]
+
+        # 不写 users.stat
+        kind_label = _PUNISHMENT_KIND_LABELS.get(kind, kind)
+        notice_title, notice_body = _PUNISHMENT_NOTICE.get(
+            kind, ("你收到一条处罚", "处罚类型：{kind}。理由：{reason}。"))
+        notify_user(target_uid, "punishment.created", notice_title,
+                    notice_body.format(kind=kind_label, reason=reason),
+                    sender=uid, meta={"punishment_id": punishment_id,
+                                      "kind": kind, "kind_label": kind_label,
+                                      "reason": reason})
+        return {"success": True, "punishment_id": punishment_id}
+
+    @api("/punishment/list", methods=["POST"])
+    def punishment_list(req):
+        uid = req["uid"]
+        password = req["password"]
+        if not verify_user(uid, password):
+            return bool_res()[False]
+        if punishments_cursor is None:
+            return bool_res()[False]
+        target_uid = req.get("target_uid", uid)
+        try:
+            target_uid = int(target_uid)
+        except (TypeError, ValueError):
+            return bool_res()[False]
+        if target_uid != uid and not _is_manager(uid):
+            return bool_res()[False]
+        _sweep_legacy_ban(target_uid)
+        rows = punishments_cursor.list_for_user(target_uid)
+        now = time.time()
+        items = []
+        for row in rows:
+            active = row[7] is None and (row[6] is None or row[6] > now)
+            items.append({
+                "id": row[0], "uid": row[1], "kind": row[2], "reason": row[3],
+                "issued_by": row[4], "created_at": row[5],
+                "expires_at": row[6], "revoked_at": row[7],
+                "revoked_by": row[8], "active": active,
+            })
+        return json.dumps({"punishments": items}, ensure_ascii=False)
+
+    @api("/punishment/revoke", methods=["POST"])
+    def punishment_revoke(req):
+        uid = req["uid"]
+        password = req["password"]
+        if not verify_user(uid, password):
+            return bool_res()[False]
+        if punishments_cursor is None or not _is_manager(uid):
+            return bool_res()[False]
+        try:
+            punishment_id = int(req["punishment_id"])
+        except (KeyError, TypeError, ValueError):
+            return bool_res()[False]
+        row = punishments_cursor.get(punishment_id)
+        if row is None:
+            return bool_res()[False]
+        punishments_cursor.revoke(punishment_id, uid)
+
+        target_uid = row[1]
+        _sweep_legacy_ban(target_uid)
+        notify_user(target_uid, "punishment.revoked", "处罚已解除",
+                    "你的一条处罚已被解除。", sender=uid,
+                    meta={"punishment_id": punishment_id})
         return bool_res()[True]
 
     @app.route("/avatar/get_avatar/<typ>/<tid>")
@@ -4133,7 +4800,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if user_row is None:
             return json.dumps({"success": False, "error": "invalid_request"})
         user_stat = user_row[4]
-        if user_stat == 'banned':
+        if user_stat in _BLOCKED_STATS:
             return json.dumps({"success": False, "error": "banned"})
         cfg = read_config()
         normalized_name, payload = validate_file_upload(filename, file_b64, cfg)
@@ -4780,7 +5447,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if user_row is None:
             return json.dumps({"success": False, "error": "invalid_request"})
         user_stat = user_row[4]
-        if user_stat == 'banned':
+        if user_stat in _BLOCKED_STATS:
             return json.dumps({"success": False, "error": "banned"})
         cfg = read_config()
         min_len = cfg.get("min_group_name_length", 1)
@@ -4910,7 +5577,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if user_row is None:
             return bool_res()[False]
         user_stat = user_row[4]
-        if user_stat == 'banned':
+        if user_stat in _BLOCKED_STATS:
             return bool_res()[False]
         gid = req["gid"]
         added = req["added"]
@@ -5026,7 +5693,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if user_row is None:
             return bool_res()[False]
         user_stat = user_row[4]
-        if user_stat == 'banned':
+        if user_stat in _BLOCKED_STATS:
             return bool_res()[False]
         oper = group_cursor.is_admin(gid, uid)
         oped = group_cursor.is_admin(gid, removed)
@@ -5054,7 +5721,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if user_row is None:
             return bool_res()[False]
         user_stat = user_row[4]
-        if user_stat == 'banned':
+        if user_stat in _BLOCKED_STATS:
             return bool_res()[False]
         if not group_cursor.is_member(gid, uid):
             return bool_res()[False]
@@ -5084,7 +5751,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if user_row is None:
             return bool_res()[False]
         user_stat = user_row[4]
-        if user_stat == 'banned':
+        if user_stat in _BLOCKED_STATS:
             return bool_res()[False]
         if not group_cursor.is_admin(gid, uid) == 2:
             return bool_res()[False]
@@ -5109,7 +5776,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if user_row is None:
             return bool_res()[False]
         user_stat = user_row[4]
-        if user_stat == 'banned':
+        if user_stat in _BLOCKED_STATS:
             return bool_res()[False]
         if not group_cursor.is_admin(gid, uid) == 2:
             return bool_res()[False]
@@ -5142,7 +5809,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if user_row is None:
             return bool_res()[False]
         user_stat = user_row[4]
-        if user_stat == 'banned':
+        if user_stat in _BLOCKED_STATS:
             return bool_res()[False]
         if not group_cursor.is_admin(gid, uid) == 2:
             return bool_res()[False]
@@ -5165,7 +5832,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if user_row is None:
             return json.dumps({"success": False, "error": "invalid_request"})
         user_stat = user_row[4]
-        if user_stat == 'banned':
+        if user_stat in _BLOCKED_STATS:
             return json.dumps({"success": False, "error": "banned"})
         if not group_cursor.is_member(gid, uid):
             return json.dumps({"success": False, "error": "not_group_member"})
@@ -5182,7 +5849,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if user_row is None:
             return bool_res()[False]
         user_stat = user_row[4]
-        if user_stat == 'banned':
+        if user_stat in _BLOCKED_STATS:
             return bool_res()[False]
         if not group_cursor.is_admin(gid, uid) == 2:
             return bool_res()[False]
@@ -5297,7 +5964,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if user_row is None:
             return json.dumps({"success": False, "error": "invalid_request"})
         user_stat = user_row[4]
-        if user_stat == 'banned':
+        if user_stat in _BLOCKED_STATS:
             return json.dumps({"success": False, "error": "banned"})
         if not group_cursor.is_member(gid, uid):
             return json.dumps({"success": False, "error": "not_group_member"})
@@ -5332,7 +5999,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if user_row is None:
             return json.dumps({"success": False, "error": "invalid_request"})
         user_stat = user_row[4]
-        if user_stat == 'banned':
+        if user_stat in _BLOCKED_STATS:
             return json.dumps({"success": False, "error": "banned"})
         settings = group_cursor.get_group_settings(gid)
         if not settings:
@@ -5376,7 +6043,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if user_row is None:
             return json.dumps({"success": False, "error": "invalid_request"})
         user_stat = user_row[4]
-        if user_stat == 'banned':
+        if user_stat in _BLOCKED_STATS:
             return json.dumps({"success": False, "error": "banned"})
         if not group_cursor.is_member(gid, uid):
             return json.dumps({"success": False, "error": "not_group_member"})
@@ -5425,7 +6092,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if user_row is None:
             return json.dumps({"success": False, "error": "invalid_request"})
         user_stat = user_row[4]
-        if user_stat == 'banned':
+        if user_stat in _BLOCKED_STATS:
             return json.dumps({"success": False, "error": "banned"})
         if not group_cursor.is_admin(gid, uid):
             return json.dumps({"success": False, "error": "forbidden"})
@@ -5457,7 +6124,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if user_row is None:
             return bool_res()[False]
         user_stat = user_row[4]
-        if user_stat == 'banned':
+        if user_stat in _BLOCKED_STATS:
             return bool_res()[False]
         req_info = group_cursor.query(
             "SELECT gid FROM join_requests WHERE rid = ?", (rid,)
@@ -5531,8 +6198,9 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
             if user_row is None:
                 return json.dumps({"success": False, "error": "invalid_request"})
             user_stat = user_row[4]
-            if user_stat == 'banned':
-                return json.dumps({"success": False, "error": "banned"})
+            block = _content_block(uid, user_stat)
+            if block is not None:
+                return json.dumps({"success": False, "error": block})
             file_record = None
 
             target_uid = 0
@@ -5915,7 +6583,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if user_row is None:
             return json.dumps({"success": False, "error": "invalid_request"})
         user_stat = user_row[4]
-        if user_stat == 'banned':
+        if user_stat in _BLOCKED_STATS:
             return json.dumps({"success": False, "error": "banned"})
 
         try:
@@ -6250,7 +6918,7 @@ def main(port_api : int, port_tcp : int, pub_pem, pri, ImgCaptcha, user_cursor, 
         if user_row is None:
             return json.dumps({"success": False, "error": "invalid_request"})
         user_stat = user_row[4]
-        if user_stat == 'banned':
+        if user_stat in _BLOCKED_STATS:
             return json.dumps({"success": False, "error": "banned"})
 
         if group_id is not None:

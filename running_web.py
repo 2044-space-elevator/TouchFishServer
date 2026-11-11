@@ -3,6 +3,7 @@ from gevent import monkey
 monkey.patch_all()
 from web import main
 from channel import InstantConnect
+from db import PunishmentsDb
 from db import *
 from captcha.image import ImageCaptcha
 from crypto import load_pri
@@ -24,8 +25,9 @@ msgcur = MessagesDb("res/{}/db/messages.db".format(PORT_API), PORT_API)
 filecur = FileDb("res/{}/file/file.db".format(PORT_API), PORT_API)
 grpcur = GroupDb("res/{}/db/group.db".format(PORT_API), PORT_API)
 key_store = jwt_keys.KeyStore("res/{}/secret".format(PORT_API))
+punishcur = PunishmentsDb("res/{}/db/punishment.db".format(PORT_API), PORT_API)
 instcur = InstantConnect(PORT_API, PORT_TCP, notificur, usercur, msgcur, grpcur, filecur,
-                         jwt_key_store=key_store)
+                         jwt_key_store=key_store, punishments_cursor=punishcur)
 stickcur = StickerDb("res/{}/db/sticker.db".format(PORT_API), PORT_API)
 
 # 请将 PORT_API, PORT_TCP 换成自己的

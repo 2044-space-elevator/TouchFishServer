@@ -211,6 +211,10 @@ def create_new_server():
     print("[INFO] file.db 创建完毕！")
     NOTIFICATION_CURSOR = db.NotificationsDb("res/{}/db/notification.db".format(PORT_API), PORT_API)
     print("[INFO] notification.db 创建完毕")
+    TICKETS_CURSOR = db.TicketsDb("res/{}/db/ticket.db".format(PORT_API), PORT_API)
+    print("[INFO] ticket.db 创建完毕")
+    PUNISHMENTS_CURSOR = db.PunishmentsDb("res/{}/db/punishment.db".format(PORT_API), PORT_API)
+    print("[INFO] punishment.db 创建完毕")
     GROUP_CURSOR = db.GroupDb("res/{}/db/group.db".format(PORT_API), PORT_API)
     GROUP_CURSOR.create_group_table()
     print("[INFO] group.db 创建完毕")
@@ -488,6 +492,8 @@ def main(args=None):
         NOTIFICATION_CURSOR = db.NotificationsDb(db_dsn, PORT_API, dialect=dialect)
         MESSAGES_CURSOR = db.MessagesDb(db_dsn, PORT_API, dialect=dialect)
         GROUP_CURSOR = db.GroupDb(db_dsn, PORT_API, dialect=dialect)
+        TICKETS_CURSOR = db.TicketsDb(db_dsn, PORT_API, dialect=dialect)
+        PUNISHMENTS_CURSOR = db.PunishmentsDb(db_dsn, PORT_API, dialect=dialect)
     else:
         USER_CURSOR = db.UserDb(HASHER, "res/{}/db/user.db".format(PORT_API), PORT_API, PORT_TCP)
         USER_CURSOR.create_user_table()
@@ -500,6 +506,10 @@ def main(args=None):
         NOTIFICATION_CURSOR = db.NotificationsDb("res/{}/db/notification.db".format(PORT_API), PORT_API)
         MESSAGES_CURSOR = db.MessagesDb("res/{}/db/messages.db".format(PORT_API), PORT_API)
         GROUP_CURSOR = db.GroupDb("res/{}/db/group.db".format(PORT_API), PORT_API)
+        TICKETS_CURSOR = db.TicketsDb("res/{}/db/ticket.db".format(PORT_API), PORT_API)
+        PUNISHMENTS_CURSOR = db.PunishmentsDb(
+            "res/{}/db/punishment.db".format(PORT_API), PORT_API
+        )
     if db_dsn is not None and USER_CURSOR.count_users() == 0:
         prt("外部数据库中尚无用户，请创建 root 账户。", "yellow")
         try:
@@ -553,6 +563,8 @@ def main(args=None):
         PORT_API, PORT_TCP, NOTIFICATION_CURSOR, USER_CURSOR,
         MESSAGES_CURSOR, GROUP_CURSOR, FILE_CURSOR,
         jwt_key_store=JWT_KEY_STORE,
+        # WS 是发消息主路径，禁言/封禁必须在这里也查得到
+        punishments_cursor=PUNISHMENTS_CURSOR,
     )
 
     # 媒体推送
@@ -661,7 +673,9 @@ def main(args=None):
     FLASK_APP = web.main(
         PORT_API, PORT_TCP, pub_pem, PRI_KEY, IMGCAPTCHA, USER_CURSOR, FORUM_CURSOR,
         FILE_CURSOR, NOTIFICATION_CURSOR, MESSAGES_CURSOR, GROUP_CURSOR,
-        INSTANT_CONTACT, STICKER_CURSOR, jwt_key_store=JWT_KEY_STORE,
+        INSTANT_CONTACT, STICKER_CURSOR,
+        tickets_cursor=TICKETS_CURSOR, punishments_cursor=PUNISHMENTS_CURSOR,
+        jwt_key_store=JWT_KEY_STORE,
     )
     start_api = args.start_api
     if not args.cli_mode:
